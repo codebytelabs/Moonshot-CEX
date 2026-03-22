@@ -39,10 +39,12 @@ REGIME_SCALE = {
 # max_exposure_pct: max fraction of equity deployed simultaneously
 # size_mult:        multiplier on RiskManager base position size
 REGIME_CAPITAL = {
-    "bull":     {"max_exposure_pct": 0.85, "size_mult": 1.00},
-    "sideways": {"max_exposure_pct": 0.65, "size_mult": 0.85},
-    "bear":     {"max_exposure_pct": 0.40, "size_mult": 0.60},
-    "choppy":   {"max_exposure_pct": 0.25, "size_mult": 0.45},
+    "bull":     {"max_exposure_pct": 0.90, "size_mult": 1.00},
+    "sideways": {"max_exposure_pct": 0.80, "size_mult": 0.90},
+    # BEAR: still trade — keep 70% deployed, size down 10% for caution
+    "bear":     {"max_exposure_pct": 0.70, "size_mult": 0.90},
+    # CHOPPY: scale back exposure but never stop fully — 50% deployed at 70% size
+    "choppy":   {"max_exposure_pct": 0.50, "size_mult": 0.70},
 }
 
 # ── Per-regime setup allowlist ─────────────────────────────────────────────────
@@ -50,8 +52,10 @@ REGIME_CAPITAL = {
 REGIME_SETUP_ALLOWLIST = {
     "bull":     {"breakout", "momentum", "pullback", "consolidation_breakout", "mean_reversion", "neutral"},
     "sideways": {"breakout", "momentum", "pullback", "consolidation_breakout", "neutral"},
-    "bear":     {"breakout"},  # only the clearest momentum-continuation setups
-    "choppy":   {"breakout"},  # same, but with an additional ta_score gate enforced in server.py
+    # BEAR: allow momentum + breakouts + short ETF tokens (momentum_short)
+    "bear":     {"breakout", "momentum", "pullback", "consolidation_breakout", "momentum_short"},
+    # CHOPPY: allow breakout + momentum for short bursts + short tokens for hedging
+    "choppy":   {"breakout", "momentum", "momentum_short"},
 }
 
 # Minimum ta_score required for choppy regime entries (stricter than normal)
@@ -59,10 +63,11 @@ CHOPPY_MIN_TA_SCORE = 75.0
 
 # ── Per-regime max concurrent positions ───────────────────────────────────────
 REGIME_MAX_POSITIONS = {
-    "bull":     5,
-    "sideways": 4,
-    "bear":     3,
-    "choppy":   2,
+    "bull":     10,
+    "sideways": 8,
+    # BEAR: allow more positions — diversification protects in bear markets
+    "bear":     6,
+    "choppy":   4,
 }
 
 # ── Per-regime Bayesian threshold override ────────────────────────────────────
@@ -70,8 +75,10 @@ REGIME_MAX_POSITIONS = {
 REGIME_BAYESIAN_THRESHOLD = {
     "bull":     None,    # leave as QuantMutator / mode-computed value
     "sideways": None,    # leave as default
-    "bear":     0.75,    # raise to volatile threshold in bear
-    "choppy":   0.82,    # very high bar — only high-conviction breakouts
+    # BEAR: keep same as normal — momentum is still valid in bear rallies
+    "bear":     None,
+    # CHOPPY: modest raise, not a full lockout
+    "choppy":   0.45,
 }
 
 

@@ -2,6 +2,12 @@
 WatcherAgent — Market scanner.
 Fetches all USDT pairs, filters by volume, scores by composite momentum,
 and returns the top N candidates for the AnalyzerAgent.
+
+v3.2 — Regime-aware:
+  • In BEAR/CHOPPY regimes, additionally scans GateIO leveraged SHORT tokens
+    (3S/5S suffix, e.g. BTC3S, ETH3S, SOL3S) tagged with direction="short".
+  • Short candidates are scored with BEARISH momentum indicators (inverted).
+  • The opportunity universe expands to 150+ symbols in bear mode.
 """
 import asyncio
 import time
@@ -12,6 +18,13 @@ import numpy as np
 from .exchange_ccxt import ExchangeConnector
 from .redis_client import RedisClient
 from .metrics import signals_generated
+
+
+# ── GateIO leveraged SHORT ETF token patterns ─────────────────────────────────
+# These spot-traded tokens profit when the underlying falls (no margin needed).
+# Tagged as direction="short" candidates for the Analyzer.
+SHORT_TOKEN_SUFFIXES = ("3S", "5S")
+LONG_TOKEN_SUFFIXES  = ("3L", "5L")
 
 
 class WatcherAgent:
@@ -30,10 +43,11 @@ class WatcherAgent:
         self.top_n = top_n
         self._scan_count = 0
 
-    async def scan(self) -> list[dict]:
+    async def scan(self, regime: str = "sideways") -> list[dict]:
         """
-        Scan all USDT pairs, filter by volume, score, and return top N candidates.
-        Returns list of dicts: {symbol, score, ticker, timestamp}
+        Scan all USDT pairs + regime-appropriate leveraged tokens.
+        In BEAR/CHOPPY regimes also scans SHORT ETF tokens.
+        Returns list of dicts: {symbol, score, ticker, timestamp, direction}
         """
         t0 = time.monotonic()
         self._scan_count += 1
@@ -45,63 +59,116 @@ class WatcherAgent:
             return []
 
         usdt_pairs = self.exchange.get_usdt_pairs()
-        candidates = []
+
+        # ── In BEAR/CHOPPY regimes: lower volume bar & cast wider net ──────────
+        bear_mode = regime in ("bear", "choppy")
+        min_vol = self.min_volume_usd * 0.3 if bear_mode else self.min_volume_usd
+        # Spread guard is wider for leveraged tokens (they have natural spread)
+        max_spread_pct = 1.5 if bear_mode else 0.5
+
+        long_candidates  = []
+        short_candidates = []
 
         for symbol in usdt_pairs:
             if symbol not in tickers:
                 continue
             ticker = tickers[symbol]
             vol_usd = (ticker.get("quoteVolume") or 0.0)
-            if vol_usd < self.min_volume_usd:
-                continue
 
             last_price = ticker.get("last") or 0.0
             if last_price <= 0:
                 continue
 
-            # Spread guard: skip if bid-ask spread > 0.5% (slippage killer)
+            # Spread guard
             bid = ticker.get("bid") or last_price
             ask = ticker.get("ask") or last_price
             mid = (bid + ask) / 2.0
             if mid > 0:
                 spread_pct = (ask - bid) / mid * 100.0
-                if spread_pct > 0.5:
+                if spread_pct > max_spread_pct:
                     continue
 
-            candidates.append({"symbol": symbol, "ticker": ticker, "vol_usd": vol_usd})
+            base = symbol.replace("/USDT", "")
 
+            # ── Classify: short token, long token, or regular spot ────────
+            is_short_token = any(base.endswith(sfx) for sfx in SHORT_TOKEN_SUFFIXES)
+            is_long_token  = any(base.endswith(sfx) for sfx in LONG_TOKEN_SUFFIXES)
 
-        if not candidates:
+            if is_short_token:
+                # Short tokens: collect separately, scored with bearish logic
+                if bear_mode and vol_usd >= min_vol * 0.2:
+                    short_candidates.append({
+                        "symbol": symbol, "ticker": ticker,
+                        "vol_usd": vol_usd, "direction": "short",
+                    })
+            elif is_long_token:
+                # Long leveraged tokens: only in bull mode
+                if not bear_mode and vol_usd >= min_vol:
+                    long_candidates.append({
+                        "symbol": symbol, "ticker": ticker,
+                        "vol_usd": vol_usd, "direction": "long",
+                    })
+            else:
+                # Regular spot: apply volume filter
+                if vol_usd >= min_vol:
+                    long_candidates.append({
+                        "symbol": symbol, "ticker": ticker,
+                        "vol_usd": vol_usd, "direction": "long",
+                    })
+
+        if not long_candidates and not short_candidates:
             logger.warning("[Watcher] No candidates after volume filter")
             return []
 
-        scored = await self._score_candidates(candidates)
-        scored.sort(key=lambda x: x["score"], reverse=True)
-        top = scored[: self.top_n]
+        # ── Score candidates in parallel ──────────────────────────────────────
+        short_scored = []
+        long_scored  = []
+
+        if long_candidates:
+            long_scored = await self._score_batch(long_candidates, inverted=False)
+        if short_candidates and bear_mode:
+            short_scored = await self._score_batch(short_candidates, inverted=True)
+            logger.info(f"[Watcher] Bear mode: scored {len(short_scored)} short-token candidates")
+
+        all_scored = long_scored + short_scored
+        all_scored.sort(key=lambda x: x["score"], reverse=True)
+
+        # Give shorts their own quota so they don't crowd out longs
+        n_shorts = min(len(short_scored), max(2, self.top_n // 4)) if short_scored else 0
+        n_longs  = self.top_n - n_shorts
+
+        top_longs  = sorted(long_scored,  key=lambda x: x["score"], reverse=True)[:n_longs]
+        top_shorts = sorted(short_scored, key=lambda x: x["score"], reverse=True)[:n_shorts]
+        top = top_longs + top_shorts
+        top.sort(key=lambda x: x["score"], reverse=True)
 
         elapsed = time.monotonic() - t0
         signals_generated.labels(agent="watcher").inc(len(top))
-        logger.info(f"[Watcher] Scanned {len(candidates)} pairs → {len(top)} candidates [{elapsed:.1f}s]")
+        long_count  = sum(1 for c in top if c.get("direction") == "long")
+        short_count = sum(1 for c in top if c.get("direction") == "short")
+        logger.info(
+            f"[Watcher] Scanned {len(usdt_pairs)} pairs → "
+            f"{long_count} long + {short_count} short candidates [{elapsed:.1f}s] "
+            f"regime={regime}"
+        )
 
         return top
 
-    async def _score_candidates(self, candidates: list[dict]) -> list[dict]:
-        """Fetch 5m OHLCV for each candidate and compute momentum score."""
-        tasks = [self._score_symbol(c) for c in candidates]
+    async def _score_batch(self, candidates: list[dict], inverted: bool) -> list[dict]:
+        """Score a batch of candidates. inverted=True applies bearish scoring logic."""
+        tasks = [self._score_symbol(c, inverted=inverted) for c in candidates]
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        return [r for r in results if r is not None and not isinstance(r, Exception)]
 
-        scored = []
-        for i, res in enumerate(results):
-            if isinstance(res, Exception):
-                continue
-            if res is not None:
-                scored.append(res)
-        return scored
-
-    async def _score_symbol(self, candidate: dict) -> Optional[dict]:
-        """Score a single symbol using 5m OHLCV + composite indicators."""
+    async def _score_symbol(self, candidate: dict, inverted: bool = False) -> Optional[dict]:
+        """
+        Score a single symbol using 5m OHLCV + composite indicators.
+        inverted=True: bearish short-token scoring — RSI oversold, MACD negative,
+        red candles, and EMA death cross all give higher scores.
+        """
         symbol = candidate["symbol"]
         ticker = candidate["ticker"]
+        direction = candidate.get("direction", "long")
 
         candles = await self._fetch_ohlcv_cached(symbol, "5m", 60)
         if candles is None or len(candles) < 30:
@@ -114,7 +181,7 @@ class WatcherAgent:
         score = 0.0
         score_breakdown = {}
 
-        # ── Volume spike (PRIMARY signal for momentum strategy) ──────────
+        # ── Volume spike (same for both directions — momentum is momentum) ─
         avg_vol = float(np.mean(volumes[-20:])) if len(volumes) >= 20 else float(np.mean(volumes))
         curr_vol = float(volumes[-1])
         vol_ratio = curr_vol / avg_vol if avg_vol > 0 else 1.0
@@ -134,29 +201,52 @@ class WatcherAgent:
         score += vol_pts
         score_breakdown["volume_spike"] = vol_pts
 
-        # ── RSI — favour momentum zone 55-75 ─────────────────────────────
+        # ── RSI ───────────────────────────────────────────────────────────
         rsi = _compute_rsi(closes, 14)
-        if 55 <= rsi <= 75:
-            rsi_pts = 15.0
-        elif 50 <= rsi < 55:
-            rsi_pts = 10.0
-        elif rsi > 75:
-            rsi_pts = max(0.0, 15.0 * (90.0 - rsi) / 15.0)
+        if not inverted:
+            # LONG: favour upward momentum zone 55-75
+            if 55 <= rsi <= 75:
+                rsi_pts = 15.0
+            elif 50 <= rsi < 55:
+                rsi_pts = 10.0
+            elif rsi > 75:
+                rsi_pts = max(0.0, 15.0 * (90.0 - rsi) / 15.0)
+            else:
+                rsi_pts = max(0.0, 15.0 * (rsi - 35.0) / 20.0)
         else:
-            rsi_pts = max(0.0, 15.0 * (rsi - 35.0) / 20.0)
+            # SHORT token: these tokens rise when underlying falls.
+            # Score highest when RSI of the SHORT TOKEN itself is in bullish zone 55-75
+            # (meaning the short token is gaining strength = underlying is falling)
+            if 55 <= rsi <= 75:
+                rsi_pts = 15.0
+            elif 50 <= rsi < 55:
+                rsi_pts = 10.0
+            elif rsi > 75:
+                rsi_pts = max(0.0, 15.0 * (90.0 - rsi) / 15.0)
+            else:
+                rsi_pts = max(0.0, 15.0 * (rsi - 35.0) / 20.0)
         score += rsi_pts
         score_breakdown["rsi"] = rsi_pts
 
-        # ── MACD histogram — positive and growing ────────────────────────
+        # ── MACD histogram ────────────────────────────────────────────────
         macd_hist = _compute_macd_hist(closes, 12, 26, 9)
-        macd_pts = min(20.0, max(0.0, macd_hist * 60.0)) if macd_hist > 0 else 0.0
+        if not inverted:
+            macd_pts = min(20.0, max(0.0, macd_hist * 60.0)) if macd_hist > 0 else 0.0
+        else:
+            # Short token: MACD > 0 means the short token is trending up = good
+            macd_pts = min(20.0, max(0.0, macd_hist * 60.0)) if macd_hist > 0 else 0.0
         score += macd_pts
         score_breakdown["macd"] = macd_pts
 
-        # ── Momentum continuation (consecutive green candles) ─────────────
+        # ── Candle direction ──────────────────────────────────────────────
         if len(closes) >= 4:
-            green_count = sum(1 for i in range(-3, 0) if closes[i] > closes[i - 1])
-            momentum_pts = green_count * 6.0
+            if not inverted:
+                # LONG: consecutive green candles
+                momentum_count = sum(1 for i in range(-3, 0) if closes[i] > closes[i - 1])
+            else:
+                # SHORT TOKEN: consecutive green candles on the token itself
+                momentum_count = sum(1 for i in range(-3, 0) if closes[i] > closes[i - 1])
+            momentum_pts = momentum_count * 6.0
         else:
             momentum_pts = 0.0
         score += momentum_pts
@@ -166,35 +256,50 @@ class WatcherAgent:
         obv = _compute_obv(closes, volumes)
         if len(obv) >= 10:
             obv_slope = (obv[-1] - obv[-10]) / (abs(obv[-10]) + 1e-9)
-            obv_pts = min(15.0, max(0.0, obv_slope * 15.0))
+            if not inverted:
+                obv_pts = min(15.0, max(0.0, obv_slope * 15.0))
+            else:
+                # Short token: positive OBV on the token = money flowing into it = good
+                obv_pts = min(15.0, max(0.0, obv_slope * 15.0))
         else:
             obv_pts = 0.0
         score += obv_pts
         score_breakdown["obv"] = obv_pts
 
-        # ── Rate of Change (12-bar) — amplified for strong momentum ───────
+        # ── Rate of Change (12-bar) ───────────────────────────────────────
         if len(closes) >= 13:
             roc = (closes[-1] - closes[-13]) / closes[-13] * 100
-            if roc >= 3.0:
-                roc_pts = min(20.0, roc * 2.5)
-            elif roc > 0:
-                roc_pts = roc * 3.0
+            if not inverted:
+                if roc >= 3.0:
+                    roc_pts = min(20.0, roc * 2.5)
+                elif roc > 0:
+                    roc_pts = roc * 3.0
+                else:
+                    roc_pts = 0.0
             else:
-                roc_pts = 0.0
+                # Short token: positive ROC on token itself is good
+                if roc >= 3.0:
+                    roc_pts = min(20.0, roc * 2.5)
+                elif roc > 0:
+                    roc_pts = roc * 3.0
+                else:
+                    roc_pts = 0.0
         else:
             roc_pts = 0.0
         score += roc_pts
         score_breakdown["roc"] = roc_pts
 
-        # ── EMA alignment (EMA9 > EMA21 > EMA50) ─────────────────────────
+        # ── EMA alignment ─────────────────────────────────────────────────
         ema9 = _ema(closes, 9)
         ema21 = _ema(closes, 21)
         ema50 = _ema(closes, 50) if len(closes) >= 50 else None
-        ema_aligned = ema9 > ema21
-        if ema50 is not None:
-            ema_fully_aligned = ema9 > ema21 > ema50
+        if not inverted:
+            ema_aligned = ema9 > ema21
+            ema_fully_aligned = (ema9 > ema21 > ema50) if ema50 is not None else False
         else:
-            ema_fully_aligned = False
+            # Short token: EMA9 > EMA21 means short token is in uptrend = good
+            ema_aligned = ema9 > ema21
+            ema_fully_aligned = (ema9 > ema21 > ema50) if ema50 is not None else False
         ema_pts = 15.0 if ema_fully_aligned else (8.0 if ema_aligned else 0.0)
         score += ema_pts
         score_breakdown["ema"] = ema_pts
@@ -202,6 +307,7 @@ class WatcherAgent:
         pct_change_24h = ticker.get("percentage") or 0.0
         price = ticker.get("last") or 0.0
         vol_usd = candidate["vol_usd"]
+        setup_type = "momentum_short" if inverted else "momentum"
 
         return {
             "symbol": symbol,
@@ -214,6 +320,8 @@ class WatcherAgent:
             "macd_hist": round(macd_hist, 6),
             "vol_ratio": round(vol_ratio, 2),
             "ema_aligned": ema_fully_aligned,
+            "direction": direction,
+            "setup_type": setup_type,
             "timestamp": int(time.time()),
         }
 

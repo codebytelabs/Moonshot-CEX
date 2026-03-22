@@ -69,10 +69,11 @@ class QuantMutator:
         new_threshold = current_bayesian_threshold
         reason = ""
 
-        # Emergency: today's PnL deeply negative → raise bars (but cap at ceiling)
+        # Emergency: today's PnL deeply negative → modest raise only, never lockout
+        # Cap threshold at 0.35 so we still allow high-velocity momentum trades
         if current_day_pnl_pct < -0.05:
-            new_score = min(self.min_score_ceiling, current_min_score + self.score_raise_step * 2)
-            new_threshold = min(0.90, current_bayesian_threshold + 0.05)
+            new_score = min(self.min_score_ceiling, current_min_score + self.score_raise_step)
+            new_threshold = min(0.35, current_bayesian_threshold + 0.02)
             reason = f"emergency_pnl ({current_day_pnl_pct:.1%})"
 
         elif win_rate >= self.high_win_rate:

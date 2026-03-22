@@ -372,7 +372,8 @@ async def _run_cycle():
     trace = {"cycle": cycle, "steps": []}
 
     # ── Step 1: Watcher scan ────────────────────────────────────────────────
-    candidates = await _watcher.scan()
+    current_regime = STATE.get("regime", "sideways")
+    candidates = await _watcher.scan(regime=current_regime)
     STATE["last_watcher_candidates"] = candidates[:10]
     trace["steps"].append(f"watcher:{len(candidates)}")
     logger.info(f"[Cycle {cycle}] Watcher → {len(candidates)} candidates")
