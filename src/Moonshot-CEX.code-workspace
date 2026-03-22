@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": ".."
+		},
+		{
+			"path": "../../Moonshot"
+		},
+		{
+			"path": "../../Moonshot-AutonomousAIMultiAgentCryptoBot"
+		}
+	],
+	"settings": {}
+}
