@@ -191,16 +191,33 @@ class AnalyzerAgent:
         else:
             bb_width = 0.05
 
-        if score_4h >= 60 and score_1h >= 55 and rsi >= 55 and vol_spike >= 1.5:
+        # ── Setup classification — CALIBRATED for actual market conditions ────
+        # Old thresholds (score_4h>=60, score_1h>=55) were only met in strong bull
+        # runs, causing 100% neutral classification in sideways/bear markets.
+        # New thresholds: achievable with moderate signals across timeframes.
+
+        # BREAKOUT: strong 4h + 1h alignment + volume expansion
+        if score_4h >= 50 and score_1h >= 40 and rsi >= 50 and vol_spike >= 1.3:
             return "breakout"
-        elif score_1h >= 50 and score_4h >= 45 and 50 <= rsi <= 70:
+
+        # MOMENTUM: 4h trend established OR 1h+5m confluence with RSI in zone
+        elif (score_4h >= 40 and score_1h >= 35 and 45 <= rsi <= 72) or (
+            score_4h >= 35 and score_5m >= 30 and 50 <= rsi <= 75
+        ):
             return "momentum"
-        elif score_4h >= 55 and rsi < 45:
+
+        # PULLBACK: strong 4h trend but RSI dipped — potential re-entry
+        elif score_4h >= 45 and rsi < 48:
             return "pullback"
+
+        # MEAN REVERSION: oversold + tight range
         elif rsi < 35 and bb_width < 0.04:
             return "mean_reversion"
-        elif bb_width < 0.03 and vol_spike >= 2.0:
+
+        # CONSOLIDATION BREAKOUT: volume surge out of tight range
+        elif bb_width < 0.035 and vol_spike >= 1.8:
             return "consolidation_breakout"
+
         else:
             return "neutral"
 

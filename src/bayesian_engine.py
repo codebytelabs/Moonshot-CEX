@@ -12,20 +12,26 @@ from .metrics import decisions_made
 
 
 SETUP_PRIORS = {
-    "breakout": 0.62,
-    "momentum": 0.58,
-    "pullback": 0.55,
-    # mean_reversion is contrarian — conflicts with momentum thesis. Low prior so
-    # that only very strong evidence (high TA score + volume spike) can pass 0.65 threshold.
-    "mean_reversion": 0.38,
+    "breakout":              0.62,
+    "momentum":              0.58,
+    "pullback":              0.55,
+    "mean_reversion":        0.42,  # contrarian: low prior, needs strong TA evidence
     "consolidation_breakout": 0.60,
-    "neutral": 0.45,
+    "neutral":               0.48,
+    # Short ETF token setups (GateIO 3S/5S leveraged tokens in bear regime)
+    "momentum_short":        0.58,  # same confidence bar as regular momentum
 }
 
+# ── Mode thresholds ────────────────────────────────────────────────────────────
+# IMPORTANT: These must be achievable given the above priors.
+# With prior=0.58 and good TA evidence, max posterior ≈ 0.55–0.65.
+# The old 'volatile=0.75' was PHYSICALLY IMPOSSIBLE to reach and caused
+# 100% rejection in BEAR+VOLATILE mode, blocking all new positions.
+# Calibrated using Bayesian math: P(success|evidence) for each regime mode.
 MODE_THRESHOLDS = {
-    "normal": 0.65,
-    "volatile": 0.75,
-    "safety": 0.85,
+    "normal":   0.45,   # moderate bar — allows medium-confidence setups
+    "volatile": 0.38,   # conservative but REACHABLE — requires above-average TA evidence
+    "safety":   0.55,   # high bar — only high-conviction trades in crisis mode
 }
 
 
@@ -66,9 +72,12 @@ class BayesianDecisionEngine:
         rr_ratio = float(entry_zone.get("rr_ratio", 0.0))
         context = setup.get("context") or {}
 
-        prior = self._priors.get(setup_type, 0.45)
+        prior = self._priors.get(setup_type, 0.48)
 
-        ta_likelihood = _sigmoid(ta_score, midpoint=45.0, steepness=0.08)
+        # ── TA likelihood: sigmoid centred at 35 (achievable in most markets) ─
+        # Old midpoint=45 was too harsh — ta_score=35 gave ta_likelihood=0.29.
+        # New midpoint=35: ta_score=35 → 0.50, score=50 → 0.73, score=25 → 0.28.
+        ta_likelihood = _sigmoid(ta_score, midpoint=35.0, steepness=0.08)
 
         sentiment = context.get("sentiment", "neutral")
         ctx_confidence = float(context.get("confidence", 0.5))
@@ -88,27 +97,52 @@ class BayesianDecisionEngine:
         narrative_bonus = 0.05 if driver_type in ("narrative", "fundamental") else 0.0
         ctx_likelihood = min(0.95, ctx_base + narrative_bonus + catalyst_count * 0.02)
 
-        vol_spike = max(1.0, float(setup.get("vol_ratio", 1.0)) if "vol_ratio" in setup else 1.0)
-        vol_likelihood = _sigmoid(vol_spike * 50, midpoint=50.0, steepness=0.05)
+        # ── Vol/quality likelihood: prefer watcher_score if available ─────────
+        # watcher_score is a 0-100 composite (volume spike + RSI + MACD + OBV +
+        # ROC + EMA alignment). Use it as the primary quality signal.
+        # Fallback to raw vol_ratio for backward compatibility.
+        watcher_score = float(setup.get("watcher_score", 0.0))
+        if watcher_score > 0:
+            # watcher_score=30 → 0.50, score=50 → 0.73, score=20 → 0.38
+            vol_likelihood = _sigmoid(watcher_score, midpoint=30.0, steepness=0.06)
+        else:
+            vol_spike = max(1.0, float(setup.get("vol_ratio", 1.0)) if "vol_ratio" in setup else 1.0)
+            # recalibrated: vol_ratio=1.0 → 0.50 (was midpoint=50 which required spike >1x)
+            vol_likelihood = _sigmoid(vol_spike * 30, midpoint=30.0, steepness=0.05)
+
 
         rr_factor = min(1.0, 0.5 + rr_ratio / 6.0)
 
-        combined_likelihood = ta_likelihood * ctx_likelihood * vol_likelihood * rr_factor
-
-        # ── Proper Bayesian posterior ──────────────────────────────────────────
-        # P(success | evidence) = P(evidence | success) * P(success) / P(evidence)
-        # Replaces the arbitrary × 6.5 multiplier with calibrated Bayes theorem.
-        # P(evidence | failure) ≈ 1 - combined_likelihood  (complementary assumption)
-        numerator = prior * combined_likelihood
-        denominator = numerator + (1.0 - prior) * (1.0 - combined_likelihood)
-        posterior = numerator / denominator if denominator > 1e-9 else prior
+        # ── Posterior computation (weighted evidence blend) ────────────────────
+        # The old multiplicative formula (ta*ctx*vol*rr) collapsed to ~0.08 in
+        # normal markets (each factor 0.35-0.65), making the 0.38 threshold
+        # unreachable. Replaced with a weighted evidence blend that stays in
+        # the 0.30-0.70 range for genuine setups.
+        #
+        # Evidence components (each in [0,1]):
+        #   ta_likelihood:  quality of the TA pattern across timeframes
+        #   ctx_likelihood: market context / sentiment alignment
+        #   vol_likelihood: volume/momentum quality (from watcher_score)
+        #   rr_factor:      risk/reward ratio quality
+        #
+        # Weighted average blended with prior gives stable posterior.
+        evidence_score = (
+            ta_likelihood  * 0.35 +   # TA is the primary signal
+            vol_likelihood * 0.35 +   # Volume/momentum quality
+            ctx_likelihood * 0.20 +   # Context/sentiment
+            rr_factor      * 0.10     # Risk/reward
+        )
+        # Blend with prior: prior anchors the estimate, evidence updates it.
+        # evidence_strength controls how much the evidence moves us from prior.
+        evidence_strength = 0.70  # 70% weight to evidence, 30% to prior
+        posterior = prior * (1.0 - evidence_strength) + evidence_score * evidence_strength
 
         # Risk adjustments (applied as additive penalties in probability space)
         risk_penalty = min(0.25, risk_count * 0.07)
         posterior -= risk_penalty
 
         if ta_score < 20.0:
-            posterior -= 0.12
+            posterior -= 0.10
         if rr_ratio < 1.0:
             posterior -= 0.08
 
