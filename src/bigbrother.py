@@ -127,6 +127,11 @@ class BigBrotherAgent:
         self._start_time = time.time()
         # track how many cycles we've held a given regime to avoid flapping
         self._regime_cycles: int = 0
+        # LLM macro sentiment: cached score in [-1, +1], updated every 30 cycles
+        self._llm_macro_score: float = 0.0   # 0 = neutral (default until first LLM call)
+        self._llm_macro_label: str = "unknown"
+        self._llm_macro_updated: int = 0      # cycle number of last LLM update
+        self._llm_macro_interval: int = 30    # query LLM every 30 cycles (≈7.5 min)
 
     async def supervise(
         self,
@@ -147,6 +152,24 @@ class BigBrotherAgent:
 
         # Regime detection (every N cycles)
         if self._cycle_count % self.regime_interval == 0:
+            # Fetch LLM macro signal asynchronously (fire & forget — never blocks cycle)
+            if (
+                self.api_key
+                and (self._cycle_count - self._llm_macro_updated) >= self._llm_macro_interval
+            ):
+                try:
+                    llm_signal = await self._fetch_llm_macro_sentiment()
+                    if llm_signal["score"] != 0.0 or llm_signal["label"] != "unknown":
+                        self._llm_macro_score = llm_signal["score"]
+                        self._llm_macro_label = llm_signal["label"]
+                        self._llm_macro_updated = self._cycle_count
+                        logger.info(
+                            f"[BigBrother] 🧠 LLM macro signal: {llm_signal['label']} "
+                            f"(score={llm_signal['score']:+.2f}) — {llm_signal.get('reason', '')[:80]}"
+                        )
+                except Exception as _e:
+                    logger.debug(f"[BigBrother] LLM macro fetch error: {_e}")
+
             new_regime = self._detect_regime(btc_ticker, closed_trades)
             if new_regime != self.regime:
                 events.append(self._record_event("regime_change", f"{self.regime} → {new_regime}"))
@@ -290,6 +313,24 @@ class BigBrotherAgent:
         else:
             primary = "sideways"
 
+        # ── LLM macro signal integration ────────────────────────────────────
+        # LLM reads current BTC/macro news and returns a -1 to +1 score.
+        # Adds ±1.5 to the composite score, acting as a leading indicator that
+        # can push regime classification before TA metrics catch up.
+        # Weight is 1.5 (modest: LLM overrides require TA confirmation too).
+        if self._llm_macro_score != 0.0:
+            score_with_llm = score + self._llm_macro_score * 1.5
+            logger.debug(
+                f"[BigBrother] Regime score: TA={score:.2f} + LLM={self._llm_macro_score:+.2f}×1.5 "
+                f"= {score_with_llm:.2f} ({self._llm_macro_label})"
+            )
+            if score_with_llm >= 2.5 and primary != "bull":
+                logger.info(f"[BigBrother] LLM macro upgraded regime: {primary} → bull")
+                primary = "bull"
+            elif score_with_llm <= -2.0 and primary != "bear":
+                logger.info(f"[BigBrother] LLM macro downgraded regime: {primary} → bear")
+                primary = "bear"
+
         # ── Choppy override ───────────────────────────────────────────────────
         # Choppy = sideways market but with volatile/whipsaw behaviour.
         # Indicators:
@@ -321,6 +362,62 @@ class BigBrotherAgent:
         if not holds:
             return 0.0
         return sum(holds) / len(holds)
+
+    async def _fetch_llm_macro_sentiment(self) -> dict:
+        """
+        Query the LLM for current BTC/crypto macro market sentiment.
+        Returns {score: float [-1,+1], label: str, reason: str}.
+        Cached externally — only called every _llm_macro_interval cycles.
+        """
+        prompt = (
+            "You are a crypto macro analyst. Based on the CURRENT market environment "
+            "(today's BTC price action, macro news, fear/greed index, recent headlines), "
+            "assess the overall crypto market regime.\n\n"
+            "Respond ONLY with a valid JSON object with these exact fields:\n"
+            '  {"score": <float from -1.0 to +1.0>, "label": "<bullish|neutral|bearish>", '
+            '"reason": "<one sentence max>"}\n\n'
+            "Score guide: +1.0 = strongly bullish macro, 0.0 = neutral, -1.0 = strongly bearish.\n"
+            "Examples: market crash = -0.9, ETF inflows = +0.7, sideways = 0.0\n"
+            "Be concise. Respond with JSON only, no markdown."
+        )
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(
+                    f"{self.api_base}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                        "HTTP-Referer": "https://moonshot-cex.ai",
+                        "X-Title": "Moonshot-CEX BigBrother",
+                    },
+                    json={
+                        "model": self.model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 120,
+                        "temperature": 0.1,
+                    },
+                )
+                if resp.status_code == 200:
+                    raw = resp.json()["choices"][0]["message"]["content"].strip()
+                    # Parse JSON from response
+                    import json as _json
+                    start = raw.find("{")
+                    end = raw.rfind("}") + 1
+                    if start != -1 and end > 0:
+                        parsed = _json.loads(raw[start:end])
+                        score = float(parsed.get("score", 0.0))
+                        score = max(-1.0, min(1.0, score))  # clamp to [-1, +1]
+                        return {
+                            "score": score,
+                            "label": str(parsed.get("label", "neutral")),
+                            "reason": str(parsed.get("reason", "")),
+                        }
+                else:
+                    logger.debug(f"[BigBrother] LLM macro HTTP {resp.status_code}")
+        except Exception as e:
+            logger.debug(f"[BigBrother] LLM macro error: {e}")
+            errors_total.labels(component="bigbrother", error_type="llm_macro").inc()
+        return {"score": 0.0, "label": "unknown", "reason": ""}
 
     def _compute_mode(self, equity: float, closed_trades: list[dict]) -> str:
         health = self.risk.check_portfolio_health(equity)
@@ -413,6 +510,9 @@ class BigBrotherAgent:
             "regime_params": self._build_regime_params(self.regime),
             "regime_capital": self._build_regime_capital(self.regime),
             "regime_setup_allowlist": list(REGIME_SETUP_ALLOWLIST.get(self.regime, set())),
+            # LLM macro signal — visible in /api/swarm/status for observability
+            "llm_macro_score": self._llm_macro_score,
+            "llm_macro_label": self._llm_macro_label,
         }
 
     def get_recent_events(self, n: int = 20) -> list[dict]:

@@ -20,7 +20,7 @@ class ContextAgent:
     def __init__(
         self,
         openrouter_api_key: str,
-        model: str = "perplexity/sonar-pro-search",
+        model: str = "google/gemini-2.5-flash-lite-preview-09-2025",
         base_url: str = "https://openrouter.ai/api/v1",
         redis: Optional[RedisClient] = None,
         cache_ttl: int = 900,
@@ -36,6 +36,7 @@ class ContextAgent:
         self.enabled = enabled
         self._call_count = 0
         self._cache_hits = 0
+        logger.info(f"[ContextAgent] Initialized | model={model} enabled={enabled}")
 
     async def enrich(self, setups: list[dict]) -> list[dict]:
         """

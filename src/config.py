@@ -44,17 +44,19 @@ class Settings(BaseSettings):
     # ── LLM ─────────────────────────────────────────────────────────────────
     llm_provider: str = Field(default="openrouter", alias="LLM_PROVIDER")
     openrouter_api_key: Optional[str] = Field(default=None, alias="OPENROUTER_API_KEY")
-    openrouter_base_url: str = Field(default="https://openrouter.ai/api/v1", alias="OPENROUTER_API_BASE_URL")
-    openrouter_primary_model: str = Field(default="google/gemini-2.5-flash-lite-preview-09-2025", alias="OPENROUTER_PRIMARY_MODEL")
+    # Accept both OPENROUTER_BASE_URL (set in .env) and legacy OPENROUTER_API_BASE_URL
+    openrouter_base_url: str = Field(default="https://openrouter.ai/api/v1", alias="OPENROUTER_BASE_URL")
+    # Primary chat model — used by ContextAgent and BigBrother
+    openrouter_primary_model: str = Field(default="google/gemini-2.5-flash-lite-preview-09-2025", alias="OPENROUTER_MODEL")
     openrouter_secondary_model: str = Field(default="deepseek/deepseek-v3.2-exp", alias="OPENROUTER_SECONDARY_MODEL")
-    openrouter_perplexity_model: str = Field(default="perplexity/sonar-pro-search", alias="OPENROUTER_PERPLEXITY_MODEL")
+    openrouter_fallback_model: str = Field(default="google/gemini-2.5-flash-lite-preview-09-2025", alias="OPENROUTER_FALLBACK_MODEL")
 
     # ── Watcher ─────────────────────────────────────────────────────────────
     watcher_min_volume_24h_usd: float = Field(default=2_000_000.0, alias="WATCHER_MIN_VOLUME_24H_USD")
     watcher_top_n: int = Field(default=20, alias="WATCHER_TOP_N")
 
     # ── Analyzer ────────────────────────────────────────────────────────────
-    analyzer_min_score: float = Field(default=30.0, alias="ANALYZER_MIN_SCORE")
+    analyzer_min_score: float = Field(default=20.0, alias="ANALYZER_MIN_SCORE")  # lowered: was 30
     analyzer_top_n: int = Field(default=5, alias="ANALYZER_TOP_N")
     analyzer_timeframes: List[str] = Field(default=["5m", "15m", "1h", "4h"], alias="ANALYZER_TIMEFRAMES")
 
@@ -63,9 +65,11 @@ class Settings(BaseSettings):
     context_cache_ttl: int = Field(default=900, alias="CONTEXT_CACHE_TTL")
 
     # ── Bayesian ────────────────────────────────────────────────────────────
-    bayesian_threshold_normal: float = Field(default=0.65, alias="BAYESIAN_THRESHOLD_NORMAL")
-    bayesian_threshold_volatile: float = Field(default=0.75, alias="BAYESIAN_THRESHOLD_VOLATILE")
-    bayesian_threshold_safety: float = Field(default=0.85, alias="BAYESIAN_THRESHOLD_SAFETY")
+    # Calibrated: old defaults (0.65/0.75/0.85) were physically unreachable
+    # given priors of 0.48-0.62. New values match calibrated posterior range.
+    bayesian_threshold_normal: float = Field(default=0.45, alias="BAYESIAN_THRESHOLD_NORMAL")
+    bayesian_threshold_volatile: float = Field(default=0.38, alias="BAYESIAN_THRESHOLD_VOLATILE")
+    bayesian_threshold_safety: float = Field(default=0.55, alias="BAYESIAN_THRESHOLD_SAFETY")
 
     # ── Risk Management ─────────────────────────────────────────────────────
     max_positions: int = Field(default=5, alias="MAX_POSITIONS")

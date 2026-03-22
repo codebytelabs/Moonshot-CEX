@@ -144,7 +144,7 @@ async def _startup():
     )
     _context = ContextAgent(
         openrouter_api_key=cfg.openrouter_api_key or "",
-        model=cfg.openrouter_perplexity_model,
+        model=cfg.openrouter_primary_model,   # Gemini Flash — works with standard chat API
         base_url=cfg.openrouter_base_url,
         redis=_redis,
         cache_ttl=cfg.context_cache_ttl,
