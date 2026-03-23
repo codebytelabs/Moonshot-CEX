@@ -202,6 +202,65 @@ class ExecutionCore:
         if amount_adj <= 0:
             raise ValueError(f"Invalid sell amount {amount_adj} for {symbol}")
 
+        # ── Market sell for ALL exits — guaranteed single-attempt fill ────────────
+        # IOC limit exits (momentum_died, time_exit, regime_shift_sweep) create
+        # partial-fill loops: fills 99%, leaves remainder, retries every 15s, remainder
+        # GROWS as new positions open on the same symbol (no cooldown set). After
+        # TRX cycling for 3+ min × 8 cycles generating fees, switch everything to
+        # market sell. Speed > price optimization for a momentum bot.
+        _SL_REASONS = ("stop_loss", "trailing_stop", "scale_down", "momentum_died",
+                       "time_exit", "no_traction", "regime_shift", "hard_loss",
+                       "regime_sweep", "emergency", "faded", "stall")
+        if reason in _SL_REASONS or any(x in reason for x in _SL_REASONS):
+            try:
+                sl_order = await asyncio.wait_for(
+                    self.exchange.create_market_sell(symbol, amount_adj),
+                    timeout=15.0,
+                )
+                sl_fill = await asyncio.wait_for(
+                    self._poll_fill(symbol, sl_order.get("id", ""), max_polls=5),
+                    timeout=15.0,
+                )
+                sl_price, sl_filled, sl_fee = self._parse_fill(symbol, sl_fill, price, amount_adj)
+                # Gate.io market orders return fill data in a different schema —
+                # _parse_fill may return 0 even when the order executed. If the
+                # order status is not 'open'/'pending', treat it as fully filled
+                # at the passed price rather than falling to the IOC loop.
+                if sl_filled <= 0:
+                    order_status = (sl_fill or sl_order or {}).get("status", "")
+                    if order_status not in ("open", "pending", ""):
+                        sl_filled = float((sl_fill or sl_order or {}).get("filled", 0) or amount_adj)
+                        sl_price = float((sl_fill or sl_order or {}).get("average", 0) or price)
+                        logger.info(
+                            f"[Exec] Market sell fill parse fallback {symbol} ({reason}): "
+                            f"status={order_status} assuming filled={sl_filled:.6f} @ {sl_price:.6f}"
+                        )
+                if sl_filled > 0:
+                    trades_total.labels(side="sell", exchange=self.exchange.name).inc()
+                    logger.info(
+                        f"[Exec] MARKET SOLD {symbol} ({reason}): "
+                        f"amount={sl_filled:.6f} @ {sl_price:.6f} (guaranteed market fill)"
+                    )
+                    return {
+                        "order_id": sl_order.get("id", f"mkt_{int(time.time())}"),
+                        "symbol": symbol,
+                        "side": "sell",
+                        "filled_price": sl_price,
+                        "filled_amount": sl_filled,
+                        "amount_usd": sl_price * sl_filled,
+                        "fee_usd": sl_fee,
+                        "reason": reason,
+                        "timestamp": int(time.time()),
+                        "mode": self.mode,
+                    }
+            except SubMinimumAmountError:
+                raise
+            except Exception as e:
+                logger.warning(
+                    f"[Exec] Market sell failed for {symbol} ({reason}): {e}. "
+                    f"Falling back to IOC limit."
+                )
+        # ────────────────────────────────────────────────────────────────────
 
         total_filled_amount = 0.0
         total_filled_usd = 0.0

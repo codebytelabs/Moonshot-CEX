@@ -49,15 +49,13 @@ class AnalyzerAgent:
         t0 = time.monotonic()
         results = []
 
-        # Regime-adaptive min_score: harder markets need HIGHER bars, not lower.
-        # Bear/choppy: require +10 above config floor (fewer, higher-quality entries only).
-        # Sideways: require +5 above config floor.
-        # Bull: use config floor as-is.
-        # QuantMutator raises self.min_score on cold streaks — never let regime override downward.
-        regime_boost = {"bull": 0, "sideways": 5, "bear": 10, "choppy": 10}.get(regime, 5)
+        # Regime boost removed — RSI/EMA/MACD hard gates handle quality control.
+        # Small bear-only penalty (3 pts) prevents worst setups without freezing everything.
+        # Sideways boost removed: individual tokens can momentum-run even in flat markets.
+        regime_boost = {"bull": 0, "sideways": 0, "bear": 3, "choppy": 5}.get(regime, 0)
         effective_min_score = self.min_score + regime_boost
 
-        for candidate in candidates[: self.top_n * 2]:
+        for candidate in candidates:
             setup = await self._analyze_symbol(candidate, regime=regime)
             if setup and setup["ta_score"] >= effective_min_score:
                 results.append(setup)
@@ -111,42 +109,73 @@ class AnalyzerAgent:
         sr_tf = tf_data.get("1h", tf_data.get("15m", data_5m))
         support, resistance = _compute_support_resistance(sr_tf[:, 2], sr_tf[:, 3], sr_tf[:, 4])
 
-        # ── 4h EMA50 trend gate: skip long entries when price is deeply below 4h EMA50 ──
-        # Bull: strict 1% — only enter tokens showing real strength vs the trend.
-        # Sideways: 4% — normal consolidation pullbacks (2-5% below EMA50) are valid entries.
-        # Bear/choppy: 5% — relative-strength / recovery plays allowed.
-        # Using a flat 1% for all regimes blocked LINK, SOL, XRP etc. that were
-        # sitting 2-5% below EMA50 in a post-pullback sideways market.
+        # ── 4h EMA50 trend gate (loose): only block deeply falling tokens ──────
+        # 10% tolerance — only rejects tokens crashing hard in a 4h downtrend.
+        # Individual momentum breakouts trade fine even when below 4h EMA50.
         direction = candidate.get("direction", "long")
         if direction == "long" and "4h" in tf_data:
             closes_4h = tf_data["4h"][:, 4]
             if len(closes_4h) >= 50:
                 ema50_4h = _ema(closes_4h, 50)
-                # EMA slope: is the 4h EMA50 rising? Require last 5 bars trending up.
-                ema50_5bars_ago = _ema(closes_4h[:-5], 50) if len(closes_4h) > 55 else ema50_4h
-                ema50_rising = ema50_4h > ema50_5bars_ago * 1.001  # EMA must be rising ≥ 0.1%
-                # Price gate:
-                # Bull: 3% pullback allowed (normal EMA retest).
-                # Sideways: 2% below EMA50 allowed — catches breakout entries just starting.
-                # Bear/choppy: must be AT or above EMA50 AND EMA must be rising.
-                if regime == "bull":
-                    ema_tolerance = 0.97
-                elif regime == "sideways":
-                    ema_tolerance = 0.98
-                else:  # bear / choppy
-                    ema_tolerance = 1.00
-                price_below_ema = closes_4h[-1] < ema50_4h * ema_tolerance
-                # In bear/choppy also require EMA to be rising — declining EMA = downtrend
-                ema_declining_in_bear = regime in ("bear", "choppy") and not ema50_rising
-                if price_below_ema or ema_declining_in_bear:
+                if closes_4h[-1] < ema50_4h * 0.90:
                     logger.debug(
                         f"[Analyzer] {symbol} filtered: price {closes_4h[-1]:.6f} "
-                        f"vs EMA50 {ema50_4h:.6f} (tol={ema_tolerance}, rising={ema50_rising}, regime={regime})"
+                        f"< EMA50 {ema50_4h:.6f} * 0.90 (deeply below trend)"
+                    )
+                    return None
+
+        # ── EMA alignment: 1h OR 15m EMA9 > EMA21 ────────────────────────────
+        # Momentum tokens breaking out on 15m may not yet show 1h EMA9>EMA21 (lagging).
+        # Accept either timeframe — catches early breakouts before 1h confirms.
+        if direction == "long":
+            _ema_ok = False
+            if "1h" in tf_data:
+                _c1h = tf_data["1h"][:, 4]
+                if len(_c1h) >= 21 and _ema(_c1h, 9) > _ema(_c1h, 21):
+                    _ema_ok = True
+            if not _ema_ok and "15m" in tf_data:
+                _c15m = tf_data["15m"][:, 4]
+                if len(_c15m) >= 21 and _ema(_c15m, 9) > _ema(_c15m, 21) * 1.001:
+                    _ema_ok = True
+            if not _ema_ok:
+                logger.debug(f"[Analyzer] {symbol} filtered: neither 1h nor 15m EMA9>EMA21")
+                return None
+
+        # ── RSI gate: 40-82, allows peak momentum zone (was 35-70) ───────────
+        # RSI 70-82 = PEAK MOMENTUM ZONE for breakouts — old gate was killing these.
+        # Only block truly oversold (<40, no momentum) or extreme blowoff (>82).
+        if direction == "long" and "1h" in tf_data:
+            _c1h_rsi = tf_data["1h"][:, 4]
+            if len(_c1h_rsi) >= 14:
+                rsi_1h = _compute_rsi(_c1h_rsi, 14)
+                if rsi_1h > 82:
+                    logger.debug(f"[Analyzer] {symbol} filtered: 1h RSI {rsi_1h:.1f} > 82 (extreme blowoff)")
+                    return None
+                if rsi_1h < 40:
+                    logger.debug(f"[Analyzer] {symbol} filtered: 1h RSI {rsi_1h:.1f} < 40 (no momentum)")
+                    return None
+
+        # ── MACD confirmation: hist > 0 OR rising ─────────────────────────────
+        # hist > 0 = confirmed momentum. hist rising (crossing from below) = momentum STARTING.
+        # Old gate (hist > 0 only) fired too late — move was 50% done by confirmation.
+        if direction == "long" and "1h" in tf_data:
+            _c1h_macd = tf_data["1h"][:, 4]
+            if len(_c1h_macd) >= 36:
+                hist_now = _compute_macd_hist(_c1h_macd, 12, 26, 9)
+                hist_prev = _compute_macd_hist(_c1h_macd[:-1], 12, 26, 9)
+                if hist_now <= 0 and hist_now <= hist_prev:
+                    logger.debug(
+                        f"[Analyzer] {symbol} filtered: 1h MACD {hist_now:.6f} ≤0 and not rising"
                     )
                     return None
 
         # Setup classification
         setup_type = self._classify_setup(tf_data, ta_scores)
+        # Tokens that cleared all hard filter gates ARE showing momentum signals.
+        # 'neutral' just means score patterns don't fit a clean category — trade it
+        # as momentum. Position sizing (kelly × ta_score) auto-scales weak signals smaller.
+        if setup_type == "neutral":
+            setup_type = "momentum"
 
         # Entry zone
         entry_zone = self._compute_entry_zone(price, atr, support, resistance, setup_type)
@@ -248,11 +277,11 @@ class AnalyzerAgent:
             return "breakout"
 
         # MOMENTUM: 4h trend established OR 1h+5m confluence OR relative-strength intra-day surge.
-        # Third branch catches tokens like TRX breaking out on 5m/1h while 4h hasn't fully built yet.
+        # RSI bounds match the 40-82 filter gate — tokens at RSI 72-82 are peak momentum, not top.
         elif (
-            (score_4h >= 40 and score_1h >= 35 and 45 <= rsi <= 72)
-            or (score_4h >= 35 and score_5m >= 30 and 50 <= rsi <= 75)
-            or (score_5m >= 42 and score_1h >= 30 and 52 <= rsi <= 80)
+            (score_4h >= 40 and score_1h >= 35 and 42 <= rsi <= 82)
+            or (score_4h >= 35 and score_5m >= 30 and 48 <= rsi <= 82)
+            or (score_5m >= 42 and score_1h >= 30 and 50 <= rsi <= 82)
         ):
             return "momentum"
 
@@ -322,7 +351,19 @@ class AnalyzerAgent:
             stop_loss = entry - risk_per_unit
             take_profit_1 = entry + 2.0 * risk_per_unit
             take_profit_2 = entry + 4.0 * risk_per_unit
+        # ── Enforce maximum 6% stop distance (config safety net) ─────────
+        max_risk = entry * 0.06
+        if risk_per_unit > max_risk:
+            risk_per_unit = max_risk
+            stop_loss = entry - risk_per_unit
+            take_profit_1 = entry + 2.0 * risk_per_unit
+            take_profit_2 = entry + 4.0 * risk_per_unit
+
         rr_ratio = (take_profit_1 - entry) / risk_per_unit if risk_per_unit > 0 else 0.0
+
+        # Reject setups where R:R is below 1.8 — not worth the risk
+        if rr_ratio < 1.8:
+            return None
 
         return {
             "entry": round(entry, 8),

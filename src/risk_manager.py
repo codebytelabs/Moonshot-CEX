@@ -74,6 +74,7 @@ class RiskManager:
         max_kelly_fraction: float = 0.25,
         min_trades_for_kelly: int = 30,
         initial_equity: float = 1000.0,
+        max_daily_trades: int = 6,
     ):
         self.max_positions = max_positions
         self.max_portfolio_exposure_pct = max_portfolio_exposure_pct
@@ -87,6 +88,8 @@ class RiskManager:
         self.max_kelly_fraction = max_kelly_fraction
         self.min_trades_for_kelly = min_trades_for_kelly
 
+        self.max_daily_trades = max_daily_trades
+
         self.peak_equity = initial_equity
         self._day_start_equity = initial_equity
         self._day_start_time = _today_start()
@@ -94,6 +97,7 @@ class RiskManager:
         self._consecutive_wins = 0
         self._pause_until: Optional[float] = None
         self._trade_history: list[dict] = []
+        self._day_trade_count: int = 0
 
         # Account tier — re-computed whenever detect_account_tier() is called
         # Defaults match the medium-tier row of ACCOUNT_TIER_THRESHOLDS so that
@@ -171,6 +175,9 @@ class RiskManager:
         day_pnl_pct = (current_equity - self._day_start_equity) / self._day_start_equity if self._day_start_equity > 0 else 0.0
         if day_pnl_pct <= -self.daily_loss_limit_pct:
             return False, f"daily_loss_limit hit ({day_pnl_pct:.1%})"
+
+        if self._day_trade_count >= self.max_daily_trades:
+            return False, f"max_daily_trades reached ({self._day_trade_count}/{self.max_daily_trades})"
 
         if drawdown >= self.max_drawdown_pct:
             return False, f"max_drawdown hit ({drawdown:.1%})"
@@ -292,6 +299,7 @@ class RiskManager:
     def record_trade(self, pnl_usd: float, pnl_pct: float, r_multiple: float):
         """Record trade outcome for Kelly and circuit breaker logic."""
         won = pnl_usd > 0
+        self._day_trade_count += 1
         self._trade_history.append({
             "pnl_usd": pnl_usd,
             "pnl_pct": pnl_pct,
@@ -384,6 +392,7 @@ class RiskManager:
         today = _today_start()
         if today > self._day_start_time:
             self._day_start_equity = equity
+            self._day_trade_count = 0
             self._day_start_time = today
 
     def _update_metrics(self):

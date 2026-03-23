@@ -150,6 +150,8 @@ class PositionManager:
         self._closed_history: list[dict] = []
         # Cooldown tracking: symbol → epoch time of any exit
         self._symbol_cooldowns: dict[str, float] = {}
+        # Track consecutive exit failures per position — ghost-close after 3
+        self._exit_failure_count: dict[str, int] = {}
 
     def is_symbol_on_cooldown(self, symbol: str) -> bool:
         """True if this symbol was recently stopped out and is still cooling down."""
@@ -430,6 +432,14 @@ class PositionManager:
 
         hold_h = pos.hold_time_hours()
 
+        # ── Hard loss cut (safety net between momentum exits and SL) ─────────
+        # Momentum thesis: if we're -2% after 10 min and never hit 0.5%, the wave
+        # didn't come. Cut immediately — don't wait for SL to bleed further.
+        if not is_synced and hold_h >= 0.167 and pnl_pct <= -2.0:
+            peak_pnl = pos.current_pnl_pct(pos.highest_price if pos.side == "long" else pos.lowest_price)
+            if peak_pnl < 0.5:  # never reached 0.5% profit → bad momentum entry
+                return await self._execute_exit(pos, current_price, "hard_loss_cut", pos.amount)
+
         # Bot-only momentum exits (keep these specific to bot trades)
         if not is_synced:
             # Bear/choppy = aggressive exits: fast management of short tokens + quick cut of bad longs
@@ -526,14 +536,19 @@ class PositionManager:
                     f"[PM] EXIT PARTIAL {pos.symbol} ({reason}): "
                     f"filled={filled_amount:.6f} remaining={pos.amount:.6f}"
                 )
-                # Set cooldown immediately on partial stop-loss fills — prevents
-                # scale_position from re-buying into a position that just stopped out.
-                if "stop" in reason.lower():
-                    cooldown_until = time.time() + self.symbol_cooldown_minutes * 60
+                # Set cooldown on ALL partial fills — prevents opening a new position
+                # while the old one is still in the partial-exit loop.
+                # Old code: only stop_loss set cooldown → momentum_died/time_exit
+                # partial fills had NO cooldown → new position opened same cycle →
+                # remaining GREW (TRX: 49→76 tokens over 8 cycles).
+                r = reason.lower()
+                if any(x in r for x in ("stop", "momentum", "time_exit", "regime", "hard_loss", "no_traction", "emergency", "faded", "stall")):
+                    cooldown_m = self.symbol_cooldown_minutes * (1.5 if "stop" in r else 1.0)
+                    cooldown_until = time.time() + cooldown_m * 60
                     self._symbol_cooldowns[pos.symbol] = cooldown_until
                     logger.info(
-                        f"[PM] Cooldown {pos.symbol} for {self.symbol_cooldown_minutes:.0f}m "
-                        f"after partial stop-loss (remaining={pos.amount:.6f})"
+                        f"[PM] Cooldown {pos.symbol} for {cooldown_m:.0f}m "
+                        f"after partial {reason} (remaining={pos.amount:.6f})"
                     )
                 return None
             # BUG FIX: Compute PnL on this final tranche using price×amount, not fill.amount_usd vs
@@ -625,7 +640,33 @@ class PositionManager:
             return closed
 
         except Exception as e:
-            logger.error(f"[PM] Exit failed for {pos.symbol} ({reason}): {e}")
+            # Track consecutive failures — force ghost-close after 3 to prevent
+            # positions bleeding forever when exchange rejects sells
+            count = self._exit_failure_count.get(pos.id, 0) + 1
+            self._exit_failure_count[pos.id] = count
+            if count >= 3:
+                logger.warning(
+                    f"[PM] FORCE GHOST-CLOSE {pos.symbol} ({reason}): "
+                    f"{count} consecutive exit failures — closing as unsellable. "
+                    f"Last error: {e}"
+                )
+                pos.status = "closed"
+                pos.closed_at = int(time.time())
+                pos.close_reason = f"{reason}_force_ghost"
+                cooldown_until = time.time() + self.symbol_cooldown_minutes * 2 * 60
+                self._symbol_cooldowns[pos.symbol] = cooldown_until
+                closed = pos.to_dict()
+                closed["exit_price"] = price if price > 0 else pos.entry_price
+                closed["pnl_pct"] = round(pos.current_pnl_pct(closed["exit_price"]), 2)
+                closed["pnl_usd"] = round(pos.unrealized_pnl_usd(closed["exit_price"]), 4)
+                self._closed_history.append(closed)
+                if len(self._closed_history) > 200:
+                    self._closed_history = self._closed_history[-200:]
+                del self._positions[pos.id]
+                self._exit_failure_count.pop(pos.id, None)
+                active_positions.set(len(self._positions))
+                return closed
+            logger.error(f"[PM] Exit failed for {pos.symbol} ({reason}): {e} (attempt {count}/3)")
             return None
         finally:
             self._positions_being_exited.discard(pos.id)
@@ -681,6 +722,15 @@ class PositionManager:
             if p.status == "open" and p.setup_type not in ("synced_holding", "exchange_holding")
         )
 
+    @property
+    def has_failed_exits(self) -> bool:
+        """True if any open position has accumulated exit failures."""
+        return any(
+            self._exit_failure_count.get(pos.id, 0) > 0
+            for pos in self._positions.values()
+            if pos.status == "open"
+        )
+
     def get_open_symbols(self) -> set[str]:
         return {p.symbol for p in self._positions.values() if p.status == "open"}
 
@@ -733,6 +783,24 @@ class PositionManager:
             return "hold"
 
         if delta_usd > 0:
+            # Safety: never pyramid into a losing position — only scale up when
+            # price is at or above entry (i.e., position is breakeven or profitable).
+            if current_price < pos.entry_price * 0.998:
+                logger.info(
+                    f"[PM] SCALE BLOCKED {pos.symbol}: "
+                    f"price {current_price:.6f} below entry {pos.entry_price:.6f} "
+                    f"— refusing to pyramid into losing position"
+                )
+                return "hold"
+
+            # Cap scale-ups at 2 per position to prevent runaway exposure.
+            if pos.pyramid_count >= 2:
+                logger.info(
+                    f"[PM] SCALE BLOCKED {pos.symbol}: "
+                    f"pyramid_count={pos.pyramid_count} at max (2) — no more adds"
+                )
+                return "hold"
+
             # Safety: block scale-up if price is at or near the stop_loss level.
             # Buying here would trigger an immediate stop_loss exit next tick.
             if pos.stop_loss > 0 and current_price <= pos.stop_loss * 1.005:
@@ -770,11 +838,13 @@ class PositionManager:
                         pos.stop_loss = pos.entry_price * (1.0 - sl_dist_frac)
                     if current_price > pos.highest_price:
                         pos.highest_price = current_price
+                    pos.pyramid_count += 1
                     logger.info(
                         f"[PM] SCALE UP {pos.symbol}: "
                         f"+{filled_amount:.6f} @ {current_price:.6f} "
                         f"(delta=${delta_usd:.2f}) new_total={pos.amount:.6f} "
-                        f"new_entry={pos.entry_price:.6f} new_sl={pos.stop_loss:.6f}"
+                        f"new_entry={pos.entry_price:.6f} new_sl={pos.stop_loss:.6f} "
+                        f"pyramid={pos.pyramid_count}/2"
                     )
                 return "scaled_up"
             except Exception as e:

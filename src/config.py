@@ -74,14 +74,15 @@ class Settings(BaseSettings):
     bayesian_threshold_safety: float = Field(default=0.58, alias="BAYESIAN_THRESHOLD_SAFETY")
 
     # ── Risk Management ─────────────────────────────────────────────────────
-    max_positions: int = Field(default=8, alias="MAX_POSITIONS")                                 # exposure cap (not count) limits real deployment
-    max_portfolio_exposure_pct: float = Field(default=0.85, alias="MAX_PORTFOLIO_EXPOSURE_PCT")   # 85% of equity deployable
-    max_single_exposure_pct: float = Field(default=0.25, alias="MAX_SINGLE_EXPOSURE_PCT")        # 25% per position ceiling
-    max_risk_per_trade_pct: float = Field(default=0.06, alias="MAX_RISK_PER_TRADE_PCT")          # 6% risk per trade
+    max_positions: int = Field(default=3, alias="MAX_POSITIONS")
+    max_portfolio_exposure_pct: float = Field(default=0.50, alias="MAX_PORTFOLIO_EXPOSURE_PCT")
+    max_single_exposure_pct: float = Field(default=0.15, alias="MAX_SINGLE_EXPOSURE_PCT")
+    max_risk_per_trade_pct: float = Field(default=0.08, alias="MAX_RISK_PER_TRADE_PCT")
     max_drawdown_pct: float = Field(default=0.15, alias="MAX_DRAWDOWN_PCT")
-    daily_loss_limit_pct: float = Field(default=0.06, alias="DAILY_LOSS_LIMIT_PCT")             # 6% daily loss ceiling
+    daily_loss_limit_pct: float = Field(default=0.05, alias="DAILY_LOSS_LIMIT_PCT")
+    max_daily_trades: int = Field(default=6, alias="MAX_DAILY_TRADES")
     consecutive_loss_threshold: int = Field(default=3, alias="CONSECUTIVE_LOSS_THRESHOLD")
-    consecutive_loss_pause_minutes: int = Field(default=10, alias="CONSECUTIVE_LOSS_PAUSE_MINUTES")
+    consecutive_loss_pause_minutes: int = Field(default=30, alias="CONSECUTIVE_LOSS_PAUSE_MINUTES")
     # DEPRECATED: initial_equity_usd is ignored at runtime.
     # Real equity is always fetched from the exchange before the swarm starts.
     # Keeping this field so .env files that set INITIAL_EQUITY_USD don't error.

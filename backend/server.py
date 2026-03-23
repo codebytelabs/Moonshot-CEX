@@ -58,6 +58,8 @@ STATE: dict = {
     "day_pnl_usd": 0.0,
     "day_pnl_pct": 0.0,
     "total_pnl_usd": 0.0,
+    "_cb_day_start_equity": 0.0,
+    "_cb_day_date": "",
     "last_cycle_at": 0,
     "last_watcher_candidates": [],
     "last_setups": [],
@@ -189,6 +191,7 @@ async def _startup():
         kelly_fraction=cfg.kelly_fraction,
         max_kelly_fraction=cfg.max_kelly_fraction,
         min_trades_for_kelly=cfg.min_trades_for_kelly,
+        max_daily_trades=cfg.max_daily_trades,
         # Pass 0.0 — will be overridden with real exchange equity during startup.
         # This prevents the risk manager from using a stale/config-defined equity value.
         initial_equity=0.0,
@@ -375,6 +378,38 @@ async def _run_cycle():
     cycle = STATE["cycle_count"]
     trace = {"cycle": cycle, "steps": []}
 
+    # ── CIRCUIT BREAKER: emergency stop if day loss exceeds 3% of equity ──
+    # Uses actual equity vs day-start equity (captures unrealized losses too)
+    equity = STATE.get("current_equity", 0)
+    _today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if STATE["_cb_day_date"] != _today_str and equity > 0:
+        STATE["_cb_day_start_equity"] = equity
+        STATE["_cb_day_date"] = _today_str
+        STATE["_circuit_breaker_tripped"] = False
+        logger.info(f"[CIRCUIT BREAKER] New day — start equity ${equity:.2f}")
+    cb_start = STATE.get("_cb_day_start_equity", 0)
+    day_pnl = equity - cb_start if cb_start > 0 else 0
+    if equity > 0 and cb_start > 0 and day_pnl < 0 and abs(day_pnl) / cb_start > 0.03:
+        if not STATE.get("_circuit_breaker_tripped"):
+            STATE["_circuit_breaker_tripped"] = True
+            logger.warning(
+                f"[CIRCUIT BREAKER] Day loss ${day_pnl:.2f} exceeds 3% of equity ${equity:.2f}. "
+                f"Emergency closing all positions and pausing."
+            )
+            if _position_manager:
+                await _position_manager.emergency_close_all()
+            if _alerts:
+                await _alerts.send(
+                    f"🚨 CIRCUIT BREAKER: Day loss ${day_pnl:.2f} ({day_pnl/equity*100:.1f}%). All positions closed.",
+                    priority="critical",
+                )
+        trace["steps"].append("circuit_breaker_active")
+        await _tick_positions()  # still tick to clean up ghost-closes
+        return
+    elif STATE.get("_circuit_breaker_tripped") and day_pnl >= 0:
+        STATE["_circuit_breaker_tripped"] = False
+        logger.info("[CIRCUIT BREAKER] Reset — day PnL back to positive.")
+
     # ── Step 1: Watcher scan ────────────────────────────────────────────────
     current_regime = STATE.get("regime", "sideways")
     candidates = await _watcher.scan(regime=current_regime)
@@ -429,7 +464,7 @@ async def _run_cycle():
 
     # In demo/live mode: fetch real available USDT cash so we never send an
     # order larger than what the exchange account actually holds.
-    _MIN_POSITION_USD = 20.0
+    _MIN_POSITION_USD = 50.0
     available_cash_usd = equity  # paper fallback: treat full equity as available
     if _uses_exchange_account_state() and _exchange:
         try:
@@ -447,6 +482,16 @@ async def _run_cycle():
         logger.warning(
             f"[Cycle {cycle}] Only ${available_cash_usd:.2f} USDT free — "
             f"skipping new entries until positions close and cash frees up."
+        )
+        await _tick_positions()
+        return
+
+    # ── Phase 1C: Block entries if any position has failed exits ─────────
+    if _position_manager and _position_manager.has_failed_exits:
+        trace["steps"].append("skip_entries:failed_exits_pending")
+        logger.warning(
+            f"[Cycle {cycle}] Blocked new entries — position(s) have failed exit attempts. "
+            f"Waiting for ghost-close before deploying more capital."
         )
         await _tick_positions()
         return
@@ -902,8 +947,41 @@ async def _recover_positions_from_db():
                 logger.warning(f"[Recovery] Could not fetch live balances: {e}")
 
         recovered = 0
+        seen_symbols: set = set()
         for doc in docs:
             symbol = doc.get("symbol", "")
+            # Skip exchange_holding / synced_holding — these are the user's personal
+            # holdings, not bot trades. Recovering them creates -$7000+ unrealized PnL
+            # swings every restart and triggers exit loops through the wrong exchange.
+            doc_setup_type = doc.get("setup_type", "")
+            if doc_setup_type in ("exchange_holding", "synced_holding"):
+                logger.debug(f"[Recovery] Skipping {symbol} ({doc_setup_type}) — user holding, not bot trade")
+                continue
+            # De-duplicate: only recover the first DB record per symbol.
+            # Multiple records arise from partial fills updating in-memory but not DB.
+            # Loading all = each gets reconciled to full exchange balance → total > held.
+            if symbol in seen_symbols:
+                logger.warning(f"[Recovery] Skipping duplicate {symbol} DB record")
+                continue
+            seen_symbols.add(symbol)
+            # Skip dust positions — amount_usd < $5 OR estimated current value < $20.
+            # BUG: doc_amount_usd = ORIGINAL position size (e.g., TAO $1392), not remaining.
+            # TAO with 0.002 tokens left has amount_usd=$1392 → old filter never fires.
+            # Fix: also check amount × entry_price (estimated remaining value).
+            doc_amount_usd = float(doc.get("amount_usd") or 0)
+            doc_amount = float(doc.get("amount") or 0)
+            doc_entry_price = float(doc.get("entry_price") or 0)
+            estimated_remaining_usd = doc_amount * doc_entry_price if doc_entry_price > 0 else doc_amount_usd
+            if doc_amount_usd < 5.0 or doc_amount < 1e-6 or estimated_remaining_usd < 20.0:
+                logger.debug(f"[Recovery] Skipping dust position {symbol}: amount_usd=${doc_amount_usd:.4f}")
+                try:
+                    await _db.positions.update_one(
+                        {"id": doc.get("id")},
+                        {"$set": {"status": "closed_dust"}},
+                    )
+                except Exception:
+                    pass
+                continue
             pos = _position_manager.restore_position_from_dict(doc)
             if pos is None:
                 continue
@@ -929,6 +1007,22 @@ async def _recover_positions_from_db():
                 # Correct the amount to what the exchange actually holds
                 pos.amount = live_qty
                 pos.amount_usd = live_qty * pos.entry_price
+                # Post-reconciliation dust check — DB stored original amount (e.g. TAO 3.976)
+                # so the pre-filter passed ($1089), but exchange only has 0.000574 TAO ($0.16).
+                # Gate.io min sell = 0.001 → close_all_positions fails forever.
+                if pos.amount_usd < 20.0:
+                    logger.warning(
+                        f"[Recovery] {symbol} reconciled to {live_qty:.6f} (${pos.amount_usd:.2f}) "
+                        f"— below $20 after reconciliation, ghost-closing as dust"
+                    )
+                    try:
+                        await _db.positions.update_one(
+                            {"id": pos.id},
+                            {"$set": {"status": "closed_dust"}}
+                        )
+                    except Exception:
+                        pass
+                    continue
 
             _position_manager._positions[pos.id] = pos
             recovered += 1
@@ -1008,12 +1102,13 @@ async def _recover_positions_from_db():
             if trade_docs:
                 wr = sum(1 for t in trade_docs if (t.get("pnl_usd") or 0) > 0) / len(trade_docs) * 100
                 logger.info(f"[Recovery] Seeded risk manager with {len(trade_docs)} historical trades (WR={wr:.0f}%)")
-            # Reset session-level safeguards — consecutive_loss_pause is a within-session
-            # guard, not persistent state. Replaying historical losses would re-trigger it
-            # every restart even though the session is fresh.
+            # Reset session-level safeguards — consecutive_loss_pause and day_trade_count
+            # are within-session guards, not persistent state. Replaying historical trades
+            # would re-trigger pauses and exhaust daily trade quota every restart.
             _risk_manager._consecutive_losses = 0
             _risk_manager._consecutive_wins = 0
             _risk_manager._pause_until = None
+            _risk_manager._day_trade_count = 0
         except Exception as e:
             logger.debug(f"[Recovery] Risk manager seed error: {e}")
 
