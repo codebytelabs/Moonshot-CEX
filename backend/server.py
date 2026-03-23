@@ -569,6 +569,13 @@ async def _run_cycle():
             logger.info(f"[Swarm] {symbol} skipped: symbol cooldown active")
             continue
 
+        # Session churn guard — block tokens entered 3+ times in last 4h
+        # Prevents repeatedly re-entering the same failing token (TRX 16×, ANIME 14×).
+        if _position_manager.is_symbol_churning(symbol):
+            trace["steps"].append(f"skip_churn:{symbol}")
+            logger.info(f"[Swarm] {symbol} skipped: churn guard (3+ entries in 4h)")
+            continue
+
         # v3.1: Setup allowlist gate — regime restricts which setup types are allowed
         setup_type = setup.get("setup_type", "neutral")
         if _regime_setup_allowlist and setup_type not in _regime_setup_allowlist:

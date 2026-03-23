@@ -67,12 +67,15 @@ REGIME_SETUP_ALLOWLIST = {
     "sideways": {"breakout", "momentum", "pullback", "consolidation_breakout"},
     # BEAR: relative-strength breakout/momentum longs + short tokens
     "bear":     {"breakout", "momentum", "momentum_short"},
-    # CHOPPY: cleanest signal only — breakout longs + short tokens
-    "choppy":   {"breakout", "momentum_short"},
+    # CHOPPY: breakout + momentum longs + short tokens
+    "choppy":   {"breakout", "momentum", "momentum_short"},
 }
 
-# Minimum ta_score required for choppy/bear regime short-token entries
-CHOPPY_MIN_TA_SCORE = 82.0
+# Minimum ta_score required for bear/choppy regime entries.
+# 50 gates low-quality noise but allows real momentum reversals through.
+# Old value 82 was unreachable — blocked SOL(52), TAO(58), BTC(47) during
+# reversal bounces, causing the bot to sit fully in cash.
+CHOPPY_MIN_TA_SCORE = 50.0
 
 # ── Per-regime max concurrent positions ───────────────────────────────────────
 REGIME_MAX_POSITIONS = {

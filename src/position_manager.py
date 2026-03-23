@@ -150,6 +150,10 @@ class PositionManager:
         self._closed_history: list[dict] = []
         # Cooldown tracking: symbol → epoch time of any exit
         self._symbol_cooldowns: dict[str, float] = {}
+        # Session churn guard: symbol → list of entry epoch times (rolling 4h window)
+        # Prevents the same token being re-entered 4+ times in 4 hours after repeatedly
+        # failing (e.g. TRX opened 16×, ANIME 14× in one session with short cooldowns).
+        self._symbol_entry_times: dict[str, list[float]] = {}
         # Track consecutive exit failures per position — ghost-close after 3
         self._exit_failure_count: dict[str, int] = {}
 
@@ -162,6 +166,24 @@ class PositionManager:
             return True
         del self._symbol_cooldowns[symbol]
         return False
+
+    def is_symbol_churning(self, symbol: str, window_hours: float = 4.0, max_entries: int = 3) -> bool:
+        """True if this symbol has been entered max_entries+ times in the last window_hours.
+        Prevents repeatedly re-entering the same failing token (TRX/ANIME churn pattern).
+        """
+        now = time.time()
+        cutoff = now - window_hours * 3600
+        times = self._symbol_entry_times.get(symbol, [])
+        recent = [t for t in times if t >= cutoff]
+        self._symbol_entry_times[symbol] = recent
+        return len(recent) >= max_entries
+
+    def _record_entry(self, symbol: str) -> None:
+        """Record an entry timestamp for churn tracking."""
+        now = time.time()
+        if symbol not in self._symbol_entry_times:
+            self._symbol_entry_times[symbol] = []
+        self._symbol_entry_times[symbol].append(now)
 
     def restore_position_from_dict(self, doc: dict) -> Optional["Position"]:
         """Reconstruct a Position from a MongoDB document (crash recovery).
@@ -247,6 +269,7 @@ class PositionManager:
             side="long", # Only long supported for now
         )
         self._positions[pos.id] = pos
+        self._record_entry(symbol)
         active_positions.set(len(self._positions))
         logger.info(
             f"[PM] OPENED {symbol} {pos.side} id={pos.id} "
@@ -354,15 +377,18 @@ class PositionManager:
         is_aggressive = bool(regime_params and regime_params.get("regime") in ("bear", "choppy"))
         review = max(1, self.momentum_recheck_interval_minutes // 2) if is_aggressive else self.momentum_recheck_interval_minutes
 
-        if hold_minutes >= review and peak_pnl_pct < 0.5 and pnl_pct <= (-0.5 if is_aggressive else -1.5) and (current_price < pos.entry_price if pos.side == "long" else current_price > pos.entry_price):
+        # NON-AGGRESSIVE thresholds: give momentum positions TIME to develop.
+        # Old: -1.5% at 30min killed SOL/AAVE/AVAX before their 5% pumps.
+        # A 2% dip on a momentum token while it pumps 5% is NORMAL intraday noise.
+        if hold_minutes >= review * 1.5 and peak_pnl_pct < 0.3 and pnl_pct <= (-1.0 if is_aggressive else -3.0) and (current_price < pos.entry_price if pos.side == "long" else current_price > pos.entry_price):
             return "no_traction_aggressive" if is_aggressive else "no_traction_5m"
-        if hold_minutes >= review * 2 and peak_pnl_pct < (1.0 if is_aggressive else 1.5) and pnl_pct <= (-0.5 if is_aggressive else -1.0) and near_entry:
+        if hold_minutes >= review * 2 and peak_pnl_pct < (1.0 if is_aggressive else 2.0) and pnl_pct <= (-0.5 if is_aggressive else -2.0) and near_entry:
             return "momentum_died_aggressive" if is_aggressive else "momentum_died_10m"
-        if hold_minutes >= review * 2 and peak_pnl_pct >= 3.0 and giveback_pct >= max(peak_pnl_pct * 0.7, 2.0) and pnl_pct < 0.5:
+        if hold_minutes >= review * 2.5 and peak_pnl_pct >= 3.0 and giveback_pct >= max(peak_pnl_pct * 0.7, 2.5) and pnl_pct < 0.5:
             return "momentum_faded"
-        if hold_minutes >= review * 3 and peak_pnl_pct < 2.5 and pnl_pct < 0.0 and near_entry:
+        if hold_minutes >= review * 3 and peak_pnl_pct < 2.5 and pnl_pct < -0.5 and near_entry:
             return "momentum_died_15m"
-        if hold_minutes >= review * 4 and peak_pnl_pct < 4.0 and pnl_pct < 0.5:
+        if hold_minutes >= review * 4 and peak_pnl_pct < 4.0 and pnl_pct < 0.0:
             return "momentum_died_20m"
         return None
 
@@ -433,9 +459,10 @@ class PositionManager:
         hold_h = pos.hold_time_hours()
 
         # ── Hard loss cut (safety net between momentum exits and SL) ─────────
-        # Momentum thesis: if we're -2% after 10 min and never hit 0.5%, the wave
+        # Momentum thesis: if we're -3% after 15 min and never hit 0.5%, the wave
         # didn't come. Cut immediately — don't wait for SL to bleed further.
-        if not is_synced and hold_h >= 0.167 and pnl_pct <= -2.0:
+        # Old -2%/10min was too tight — SOL dips 2% before pumping 5%.
+        if not is_synced and hold_h >= 0.25 and pnl_pct <= -3.0:
             peak_pnl = pos.current_pnl_pct(pos.highest_price if pos.side == "long" else pos.lowest_price)
             if peak_pnl < 0.5:  # never reached 0.5% profit → bad momentum entry
                 return await self._execute_exit(pos, current_price, "hard_loss_cut", pos.amount)
@@ -451,8 +478,8 @@ class PositionManager:
                     r_lower = momentum_reason.lower()
                     # Scale down (50%) for "soft" momentum signals — keeps position alive
                     # so it can recover without paying full roundtrip fees.
-                    # Hard failures (no_traction, faded) still do a full close.
-                    if any(x in r_lower for x in ("died", "stall")) and not is_aggressive:
+                    # Hard failures (faded) still do a full close.
+                    if any(x in r_lower for x in ("died", "stall", "no_traction")) and not is_aggressive:
                         partial = await self._execute_partial_exit(
                             pos, current_price, momentum_reason, pos.amount * 0.50
                         )
@@ -470,10 +497,10 @@ class PositionManager:
             # NON-AGGRESSIVE (bull/sideways — normal momentum longs):
             #   Give positions 45-90 min to work. A -0.5% dip in 15 min is noise.
             #   Old threshold (-0.5% / 15 min) caused a chop-machine death loop.
-            stall_hold  = 0.25 if is_aggressive else 0.75   # 15 min vs 45 min
-            stall_loss  = -1.5 if is_aggressive else -2.5   # -1.5% vs -2.5%
-            traction_hold  = 0.10 if is_aggressive else 0.50  # 6 min vs 30 min
-            traction_loss  = -1.0 if is_aggressive else -2.0  # -1.0% vs -2.0%
+            stall_hold  = 0.25 if is_aggressive else 1.0    # 15 min vs 60 min
+            stall_loss  = -1.5 if is_aggressive else -3.5   # -1.5% vs -3.5%
+            traction_hold  = 0.10 if is_aggressive else 0.75  # 6 min vs 45 min
+            traction_loss  = -1.0 if is_aggressive else -3.0  # -1.0% vs -3.0%
 
             if hold_h >= stall_hold and pnl_pct < stall_loss and (current_price <= pos.entry_price * 1.003 if pos.side == "long" else current_price >= pos.entry_price * 0.997):
                 return await self._execute_exit(pos, current_price, "momentum_stall_aggressive" if is_aggressive else "momentum_stall", pos.amount)

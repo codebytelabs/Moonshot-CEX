@@ -208,18 +208,18 @@ class WatcherAgent:
         curr_vol = float(volumes[-1])
         vol_ratio = curr_vol / avg_vol if avg_vol > 0 else 1.0
         if vol_ratio >= 10.0:
-            vol_pts = 60.0
+            vol_pts = 40.0
         elif vol_ratio >= 5.0:
-            vol_pts = 45.0 + (vol_ratio - 5.0) * 3.0
+            vol_pts = 30.0 + (vol_ratio - 5.0) * 2.0
         elif vol_ratio >= 3.0:
-            vol_pts = 30.0 + (vol_ratio - 3.0) * 7.5
+            vol_pts = 20.0 + (vol_ratio - 3.0) * 5.0
         elif vol_ratio >= 2.0:
-            vol_pts = 15.0 + (vol_ratio - 2.0) * 15.0
+            vol_pts = 10.0 + (vol_ratio - 2.0) * 10.0
         elif vol_ratio >= 1.5:
-            vol_pts = 5.0 + (vol_ratio - 1.5) * 20.0
+            vol_pts = 3.0 + (vol_ratio - 1.5) * 14.0
         else:
             vol_pts = 0.0
-        vol_pts = min(60.0, vol_pts)
+        vol_pts = min(40.0, vol_pts)
         score += vol_pts
         score_breakdown["volume_spike"] = vol_pts
 
@@ -325,13 +325,47 @@ class WatcherAgent:
         score += ema_pts
         score_breakdown["ema"] = ema_pts
 
+        # ── 1h price return (from 5m candles) — THE momentum signal ─────────
+        # This directly captures "SOL just pumped 5%". If close now > close 12 bars
+        # ago (= 1 hour on 5m) the token is ACTUALLY moving, not just noisy.
+        if len(closes) >= 13:
+            return_1h = (closes[-1] - closes[-13]) / closes[-13] * 100.0
+        else:
+            return_1h = 0.0
+        if not inverted:
+            if return_1h >= 5.0:
+                ret1h_pts = 35.0
+            elif return_1h >= 3.0:
+                ret1h_pts = 25.0
+            elif return_1h >= 2.0:
+                ret1h_pts = 18.0
+            elif return_1h >= 1.0:
+                ret1h_pts = 10.0
+            elif return_1h >= 0.5:
+                ret1h_pts = 5.0
+            else:
+                ret1h_pts = 0.0
+        else:
+            if return_1h >= 5.0:
+                ret1h_pts = 35.0
+            elif return_1h >= 3.0:
+                ret1h_pts = 25.0
+            elif return_1h >= 1.0:
+                ret1h_pts = 10.0
+            else:
+                ret1h_pts = 0.0
+        score += ret1h_pts
+        score_breakdown["return_1h"] = ret1h_pts
+
         # ── 24h trend bonus — momentum requires positive daily price action ─
         pct_change_24h = float(ticker.get("percentage") or 0.0)
         if pct_change_24h >= 10.0:
-            trend_pts = 15.0
+            trend_pts = 25.0
         elif pct_change_24h >= 5.0:
-            trend_pts = 10.0
+            trend_pts = 18.0
         elif pct_change_24h >= 2.0:
+            trend_pts = 10.0
+        elif pct_change_24h >= 1.0:
             trend_pts = 5.0
         else:
             trend_pts = 0.0  # flat/negative already pre-filtered for longs

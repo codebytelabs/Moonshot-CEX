@@ -92,9 +92,10 @@ class AnalyzerAgent:
         for tf, data in tf_data.items():
             ta_scores[tf] = self._compute_tf_score(data)
 
-        # Higher weight on 4h — it defines the actual trend direction.
-        # 5m noise should not dominate: cut from 20% to 10%.
-        weights = {"5m": 0.10, "15m": 0.25, "1h": 0.30, "4h": 0.35}
+        # Momentum trading: 15m + 1h dominate — they catch real-time moves.
+        # 4h defines trend direction but lags too much for entry timing.
+        # 5m captures immediate momentum (higher than before — momentum is NOW).
+        weights = {"5m": 0.15, "15m": 0.30, "1h": 0.35, "4h": 0.20}
         total_weight = sum(weights[tf] for tf in ta_scores)
         ta_score = sum(ta_scores[tf] * weights[tf] for tf in ta_scores) / total_weight
 
@@ -124,10 +125,27 @@ class AnalyzerAgent:
                     )
                     return None
 
+        # ── Momentum fast-track: >2% 1h return bypasses EMA/MACD gates ────────
+        # When price is ACTUALLY pumping, lagging TA indicators (EMA cross, MACD)
+        # haven't confirmed yet. The price pump IS the signal — don't let slow
+        # indicators block the best momentum entries (SOL +5%, BTC +3%, etc.).
+        _closes_5m = data_5m[:, 4]
+        _fast_track = False
+        _return_1h = 0.0
+        if len(_closes_5m) >= 13:
+            _return_1h = (_closes_5m[-1] - _closes_5m[-13]) / _closes_5m[-13] * 100.0
+            if _return_1h >= 2.0:
+                _fast_track = True
+                logger.info(
+                    f"[Analyzer] {symbol} FAST-TRACK: 1h return +{_return_1h:.1f}% — "
+                    f"bypassing EMA/MACD gates"
+                )
+
         # ── EMA alignment: 1h OR 15m EMA9 > EMA21 ────────────────────────────
         # Momentum tokens breaking out on 15m may not yet show 1h EMA9>EMA21 (lagging).
         # Accept either timeframe — catches early breakouts before 1h confirms.
-        if direction == "long":
+        # SKIPPED if fast-track (price already confirmed momentum).
+        if direction == "long" and not _fast_track:
             _ema_ok = False
             if "1h" in tf_data:
                 _c1h = tf_data["1h"][:, 4]
@@ -141,24 +159,26 @@ class AnalyzerAgent:
                 logger.debug(f"[Analyzer] {symbol} filtered: neither 1h nor 15m EMA9>EMA21")
                 return None
 
-        # ── RSI gate: 40-82, allows peak momentum zone (was 35-70) ───────────
-        # RSI 70-82 = PEAK MOMENTUM ZONE for breakouts — old gate was killing these.
-        # Only block truly oversold (<40, no momentum) or extreme blowoff (>82).
+        # ── RSI gate: 40-92, allows full momentum zone including peak ──────────
+        # RSI 70-90 = PEAK MOMENTUM ZONE. SOL pumping 5% sits at RSI 85+.
+        # Old 82 cap REJECTED the best momentum trades. Only block true parabolic
+        # blowoffs (>92) where mean reversion is almost certain.
         if direction == "long" and "1h" in tf_data:
             _c1h_rsi = tf_data["1h"][:, 4]
             if len(_c1h_rsi) >= 14:
                 rsi_1h = _compute_rsi(_c1h_rsi, 14)
-                if rsi_1h > 82:
-                    logger.debug(f"[Analyzer] {symbol} filtered: 1h RSI {rsi_1h:.1f} > 82 (extreme blowoff)")
+                if rsi_1h > 92:
+                    logger.debug(f"[Analyzer] {symbol} filtered: 1h RSI {rsi_1h:.1f} > 92 (parabolic blowoff)")
                     return None
-                if rsi_1h < 40:
+                if rsi_1h < 40 and not _fast_track:
                     logger.debug(f"[Analyzer] {symbol} filtered: 1h RSI {rsi_1h:.1f} < 40 (no momentum)")
                     return None
 
         # ── MACD confirmation: hist > 0 OR rising ─────────────────────────────
         # hist > 0 = confirmed momentum. hist rising (crossing from below) = momentum STARTING.
         # Old gate (hist > 0 only) fired too late — move was 50% done by confirmation.
-        if direction == "long" and "1h" in tf_data:
+        # SKIPPED if fast-track (price already confirmed momentum).
+        if direction == "long" and "1h" in tf_data and not _fast_track:
             _c1h_macd = tf_data["1h"][:, 4]
             if len(_c1h_macd) >= 36:
                 hist_now = _compute_macd_hist(_c1h_macd, 12, 26, 9)
@@ -277,11 +297,11 @@ class AnalyzerAgent:
             return "breakout"
 
         # MOMENTUM: 4h trend established OR 1h+5m confluence OR relative-strength intra-day surge.
-        # RSI bounds match the 40-82 filter gate — tokens at RSI 72-82 are peak momentum, not top.
+        # RSI bounds match the 40-92 filter gate — tokens at RSI 72-90 are peak momentum, not top.
         elif (
-            (score_4h >= 40 and score_1h >= 35 and 42 <= rsi <= 82)
-            or (score_4h >= 35 and score_5m >= 30 and 48 <= rsi <= 82)
-            or (score_5m >= 42 and score_1h >= 30 and 50 <= rsi <= 82)
+            (score_4h >= 40 and score_1h >= 35 and 42 <= rsi <= 92)
+            or (score_4h >= 35 and score_5m >= 30 and 48 <= rsi <= 92)
+            or (score_5m >= 42 and score_1h >= 30 and 50 <= rsi <= 92)
         ):
             return "momentum"
 
