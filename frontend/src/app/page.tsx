@@ -7,9 +7,7 @@ import StatsBar from "@/components/StatsBar";
 import MarketFeed from "@/components/MarketFeed";
 import PositionsPanel from "@/components/PositionsPanel";
 import TradeLog from "@/components/TradeLog";
-import RegimePanel from "@/components/RegimePanel";
-import AgentsPanel from "@/components/AgentsPanel";
-import SwarmControl from "@/components/SwarmControl";
+import SideSummary from "@/components/SideSummary";
 import NavChart from "@/components/NavChart";
 
 export default function Dashboard() {
@@ -63,6 +61,16 @@ export default function Dashboard() {
           total_pnl_usd: data.total_pnl_usd,
           day_pnl_usd: data.day_pnl_usd,
         }));
+      }
+      if (Array.isArray(data.recent_trades) && data.recent_trades.length > 0) {
+        setTrades((prev) => {
+          const incoming = data.recent_trades as Record<string, unknown>[];
+          const existingIds = new Set(
+            (prev as Record<string, unknown>[]).map((t) => t.id).filter(Boolean)
+          );
+          const newOnes = incoming.filter((t) => t.id && !existingIds.has(t.id));
+          return newOnes.length > 0 ? [...prev, ...newOnes] : prev;
+        });
       }
     }
   }, [messages]);
@@ -135,33 +143,23 @@ export default function Dashboard() {
             <MarketFeed feed={feed} />
           </div>
 
-          {/* Top center: Positions */}
-          <div className="col-span-5 row-span-1 min-h-0">
-            <PositionsPanel positions={(portfolio?.open_positions as unknown[]) ?? []} />
+          {/* Top center: Positions — wide with full detail */}
+          <div className="col-span-8 row-span-1 min-h-0">
+            <PositionsPanel positions={(portfolio?.open_positions as unknown[]) ?? []} onClose={load} />
           </div>
 
-          {/* Top right: Regime */}
+          {/* Top right: Consolidated Regime + Agents + Controls */}
           <div className="col-span-2 row-span-1 min-h-0">
-            <RegimePanel swarmStatus={swarmStatus} />
+            <SideSummary swarmStatus={swarmStatus} agents={agents} onAction={handleSwarmToggle} />
           </div>
 
-          {/* Top far-right: Swarm Control */}
-          <div className="col-span-1 row-span-1 min-h-0">
-            <SwarmControl swarmStatus={swarmStatus} onAction={handleSwarmToggle} />
-          </div>
-
-          {/* Top far-right: Agents compact */}
-          <div className="col-span-2 row-span-1 min-h-0">
-            <AgentsPanel agents={agents} />
-          </div>
-
-          {/* Bottom center: NAV CHART — big and prominent */}
-          <div className="col-span-7 row-span-1 min-h-0">
+          {/* Bottom center: NAV CHART */}
+          <div className="col-span-8 row-span-1 min-h-0">
             <NavChart currentEquity={Number(portfolio?.equity ?? 0)} />
           </div>
 
           {/* Bottom right: Trade Log */}
-          <div className="col-span-3 row-span-1 min-h-0">
+          <div className="col-span-2 row-span-1 min-h-0">
             <TradeLog trades={trades} />
           </div>
         </div>

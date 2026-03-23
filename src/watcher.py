@@ -20,11 +20,22 @@ from .redis_client import RedisClient
 from .metrics import signals_generated
 
 
-# ── GateIO leveraged SHORT ETF token patterns ─────────────────────────────────
-# These spot-traded tokens profit when the underlying falls (no margin needed).
-# Tagged as direction="short" candidates for the Analyzer.
-SHORT_TOKEN_SUFFIXES = ("3S", "5S")
-LONG_TOKEN_SUFFIXES  = ("3L", "5L")
+# ── Leveraged ETF token patterns (Gate.io + Binance) ────────────────────────
+# Spot-traded tokens that profit when the underlying falls (no margin needed).
+# Gate.io: BTC3S/5S (short), BTC3L/5L (long)
+# Binance: BTCDOWN (short), BTCUP (long)
+SHORT_TOKEN_SUFFIXES = ("3S", "5S", "DOWN")
+LONG_TOKEN_SUFFIXES  = ("3L", "5L", "UP")
+
+# ── Stablecoin / near-stable blacklist ──────────────────────────────────────
+# These tokens are pegged — they generate false momentum signals
+# (e.g. USDC flagged as "momentum" on a 0.1% depeg). Never trade them.
+_STABLE_BASES: frozenset[str] = frozenset({
+    "USDC", "USDT", "BUSD", "FDUSD", "TUSD", "DAI", "USDP",
+    "GUSD", "USDX", "USDD", "USDJ", "LUSD", "FRAX",
+    "SUSD", "MUSD", "STBT", "USDE", "PYUSD",
+    "WBTC", "WETH", "WBNB",  # wrapped tokens — track underlying, not wrapper
+})
 
 
 class WatcherAgent:
@@ -63,8 +74,10 @@ class WatcherAgent:
         # ── In BEAR/CHOPPY regimes: lower volume bar & cast wider net ──────────
         bear_mode = regime in ("bear", "choppy")
         min_vol = self.min_volume_usd * 0.3 if bear_mode else self.min_volume_usd
-        # Spread guard is wider for leveraged tokens (they have natural spread)
-        max_spread_pct = 1.5 if bear_mode else 0.5
+        # Spread guard: leveraged tokens have natural wider spread.
+        # Bull/sideways: 1.0% allows solid mid-caps (was 0.5% — too tight, cut most tokens).
+        # Bear/choppy: 1.5% for leveraged short ETFs.
+        max_spread_pct = 1.5 if bear_mode else 1.0
 
         long_candidates  = []
         short_candidates = []
@@ -109,7 +122,13 @@ class WatcherAgent:
                         "vol_usd": vol_usd, "direction": "long",
                     })
             else:
-                # Regular spot: apply volume filter
+                # Regular spot: skip stablecoins and declining tokens
+                if base in _STABLE_BASES:
+                    continue
+                pct_24h = float(ticker.get("percentage") or 0.0)
+                # Long momentum requires POSITIVE 24h move — skip anything down >3%
+                if pct_24h < -3.0:
+                    continue
                 if vol_usd >= min_vol:
                     long_candidates.append({
                         "symbol": symbol, "ticker": ticker,
@@ -133,8 +152,11 @@ class WatcherAgent:
         all_scored = long_scored + short_scored
         all_scored.sort(key=lambda x: x["score"], reverse=True)
 
-        # Give shorts their own quota so they don't crowd out longs
-        n_shorts = min(len(short_scored), max(2, self.top_n // 4)) if short_scored else 0
+        # Give shorts their own quota so they don't crowd out longs.
+        # In bear/choppy regimes both sides are active — give shorts 1/3 of top_n.
+        # In bull/sideways keep the smaller 1/4 quota (shorts are rare).
+        short_frac = 3 if regime in ("bear", "choppy") else 4
+        n_shorts = min(len(short_scored), max(2, self.top_n // short_frac)) if short_scored else 0
         n_longs  = self.top_n - n_shorts
 
         top_longs  = sorted(long_scored,  key=lambda x: x["score"], reverse=True)[:n_longs]
@@ -297,14 +319,24 @@ class WatcherAgent:
             ema_aligned = ema9 > ema21
             ema_fully_aligned = (ema9 > ema21 > ema50) if ema50 is not None else False
         else:
-            # Short token: EMA9 > EMA21 means short token is in uptrend = good
             ema_aligned = ema9 > ema21
             ema_fully_aligned = (ema9 > ema21 > ema50) if ema50 is not None else False
         ema_pts = 15.0 if ema_fully_aligned else (8.0 if ema_aligned else 0.0)
         score += ema_pts
         score_breakdown["ema"] = ema_pts
 
-        pct_change_24h = ticker.get("percentage") or 0.0
+        # ── 24h trend bonus — momentum requires positive daily price action ─
+        pct_change_24h = float(ticker.get("percentage") or 0.0)
+        if pct_change_24h >= 10.0:
+            trend_pts = 15.0
+        elif pct_change_24h >= 5.0:
+            trend_pts = 10.0
+        elif pct_change_24h >= 2.0:
+            trend_pts = 5.0
+        else:
+            trend_pts = 0.0  # flat/negative already pre-filtered for longs
+        score += trend_pts
+        score_breakdown["trend_24h"] = trend_pts
         price = ticker.get("last") or 0.0
         vol_usd = candidate["vol_usd"]
         setup_type = "momentum_short" if inverted else "momentum"

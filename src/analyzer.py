@@ -41,7 +41,7 @@ class AnalyzerAgent:
         self.min_score = min_score
         self.top_n = top_n
 
-    async def analyze(self, candidates: list[dict]) -> list[dict]:
+    async def analyze(self, candidates: list[dict], regime: str = "sideways") -> list[dict]:
         """
         Run multi-timeframe TA on top watcher candidates.
         Returns list of setups sorted by ta_score descending.
@@ -49,9 +49,17 @@ class AnalyzerAgent:
         t0 = time.monotonic()
         results = []
 
+        # Regime-adaptive min_score: harder markets need HIGHER bars, not lower.
+        # Bear/choppy: require +10 above config floor (fewer, higher-quality entries only).
+        # Sideways: require +5 above config floor.
+        # Bull: use config floor as-is.
+        # QuantMutator raises self.min_score on cold streaks — never let regime override downward.
+        regime_boost = {"bull": 0, "sideways": 5, "bear": 10, "choppy": 10}.get(regime, 5)
+        effective_min_score = self.min_score + regime_boost
+
         for candidate in candidates[: self.top_n * 2]:
-            setup = await self._analyze_symbol(candidate)
-            if setup and setup["ta_score"] >= self.min_score:
+            setup = await self._analyze_symbol(candidate, regime=regime)
+            if setup and setup["ta_score"] >= effective_min_score:
                 results.append(setup)
 
         results.sort(key=lambda x: x["ta_score"], reverse=True)
@@ -62,7 +70,7 @@ class AnalyzerAgent:
         logger.info(f"[Analyzer] Analyzed {len(candidates)} candidates → {len(top)} setups [{elapsed:.1f}s]")
         return top
 
-    async def _analyze_symbol(self, candidate: dict) -> Optional[dict]:
+    async def _analyze_symbol(self, candidate: dict, regime: str = "sideways") -> Optional[dict]:
         symbol = candidate["symbol"]
         price = candidate.get("price", 0.0)
         if price <= 0:
@@ -86,17 +94,56 @@ class AnalyzerAgent:
         for tf, data in tf_data.items():
             ta_scores[tf] = self._compute_tf_score(data)
 
-        weights = {"5m": 0.20, "15m": 0.30, "1h": 0.30, "4h": 0.20}
+        # Higher weight on 4h — it defines the actual trend direction.
+        # 5m noise should not dominate: cut from 20% to 10%.
+        weights = {"5m": 0.10, "15m": 0.25, "1h": 0.30, "4h": 0.35}
         total_weight = sum(weights[tf] for tf in ta_scores)
         ta_score = sum(ta_scores[tf] * weights[tf] for tf in ta_scores) / total_weight
 
-        # ATR from 5m for risk sizing
+        # ATR from 1h for stop sizing — 5m ATR is too noisy and places stops
+        # within normal market microstructure, causing immediate stop-outs.
+        # 1h ATR captures meaningful volatility over a tradeable timeframe.
         data_5m = tf_data["5m"]
-        atr = _compute_atr(data_5m[:, 2], data_5m[:, 3], data_5m[:, 4], 14)
+        atr_src = tf_data.get("1h", data_5m)
+        atr = _compute_atr(atr_src[:, 2], atr_src[:, 3], atr_src[:, 4], 14)
 
         # Support / resistance from 1h or 15m
         sr_tf = tf_data.get("1h", tf_data.get("15m", data_5m))
         support, resistance = _compute_support_resistance(sr_tf[:, 2], sr_tf[:, 3], sr_tf[:, 4])
+
+        # ── 4h EMA50 trend gate: skip long entries when price is deeply below 4h EMA50 ──
+        # Bull: strict 1% — only enter tokens showing real strength vs the trend.
+        # Sideways: 4% — normal consolidation pullbacks (2-5% below EMA50) are valid entries.
+        # Bear/choppy: 5% — relative-strength / recovery plays allowed.
+        # Using a flat 1% for all regimes blocked LINK, SOL, XRP etc. that were
+        # sitting 2-5% below EMA50 in a post-pullback sideways market.
+        direction = candidate.get("direction", "long")
+        if direction == "long" and "4h" in tf_data:
+            closes_4h = tf_data["4h"][:, 4]
+            if len(closes_4h) >= 50:
+                ema50_4h = _ema(closes_4h, 50)
+                # EMA slope: is the 4h EMA50 rising? Require last 5 bars trending up.
+                ema50_5bars_ago = _ema(closes_4h[:-5], 50) if len(closes_4h) > 55 else ema50_4h
+                ema50_rising = ema50_4h > ema50_5bars_ago * 1.001  # EMA must be rising ≥ 0.1%
+                # Price gate:
+                # Bull: 3% pullback allowed (normal EMA retest).
+                # Sideways: 2% below EMA50 allowed — catches breakout entries just starting.
+                # Bear/choppy: must be AT or above EMA50 AND EMA must be rising.
+                if regime == "bull":
+                    ema_tolerance = 0.97
+                elif regime == "sideways":
+                    ema_tolerance = 0.98
+                else:  # bear / choppy
+                    ema_tolerance = 1.00
+                price_below_ema = closes_4h[-1] < ema50_4h * ema_tolerance
+                # In bear/choppy also require EMA to be rising — declining EMA = downtrend
+                ema_declining_in_bear = regime in ("bear", "choppy") and not ema50_rising
+                if price_below_ema or ema_declining_in_bear:
+                    logger.debug(
+                        f"[Analyzer] {symbol} filtered: price {closes_4h[-1]:.6f} "
+                        f"vs EMA50 {ema50_4h:.6f} (tol={ema_tolerance}, rising={ema50_rising}, regime={regime})"
+                    )
+                    return None
 
         # Setup classification
         setup_type = self._classify_setup(tf_data, ta_scores)
@@ -200,9 +247,12 @@ class AnalyzerAgent:
         if score_4h >= 50 and score_1h >= 40 and rsi >= 50 and vol_spike >= 1.3:
             return "breakout"
 
-        # MOMENTUM: 4h trend established OR 1h+5m confluence with RSI in zone
-        elif (score_4h >= 40 and score_1h >= 35 and 45 <= rsi <= 72) or (
-            score_4h >= 35 and score_5m >= 30 and 50 <= rsi <= 75
+        # MOMENTUM: 4h trend established OR 1h+5m confluence OR relative-strength intra-day surge.
+        # Third branch catches tokens like TRX breaking out on 5m/1h while 4h hasn't fully built yet.
+        elif (
+            (score_4h >= 40 and score_1h >= 35 and 45 <= rsi <= 72)
+            or (score_4h >= 35 and score_5m >= 30 and 50 <= rsi <= 75)
+            or (score_5m >= 42 and score_1h >= 30 and 52 <= rsi <= 80)
         ):
             return "momentum"
 
@@ -262,6 +312,16 @@ class AnalyzerAgent:
             return None
 
         risk_per_unit = entry - stop_loss
+
+        # ── Enforce minimum 2% stop distance ──────────────────────────────────
+        # ATR-based stops can be <1% on low-volatility tokens — these get hit
+        # on normal market noise, creating constant stop-outs. Minimum = 2%.
+        min_risk = entry * 0.02
+        if risk_per_unit < min_risk:
+            risk_per_unit = min_risk
+            stop_loss = entry - risk_per_unit
+            take_profit_1 = entry + 2.0 * risk_per_unit
+            take_profit_2 = entry + 4.0 * risk_per_unit
         rr_ratio = (take_profit_1 - entry) / risk_per_unit if risk_per_unit > 0 else 0.0
 
         return {

@@ -63,20 +63,44 @@ class ExchangeConnector:
         if demo_url:
             base = demo_url.rstrip("/")
             if name == "binance":
-                self.exchange.urls["api"] = {
-                    "public": f"{base}/api/v3",
-                    "private": f"{base}/api/v3",
-                    "v3": f"{base}/api/v3",
-                    "v1": f"{base}/api/v1",
-                    "sapi": f"{base}/sapi/v1",
-                    "sapiV2": f"{base}/sapi/v2",
-                    "sapiV3": f"{base}/sapi/v3",
-                    "sapiV4": f"{base}/sapi/v4",
-                    "fapiPublic": f"{base}/fapi/v1",
-                    "fapiPublicV2": f"{base}/fapi/v2",
-                    "fapiPrivate": f"{base}/fapi/v1",
+                # Map every CCXT Binance URL key to the demo base so sign()
+                # never raises NotSupported for dapiPublic/eapi/papi etc.
+                all_url_keys = list(self.exchange.urls.get("api", {}).keys())
+                self.exchange.urls["api"] = {k: f"{base}/api/v3" for k in all_url_keys}
+                self.exchange.urls["api"].update({
+                    "public":        f"{base}/api/v3",
+                    "private":       f"{base}/api/v3",
+                    "v3":            f"{base}/api/v3",
+                    "v1":            f"{base}/api/v1",
+                    "sapi":          f"{base}/sapi/v1",
+                    "sapiV2":        f"{base}/sapi/v2",
+                    "sapiV3":        f"{base}/sapi/v3",
+                    "sapiV4":        f"{base}/sapi/v4",
+                    "fapiPublic":    f"{base}/fapi/v1",
+                    "fapiPublicV2":  f"{base}/fapi/v2",
+                    "fapiPublicV3":  f"{base}/fapi/v3",
+                    "fapiPrivate":   f"{base}/fapi/v1",
                     "fapiPrivateV2": f"{base}/fapi/v2",
-                }
+                    "dapiPublic":    f"{base}/dapi/v1",
+                    "dapiPrivate":   f"{base}/dapi/v1",
+                    "eapiPublic":    f"{base}/eapi/v1",
+                    "papi":          f"{base}/papi/v1",
+                })
+                # Pre-populate margin pair data so parse_market() doesn't need
+                # sapi/v1/margin calls (404 on demo). Without this, load_markets fails.
+                self.exchange.options.setdefault("crossMarginPairsData", [])
+                self.exchange.options.setdefault("isolatedMarginPairsData", [])
+                self.exchange.options.setdefault("portfolioMarginSymbolsData", [])
+                # Suppress the ExchangeError warning for symbol-less open-order fetches.
+                self.exchange.options["warnOnFetchOpenOrdersWithoutSymbol"] = False
+                # Override fetch_markets to spot-only via /api/v3/exchangeInfo.
+                # CCXT Binance normally loads spot+usdm+coinm in parallel; the
+                # futures endpoints return 404 on the demo URL.
+                _ex_ref = self.exchange
+                async def _spot_only_fetch_markets(params={}):
+                    info = await _ex_ref.publicGetExchangeInfo({})
+                    return _ex_ref.parse_markets(info["symbols"])
+                self.exchange.fetch_markets = _spot_only_fetch_markets
             elif name == "gateio":
                 if "api" in self.exchange.urls:
                     api_urls = self.exchange.urls["api"]
@@ -156,9 +180,11 @@ class ExchangeConnector:
         logger.info(f"[{self.name}] LIMIT BUY {symbol} amount={amount:.6f} price={price:.6f}")
         return await self._retry(self.exchange.create_order, symbol, "limit", "buy", amount, price, endpoint="create_order")
 
-    async def create_limit_sell(self, symbol: str, amount: float, price: float) -> dict:
-        logger.info(f"[{self.name}] LIMIT SELL {symbol} amount={amount:.6f} price={price:.6f}")
-        return await self._retry(self.exchange.create_order, symbol, "limit", "sell", amount, price, endpoint="create_order")
+    async def create_limit_sell(self, symbol: str, amount: float, price: float, time_in_force: str = "gtc") -> dict:
+        tif = time_in_force.upper()
+        logger.info(f"[{self.name}] LIMIT SELL {symbol} amount={amount:.6f} price={price:.6f} tif={tif}")
+        params = {"timeInForce": tif} if tif != "GTC" else {}
+        return await self._retry(self.exchange.create_order, symbol, "limit", "sell", amount, price, params, endpoint="create_order")
 
     async def cancel_order(self, order_id: str, symbol: str) -> dict:
         return await self._retry(self.exchange.cancel_order, order_id, symbol, endpoint="cancel_order")
@@ -226,6 +252,11 @@ class ExchangeConnector:
                 logger.error(f"[{self.name}] Exchange unavailable: {e}, retrying in {wait}s")
                 await asyncio.sleep(wait)
             except ccxt_async.ExchangeError as e:
+                # Binance -2013: order already filled and purged — expected for
+                # instant market fills. Log at DEBUG so it doesn't pollute ERROR logs.
+                if "-2013" in str(e) or "order does not exist" in str(e).lower():
+                    logger.debug(f"[{self.name}] Order already filled/gone on {endpoint}: {e}")
+                    raise
                 err_str = str(e).lower()
                 # ── Dust / sub-minimum detection ─────────────────────────────
                 # Gate.io and other exchanges return ExchangeError (not retryable)
@@ -240,8 +271,15 @@ class ExchangeConnector:
                     "less than min",
                     "below minimum",
                     "invalid_param_value",
+                    "filter failure: notional",   # Binance -1013: notional < $5
+                    "filter failure: lot_size",   # Binance -1013: qty below min lot
+                    "filter failure: min_notional",
                 )
-                if endpoint == "create_order" and any(p in err_str for p in _DUST_PATTERNS):
+                # Also detect Binance numeric code -1013 directly
+                _is_binance_notional = ("-1013" in str(e) and "notional" in err_str)
+                if endpoint == "create_order" and (
+                    any(p in err_str for p in _DUST_PATTERNS) or _is_binance_notional
+                ):
                     from .execution_core import SubMinimumAmountError  # late import avoids circular
                     # Extract symbol from args[0] if available
                     sym = str(args[0]) if args else "unknown"
@@ -260,7 +298,12 @@ class ExchangeConnector:
                 errors_total.labels(component="exchange", error_type="exchange_error").inc()
                 raise
             except Exception as e:
-                logger.error(f"[{self.name}] Unexpected error on {endpoint}: {e}")
+                # fetch_my_trades on Binance demo returns malformed responses (NoneType).
+                # This is non-critical — downgrade to DEBUG so it doesn't pollute ERROR logs.
+                if endpoint == "fetch_my_trades":
+                    logger.debug(f"[{self.name}] fetch_my_trades parse error (non-critical): {e}")
+                else:
+                    logger.error(f"[{self.name}] Unexpected error on {endpoint}: {e}")
                 errors_total.labels(component="exchange", error_type="unexpected").inc()
                 raise
 

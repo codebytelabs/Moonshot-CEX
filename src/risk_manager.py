@@ -30,10 +30,14 @@ from .metrics import current_drawdown, win_rate, avg_r_multiple
 
 
 # ── Account-size tier thresholds ──────────────────────────────────────────────
+# Tuned for aggressive deployment (80-90% capital utilisation target):
+#   kelly_mult   — applied as tier_mult = kelly_mult / 0.75 so medium = 1.0×
+#   max_single   — per-position ceiling as fraction of equity
+#   max_risk     — risk-based floor fallback when trade history is thin
 ACCOUNT_TIER_THRESHOLDS = [
-    (2_000,  "small",  0.25, 0.10, 0.02),   # (max_equity, tier, kelly_mult, max_single, max_risk)
-    (20_000, "medium", 0.50, 0.15, 0.05),
-    (float("inf"), "large", 0.60, 0.15, 0.08),
+    (2_000,  "small",  0.50, 0.15, 0.05),   # (max_equity, tier, kelly_mult, max_single, max_risk)
+    (20_000, "medium", 0.75, 0.25, 0.08),   # 25% per position × 4-5 slots ≈ 80-100% deployed
+    (float("inf"), "large", 0.90, 0.25, 0.10),
 ]
 
 # ── Drawdown-gradient size multipliers ────────────────────────────────────────
@@ -92,10 +96,13 @@ class RiskManager:
         self._trade_history: list[dict] = []
 
         # Account tier — re-computed whenever detect_account_tier() is called
+        # Defaults match the medium-tier row of ACCOUNT_TIER_THRESHOLDS so that
+        # compute_position_size produces sensible values even if called before
+        # detect_account_tier() (e.g. scaling path that skips can_open_position).
         self._account_tier: str = "medium"
-        self._tier_kelly_mult: float = 0.50
-        self._tier_max_single: float = 0.15
-        self._tier_max_risk: float = 0.05
+        self._tier_kelly_mult: float = 0.75
+        self._tier_max_single: float = 0.25
+        self._tier_max_risk: float = 0.08
 
     # ── Account-tier detection (call at startup and after equity updates) ──────
     def detect_account_tier(self, equity: float) -> str:
@@ -198,6 +205,10 @@ class RiskManager:
 
         Hard cap: never exceeds min(max_single_exposure_pct, tier_max_single_pct)
         """
+        # Ensure tier is always current — calling detect_account_tier here means
+        # size is correct even when the scaling path bypasses can_open_position.
+        self.detect_account_tier(current_equity)
+
         # ── Tier-aware base size ───────────────────────────────────────────────
         kelly_size = self._kelly_size(current_equity)
         eff_max_single = min(self.max_single_exposure_pct, self._tier_max_single)
@@ -211,8 +222,8 @@ class RiskManager:
         base_size = min(kelly_size, max_single, risk_based)
 
         # ── 1. Account-tier Kelly multiplier ─────────────────────────────────
-        tier_mult = self._tier_kelly_mult / 0.50   # normalise so medium=1.0×
-        # small=0.5×, medium=1.0×, large=1.2×
+        tier_mult = self._tier_kelly_mult / 0.75   # normalise so medium=1.0×
+        # small=0.67×, medium=1.0×, large=1.20×
         base_size *= tier_mult
 
         # ── 2. Drawdown gradient ──────────────────────────────────────────────
@@ -230,9 +241,11 @@ class RiskManager:
         base_size *= streak_mult
 
         # ── 4. Conviction multiplier ──────────────────────────────────────────
-        conviction_range = max(1.0 - threshold, 0.01)
-        conviction_pct = max(0.0, min(1.0, (posterior - threshold) / conviction_range))
-        conviction_mult = 0.55 + conviction_pct * 0.90   # 0.55 – 1.45
+        # Normalise over the full range (threshold → 1.0) so the multiplier
+        # scales smoothly with real posterior values (0.45–0.90).
+        # Floor raised to 0.75 so a barely-passing setup still gets 75% of base.
+        conviction_norm = max(0.0, min(1.0, (posterior - threshold) / max(1.0 - threshold, 0.01)))
+        conviction_mult = 0.75 + conviction_norm * 0.65   # 0.75 – 1.40
 
         # ── 5. Liquidity multiplier ───────────────────────────────────────────
         if vol_usd <= 0:
@@ -257,9 +270,9 @@ class RiskManager:
         # ── Final size ────────────────────────────────────────────────────────
         size = base_size * conviction_mult * liq_mult * ta_mult * reg_mult
         size = min(size, max_single)   # hard cap
-        size = max(size, 10.0)         # minimum order floor
+        size = max(size, 50.0)         # minimum order floor — never open a sub-$50 position
 
-        logger.debug(
+        logger.info(
             f"[Risk] {symbol} size=${size:.2f} "
             f"(base=${base_size:.2f} kelly=${kelly_size:.2f} risk=${risk_based:.2f} | "
             f"tier={self._account_tier}({tier_mult:.2f}×) dd={drawdown:.1%}({dd_mult:.2f}×) "
@@ -333,18 +346,31 @@ class RiskManager:
     def _kelly_size(self, equity: float) -> float:
         recent = self._recent_trades(90)
         if len(recent) < self.min_trades_for_kelly:
-            return equity * self.max_risk_per_trade_pct
+            # Insufficient trade history — use the full tier max-single as the base.
+            # The old fallback (equity × max_risk_per_trade_pct) produced $120 on a
+            # $12K account; after stacked multipliers that became $4-$9 per trade.
+            # Multipliers (conviction / liquidity / regime) then scale this down to
+            # a real position size in the $800–$3K range for a $12K portfolio.
+            return equity * self._tier_max_single
 
         wr = _win_rate(recent)
         avg_r = _avg_r(recent)
         if avg_r <= 0:
-            return equity * self.max_risk_per_trade_pct
+            return equity * self._tier_max_single
 
         kelly = wr - (1 - wr) / avg_r
         kelly = max(0.0, kelly)
         half_kelly = kelly * self.kelly_fraction
         capped = min(half_kelly, self.max_kelly_fraction)
-        return equity * capped
+        kelly_size = equity * capped
+
+        # Floor: Kelly can return 0 during a losing streak (negative formula → clamped
+        # to 0). Without a floor that collapses to the $10 minimum and, after partial
+        # exits, produces $4-$9 runners.  Use 80% of the tier's per-position ceiling
+        # as the absolute floor so multipliers (conviction/drawdown/regime) do the
+        # de-risking instead of Kelly zeroing everything out.
+        kelly_floor = equity * self._tier_max_single * 0.80
+        return max(kelly_size, kelly_floor)
 
     def _compute_drawdown(self, equity: float) -> float:
         if self.peak_equity <= 0:

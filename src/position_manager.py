@@ -129,6 +129,7 @@ class PositionManager:
         max_sell_retries: int = 3,
         stop_loss_pct: float = -18.0,
         momentum_recheck_interval_minutes: int = 5,
+        symbol_cooldown_minutes: float = 30.0,
     ):
         self.execution = execution
         self.trailing_activate_pct = trailing_activate_pct
@@ -142,13 +143,13 @@ class PositionManager:
         self.max_sell_retries = max_sell_retries
         self.stop_loss_pct = stop_loss_pct
         self.momentum_recheck_interval_minutes = max(1, momentum_recheck_interval_minutes)
+        self.symbol_cooldown_minutes: float = symbol_cooldown_minutes
 
         self._positions: dict[str, Position] = {}
         self._positions_being_exited: set[str] = set()
         self._closed_history: list[dict] = []
-        # Cooldown tracking: symbol → epoch time of last stop-loss exit
+        # Cooldown tracking: symbol → epoch time of any exit
         self._symbol_cooldowns: dict[str, float] = {}
-        self.symbol_cooldown_minutes: float = 15.0  # configurable at runtime
 
     def is_symbol_on_cooldown(self, symbol: str) -> bool:
         """True if this symbol was recently stopped out and is still cooling down."""
@@ -205,7 +206,7 @@ class PositionManager:
         symbol = setup["symbol"]
         entry_zone = setup.get("entry_zone", {})
         price = float(setup.get("price", 0.0))
-        stop_loss = float(entry_zone.get("stop_loss", price * 0.82))
+        stop_loss = float(entry_zone.get("stop_loss", price * 0.94))  # fallback: 6% below entry
 
         if price <= 0:
             logger.warning(f"[PM] Skipping {symbol}: invalid price {price}")
@@ -347,13 +348,13 @@ class PositionManager:
         giveback_pct = peak_pnl_pct - pnl_pct
         near_entry = current_price <= pos.entry_price * 1.005 if pos.side == "long" else current_price >= pos.entry_price * 0.995
         
-        # Aggressive stall exits in bear/choppy (where max_exposure matches those regimes)
-        is_aggressive = regime_params and regime_params.get("max_exposure_pct", 1.0) <= 0.40
+        # Bear/choppy = aggressive exits: fast management of short tokens + quick cut of bad longs
+        is_aggressive = bool(regime_params and regime_params.get("regime") in ("bear", "choppy"))
         review = max(1, self.momentum_recheck_interval_minutes // 2) if is_aggressive else self.momentum_recheck_interval_minutes
 
-        if hold_minutes >= review and peak_pnl_pct < 0.5 and pnl_pct <= (-0.5 if is_aggressive else -1.0) and (current_price < pos.entry_price if pos.side == "long" else current_price > pos.entry_price):
+        if hold_minutes >= review and peak_pnl_pct < 0.5 and pnl_pct <= (-0.5 if is_aggressive else -1.5) and (current_price < pos.entry_price if pos.side == "long" else current_price > pos.entry_price):
             return "no_traction_aggressive" if is_aggressive else "no_traction_5m"
-        if hold_minutes >= review * 2 and peak_pnl_pct < (1.0 if is_aggressive else 1.5) and pnl_pct <= -0.5 and near_entry:
+        if hold_minutes >= review * 2 and peak_pnl_pct < (1.0 if is_aggressive else 1.5) and pnl_pct <= (-0.5 if is_aggressive else -1.0) and near_entry:
             return "momentum_died_aggressive" if is_aggressive else "momentum_died_10m"
         if hold_minutes >= review * 2 and peak_pnl_pct >= 3.0 and giveback_pct >= max(peak_pnl_pct * 0.7, 2.0) and pnl_pct < 0.5:
             return "momentum_faded"
@@ -431,18 +432,43 @@ class PositionManager:
 
         # Bot-only momentum exits (keep these specific to bot trades)
         if not is_synced:
-            # Short-circuit aggressive stalling
-            is_aggressive = regime_params and regime_params.get("max_exposure_pct", 1.0) <= 0.40
+            # Bear/choppy = aggressive exits: fast management of short tokens + quick cut of bad longs
+            is_aggressive = bool(regime_params and regime_params.get("regime") in ("bear", "choppy"))
             
             if not pos.tier1_done:
                 momentum_reason = self._momentum_exit_reason(pos, current_price, pnl_pct, regime_params)
                 if momentum_reason:
+                    r_lower = momentum_reason.lower()
+                    # Scale down (50%) for "soft" momentum signals — keeps position alive
+                    # so it can recover without paying full roundtrip fees.
+                    # Hard failures (no_traction, faded) still do a full close.
+                    if any(x in r_lower for x in ("died", "stall")) and not is_aggressive:
+                        partial = await self._execute_partial_exit(
+                            pos, current_price, momentum_reason, pos.amount * 0.50
+                        )
+                        pos.tier1_done = True  # prevent re-triggering on next tick
+                        logger.info(
+                            f"[PM] SCALE-DOWN {pos.symbol} ({momentum_reason}): "
+                            f"50% sold, remaining=${pos.amount_usd:.0f} stays open"
+                        )
+                        return partial
                     return await self._execute_exit(pos, current_price, momentum_reason, pos.amount)
 
-            if hold_h >= (0.25 if is_aggressive else 0.5) and pnl_pct < -1.0 and (current_price <= pos.entry_price * 1.003 if pos.side == "long" else current_price >= pos.entry_price * 0.997):
+            # ── Timing / threshold calibration ──────────────────────────────────
+            # AGGRESSIVE (bear/choppy — short tokens only):
+            #   Exit quickly — short tokens are volatile, tight management needed.
+            # NON-AGGRESSIVE (bull/sideways — normal momentum longs):
+            #   Give positions 45-90 min to work. A -0.5% dip in 15 min is noise.
+            #   Old threshold (-0.5% / 15 min) caused a chop-machine death loop.
+            stall_hold  = 0.25 if is_aggressive else 0.75   # 15 min vs 45 min
+            stall_loss  = -1.5 if is_aggressive else -2.5   # -1.5% vs -2.5%
+            traction_hold  = 0.10 if is_aggressive else 0.50  # 6 min vs 30 min
+            traction_loss  = -1.0 if is_aggressive else -2.0  # -1.0% vs -2.0%
+
+            if hold_h >= stall_hold and pnl_pct < stall_loss and (current_price <= pos.entry_price * 1.003 if pos.side == "long" else current_price >= pos.entry_price * 0.997):
                 return await self._execute_exit(pos, current_price, "momentum_stall_aggressive" if is_aggressive else "momentum_stall", pos.amount)
 
-            if hold_h >= (0.1 if is_aggressive else 0.25) and pnl_pct < -0.5 and (current_price < pos.entry_price if pos.side == "long" else current_price > pos.entry_price):
+            if hold_h >= traction_hold and pnl_pct < traction_loss and (current_price < pos.entry_price if pos.side == "long" else current_price > pos.entry_price):
                 return await self._execute_exit(pos, current_price, "no_traction_aggressive" if is_aggressive else "no_traction", pos.amount)
 
         # Time exit applies to ALL positions (bot + synced/exchange holdings)
@@ -500,6 +526,15 @@ class PositionManager:
                     f"[PM] EXIT PARTIAL {pos.symbol} ({reason}): "
                     f"filled={filled_amount:.6f} remaining={pos.amount:.6f}"
                 )
+                # Set cooldown immediately on partial stop-loss fills — prevents
+                # scale_position from re-buying into a position that just stopped out.
+                if "stop" in reason.lower():
+                    cooldown_until = time.time() + self.symbol_cooldown_minutes * 60
+                    self._symbol_cooldowns[pos.symbol] = cooldown_until
+                    logger.info(
+                        f"[PM] Cooldown {pos.symbol} for {self.symbol_cooldown_minutes:.0f}m "
+                        f"after partial stop-loss (remaining={pos.amount:.6f})"
+                    )
                 return None
             # BUG FIX: Compute PnL on this final tranche using price×amount, not fill.amount_usd vs
             # pos.amount_usd — the latter is already reduced by prior tier exits, causing incorrect PnL.
@@ -528,17 +563,32 @@ class PositionManager:
             closed = pos.to_dict()
             closed["exit_price"] = fill["filled_price"]
             closed["pnl_pct"] = round(pnl_pct, 2)
+            closed["pnl_usd"] = round(pos.realized_pnl_usd, 4)  # required by server.py DB update check
             self._closed_history.append(closed)
             if len(self._closed_history) > 200:
                 self._closed_history = self._closed_history[-200:]
 
-            # Symbol cooldown: prevent re-entry after stop-loss for configured window
-            if "stop" in reason.lower():
-                cooldown_until = time.time() + self.symbol_cooldown_minutes * 60
-                self._symbol_cooldowns[pos.symbol] = cooldown_until
-                logger.info(
-                    f"[PM] Cooldown {pos.symbol} for {self.symbol_cooldown_minutes:.0f}m after stop-loss"
-                )
+            # ── Tiered cooldown by exit reason ────────────────────────────────
+            # Danger exits (stop, regime sweep) → 45 min: coin is in trouble.
+            # Momentum/time failures → 20-30 min: setup failed, give it a reset.
+            # TP / trailing → 5-10 min: profitable exit, fresh signal may re-enter.
+            # momentum_died/stall never reach here (they scale-down and keep position open).
+            r = reason.lower()
+            if any(x in r for x in ("stop_loss", "regime_shift", "emergency")):
+                cooldown_m = self.symbol_cooldown_minutes * 1.5   # 45 min
+            elif any(x in r for x in ("no_traction", "time_exit")):
+                cooldown_m = self.symbol_cooldown_minutes          # 30 min
+            elif any(x in r for x in ("faded", "died", "stall")):
+                cooldown_m = self.symbol_cooldown_minutes * 0.67   # 20 min
+            elif "trailing" in r:
+                cooldown_m = max(8.0, self.symbol_cooldown_minutes * 0.33)  # 10 min
+            elif any(x in r for x in ("tp", "take_profit", "tier1", "tier2")):
+                cooldown_m = max(5.0, self.symbol_cooldown_minutes * 0.2)   # 6 min
+            else:
+                cooldown_m = self.symbol_cooldown_minutes          # 30 min default
+            cooldown_until = time.time() + cooldown_m * 60
+            self._symbol_cooldowns[pos.symbol] = cooldown_until
+            logger.info(f"[PM] Cooldown {pos.symbol} for {cooldown_m:.0f}m after {reason}")
 
             del self._positions[pos.id]
             active_positions.set(len(self._positions))
@@ -566,6 +616,7 @@ class PositionManager:
             closed["pnl_pct"] = round(
                 (dust_err.price - pos.entry_price) / pos.entry_price * 100.0, 2
             )
+            closed["pnl_usd"] = round(pos.realized_pnl_usd, 4)  # required by server.py DB update check
             self._closed_history.append(closed)
             if len(self._closed_history) > 200:
                 self._closed_history = self._closed_history[-200:]
@@ -632,6 +683,143 @@ class PositionManager:
 
     def get_open_symbols(self) -> set[str]:
         return {p.symbol for p in self._positions.values() if p.status == "open"}
+
+    def get_position_for_symbol(self, symbol: str) -> Optional["Position"]:
+        """Return the first open position for a given symbol, or None."""
+        for pos in self._positions.values():
+            if pos.status == "open" and pos.symbol == symbol:
+                return pos
+        return None
+
+    async def scale_position(
+        self,
+        pos: "Position",
+        target_usd: float,
+        current_price: float,
+        tolerance_pct: float = 10.0,
+    ) -> str:
+        """Scale an existing position toward a target USD size instead of sell+rebuy.
+
+        Returns one of:
+          "hold"       — size is within tolerance, no trade executed
+          "scaled_up"  — bought delta to reach target size
+          "scaled_down"— sold delta to reach target size
+          "error"      — trade attempt failed
+        """
+        if current_price <= 0 or pos.amount_usd <= 0:
+            return "hold"
+
+        # Revalue position at current market price for an apples-to-apples comparison
+        current_value_usd = pos.amount * current_price
+
+        # Guard: don't scale a dust position — let _tick_position ghost-close it naturally.
+        # Scaling into dust would immediately re-open a full position that just stopped out.
+        if current_value_usd < 5.0:
+            logger.info(
+                f"[PM] SCALE SKIP {pos.symbol}: position is dust "
+                f"(${current_value_usd:.2f}) — awaiting natural close"
+            )
+            return "hold"
+
+        delta_usd = target_usd - current_value_usd
+        tolerance_usd = current_value_usd * (tolerance_pct / 100.0)
+
+        if abs(delta_usd) <= tolerance_usd:
+            logger.info(
+                f"[PM] SCALE HOLD {pos.symbol}: "
+                f"current=${current_value_usd:.2f} target=${target_usd:.2f} "
+                f"delta=${delta_usd:+.2f} (within {tolerance_pct:.0f}% tolerance)"
+            )
+            return "hold"
+
+        if delta_usd > 0:
+            # Safety: block scale-up if price is at or near the stop_loss level.
+            # Buying here would trigger an immediate stop_loss exit next tick.
+            if pos.stop_loss > 0 and current_price <= pos.stop_loss * 1.005:
+                logger.info(
+                    f"[PM] SCALE BLOCKED {pos.symbol}: "
+                    f"price {current_price:.6f} at/near stop_loss {pos.stop_loss:.6f} "
+                    f"— skipping scale_up to avoid immediate stop cycle"
+                )
+                return "hold"
+
+            # Need to buy more — buy only the delta
+            try:
+                fill = await self.execution.enter_position(
+                    symbol=pos.symbol,
+                    side="buy",
+                    amount_usd=delta_usd,
+                    price=current_price,
+                    setup_type="scale_up",
+                )
+                filled_amount = float(fill.get("filled_amount", 0.0))
+                if filled_amount > 0:
+                    old_entry = pos.entry_price  # capture before updating
+                    total_amount = pos.amount + filled_amount
+                    # Weighted average entry price
+                    pos.entry_price = (
+                        old_entry * pos.amount + current_price * filled_amount
+                    ) / total_amount
+                    pos.amount = total_amount
+                    pos.amount_usd += float(fill.get("amount_usd", delta_usd))
+                    pos.total_fees_usd += fill.get("fee_usd", 0.0)
+                    # Update stop_loss proportionally so it trails the new entry price.
+                    # Preserves the original risk-distance fraction set at open_position.
+                    if pos.stop_loss > 0 and old_entry > 0:
+                        sl_dist_frac = (old_entry - pos.stop_loss) / old_entry
+                        pos.stop_loss = pos.entry_price * (1.0 - sl_dist_frac)
+                    if current_price > pos.highest_price:
+                        pos.highest_price = current_price
+                    logger.info(
+                        f"[PM] SCALE UP {pos.symbol}: "
+                        f"+{filled_amount:.6f} @ {current_price:.6f} "
+                        f"(delta=${delta_usd:.2f}) new_total={pos.amount:.6f} "
+                        f"new_entry={pos.entry_price:.6f} new_sl={pos.stop_loss:.6f}"
+                    )
+                return "scaled_up"
+            except Exception as e:
+                logger.error(f"[PM] Scale-up failed for {pos.symbol}: {e}")
+                return "error"
+        else:
+            # Need to sell excess — sell only the delta
+            sell_usd = abs(delta_usd)
+            sell_amount = sell_usd / current_price
+            # Clamp to what we actually hold (safety)
+            sell_amount = min(sell_amount, pos.amount * 0.995)
+            if sell_amount <= 0:
+                return "hold"
+            try:
+                fill = await self.execution.exit_position(
+                    pos.symbol, sell_amount, current_price, "scale_down"
+                )
+                filled_amount = float(fill.get("filled_amount", 0.0))
+                if filled_amount > 0:
+                    partial_pnl = (fill["filled_price"] - pos.entry_price) * filled_amount
+                    pos.realized_pnl_usd += partial_pnl
+                    pos.amount = max(0.0, pos.amount - filled_amount)
+                    pos.amount_usd = pos.amount * pos.entry_price
+                    pos.total_fees_usd += fill.get("fee_usd", 0.0)
+                    logger.info(
+                        f"[PM] SCALE DOWN {pos.symbol}: "
+                        f"-{filled_amount:.6f} @ {fill['filled_price']:.6f} "
+                        f"(delta=${delta_usd:.2f}) partial_pnl=${partial_pnl:.2f}"
+                    )
+                return "scaled_down"
+            except SubMinimumAmountError:
+                # Delta to sell is dust — zero out the remainder and move on.
+                # Without this the same tiny delta repeats as ERROR every cycle.
+                pos.amount = max(0.0, pos.amount - sell_amount)
+                pos.amount_usd = pos.amount * pos.entry_price
+                logger.info(
+                    f"[PM] SCALE DUST {pos.symbol}: delta {sell_amount:.8f} is below "
+                    f"exchange minimum — trimming tracked amount to {pos.amount:.8f}"
+                )
+                return "scaled_down"
+            except Exception as e:
+                logger.error(f"[PM] Scale-down failed for {pos.symbol}: {e}")
+                return "error"
+
+
 
     @property
     def open_count(self) -> int:

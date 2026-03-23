@@ -40,12 +40,35 @@ class QuantMutator:
         current_bayesian_threshold: float,
         closed_trades: list[dict],
         current_day_pnl_pct: float = 0.0,
+        consecutive_zero_setups: int = 0,
     ) -> dict:
         """
         Check if mutation is warranted this cycle.
         Returns {min_score, bayesian_threshold, mutated: bool}.
         """
         self._cycle_count += 1
+
+        # ── Drought relief: system frozen with 0 setups for too long ──────────
+        # If no setup passes the filter for >200 consecutive cycles (~1.7h), the
+        # bars are too high. Force them back down so trading can resume.
+        DROUGHT_CYCLES = 200
+        if consecutive_zero_setups > DROUGHT_CYCLES:
+            relief_score = max(self.min_score_floor, current_min_score - self.score_raise_step * 2)
+            relief_threshold = max(0.45, current_bayesian_threshold - 0.10)
+            mutated = (relief_score != current_min_score or relief_threshold != current_bayesian_threshold)
+            if mutated:
+                logger.info(
+                    f"[QuantMutator] drought_relief ({consecutive_zero_setups} zero-setup cycles): "
+                    f"min_score {current_min_score:.1f}→{relief_score:.1f} "
+                    f"threshold {current_bayesian_threshold:.2f}→{relief_threshold:.2f}"
+                )
+            return {
+                "min_score": round(relief_score, 2),
+                "bayesian_threshold": round(relief_threshold, 3),
+                "mutated": mutated,
+                "win_rate": 0.0,
+                "reason": f"drought_relief ({consecutive_zero_setups} cycles)" if mutated else "no_change",
+            }
 
         if self._cycle_count % self.every_n_cycles != 0:
             return {
@@ -83,9 +106,15 @@ class QuantMutator:
             reason = f"hot_streak (wr={win_rate:.0%})"
 
         elif win_rate < self.low_win_rate:
-            # Cold streak → raise bars to reduce trading (but cap at ceiling)
+            # Cold streak → raise score bar, but:
+            # 1. Don't raise Bayesian when score is already at ceiling — system can't enter
+            #    anyway, and raising Bayesian just makes the freeze harder to break out of.
+            # 2. Cap Bayesian at 0.62 — Bayesian prior is 0.48-0.62; higher is unreachable.
             new_score = min(self.min_score_ceiling, current_min_score + self.score_raise_step)
-            new_threshold = min(0.88, current_bayesian_threshold + 0.03)
+            if current_min_score < self.min_score_ceiling:
+                new_threshold = min(0.62, current_bayesian_threshold + 0.02)
+            else:
+                new_threshold = current_bayesian_threshold  # frozen at ceiling — don't raise further
             reason = f"cold_streak (wr={win_rate:.0%})"
         
         # Hard cap enforcement for momentum hunting (never exceed ceiling)

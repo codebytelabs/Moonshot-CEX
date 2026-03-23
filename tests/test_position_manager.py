@@ -181,3 +181,69 @@ async def test_regime_time_exit_overrides_base_time_exit():
 
     assert ex.exit_position.await_count == 1
     assert exits[0]["close_reason"] == "time_exit"
+
+
+# ── scale_position tests ──────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_scale_up_buys_only_delta():
+    """When target > current value by >10%, enter_position is called for the delta only."""
+    fill_price = 100.0
+    fill_amount = 2.0  # will be the delta buy
+    ex = make_mock_execution(fill_price=fill_price, fill_amount=fill_amount)
+    # Build PM directly with this ex so assertions target the right mock
+    pm = PositionManager(execution=ex, trailing_activate_pct=15.0, stop_loss_pct=-18.0)
+
+    # Existing position: 3 units @ $100 = $300 current value
+    pos = make_position_obj(entry=100.0, amount=3.0)
+    pm._positions[pos.id] = pos
+
+    # Target: $500 → delta = $200 → well outside 10% tolerance
+    result = await pm.scale_position(pos, target_usd=500.0, current_price=100.0, tolerance_pct=10.0)
+
+    assert result == "scaled_up"
+    ex.enter_position.assert_awaited_once()
+    ex.exit_position.assert_not_awaited()
+    # Amount should have grown
+    assert pos.amount > 3.0
+
+
+@pytest.mark.asyncio
+async def test_scale_hold_within_tolerance():
+    """When target is within ±10% of current value, no trade is placed."""
+    ex = make_mock_execution(fill_price=100.0)
+    pm = PositionManager(execution=ex, trailing_activate_pct=15.0, stop_loss_pct=-18.0)
+
+    # Existing: 3 units @ $100 = $300.  Target $305 is ~1.7% away → hold.
+    pos = make_position_obj(entry=100.0, amount=3.0)
+    pm._positions[pos.id] = pos
+
+    result = await pm.scale_position(pos, target_usd=305.0, current_price=100.0, tolerance_pct=10.0)
+
+    assert result == "hold"
+    ex.enter_position.assert_not_awaited()
+    ex.exit_position.assert_not_awaited()
+    # Amount unchanged
+    assert pos.amount == 3.0
+
+
+@pytest.mark.asyncio
+async def test_scale_down_sells_only_delta():
+    """When target < current value by >10%, exit_position is called for the excess only."""
+    fill_price = 100.0
+    sell_amount = 2.0  # exchange will fill this
+    ex = make_mock_execution(fill_price=fill_price, fill_amount=sell_amount)
+    pm = PositionManager(execution=ex, trailing_activate_pct=15.0, stop_loss_pct=-18.0)
+
+    # Existing: 5 units @ $100 = $500.  Target $200 → sell excess.
+    pos = make_position_obj(entry=100.0, amount=5.0)
+    pm._positions[pos.id] = pos
+
+    result = await pm.scale_position(pos, target_usd=200.0, current_price=100.0, tolerance_pct=10.0)
+
+    assert result == "scaled_down"
+    ex.exit_position.assert_awaited_once()
+    ex.enter_position.assert_not_awaited()
+    # Amount should have decreased
+    assert pos.amount < 5.0
+

@@ -342,48 +342,58 @@ pytest tests/ --cov=src --cov-report=term-missing
 
 ## Changelog
 
-### v3.0 — March 2026 (Current)
+> Full version history with detailed bug fixes, strategy changes, and configuration overhauls:  
+> **[→ See CHANGELOG.md](./CHANGELOG.md)**
 
-**Exchange-First Data Architecture**
-- All financial metrics (equity, PnL, positions) now sourced directly from exchange — MongoDB used for infra only
-- FIFO realized PnL calculation (`_compute_pnl_from_fills`) replaces hardcoded zeros
-- Unrealized PnL per position shown in real-time from live price feeds
-- `INITIAL_EQUITY_USD` deprecated — real equity fetched on startup with 5-retry exponential backoff; swarm blocked until confirmed
+---
 
-**Conviction-Aware Position Sizing** _(biggest change)_
-- `compute_position_size()` now accepts `posterior`, `threshold`, `vol_usd`, `ta_score`
-- **Conviction multiplier** (0.55× → 1.45×): posterior well above threshold = bigger size; borderline = smaller
-- **Liquidity multiplier** (0.45× → 1.00×): 24h vol gates sizing to avoid slippage on illiquid coins
-- **TA quality multiplier** (0.90× → 1.10×): higher technical score = modest size boost
-- Max single exposure cap (`15%`) always applies regardless of multipliers
+### v3.2 — March 23, 2026 (Current) — Profitability Overhaul
 
-**Bayesian Engine Improvements**
-- Replaced arbitrary `× 6.5` normalisation with mathematically correct Bayes theorem:  
-  `P(H|E) = P(E|H) · P(H) / [P(E|H) · P(H) + P(E|¬H) · P(¬H)]`
-- `mean_reversion` prior lowered `0.52 → 0.38` (contrarian setup conflicts with momentum thesis)
+**Mission:** Stop the bleeding. Root cause analysis identified 10+ systematic issues. All fixed.
 
-**Capital Deployment & Aggressive Momentum Limits (v3.1)**
-- `MAX_PORTFOLIO_EXPOSURE_PCT` raised to 95% to ensure full capital utilization
-- `MAX_SINGLE_EXPOSURE_PCT` raised to 20% to make bets highly impactful
-- `MUTATOR_MIN_SCORE_CEILING` capped at 25 and `ANALYZER_MIN_SCORE` dropped to 15 to ensure the bot continues trading aggressively even in suboptimal regimes
-- Modified Pyramiding to compound into winning trades as early as +1.5R (before Tier 1 profit taking)
+**Bug Fixes**
+- `is_aggressive` flag permanently `False` in all regimes (read `max_exposure_pct` from wrong dict) — fixed to use explicit regime name check
+- Bayesian threshold **inverted** in `.env`: `VOLATILE=0.38` (easier than normal `0.45`) — now `0.52` (stricter)
+- `momentum_recheck_interval_minutes` never wired from config to `PositionManager` — always defaulted to 5 min regardless of config
+- `MAX_DRAWDOWN_PCT` duplicated in `.env` (25.0 + 0.35) — first value effectively disabled drawdown protection
+- `MAX_DAILY_LOSS_USD=5.0` — $5/day cap halting the bot after one normal fill; removed
+- `.env` overriding all `config.py` threshold fixes silently
 
-**Historical NAV Charting & Clean UI**
-- Frontend NAV Chart now features Session, 1H, 6H, 1D, 7D interval selection powered by MongoDB snapshots
-- Persistent dust-filtering (< $3 USD value) keeps "Ghost" positions off the Open Positions board
+**Strategy Changes**
+- Bear/choppy: **dual-side trading** — `breakout`/`momentum` longs + short tokens simultaneously (was: short tokens only, capital starved to 15-20%)
+- Capital raised: bear `20% → 55%`, choppy `15% → 42%`, sideways `75% → 82%`
+- **4h EMA50 trend gate**: long entries blocked if token is below its own 4h EMA50 (per-token relative-strength filter)
+- **Minimum 2% stop distance**: ATR stops below 2% widened — prevents noise stop-outs on sub-1% stops
+- Exit timing extended for bull/sideways: `no_traction` 15min/-0.5% → 30min/-2.0%; `momentum_stall` 30min/-1.0% → 45min/-2.5%
+- Watcher short-token quota: regime-aware (`top_n//3` in bear/choppy vs `top_n//4` in bull/sideways)
+- `analyzer_top_n`: `5 → 12` — pipeline needs more candidates to fill 6-10 positions after EMA50 filtering
+- `CONSECUTIVE_LOSS_PAUSE_MINUTES`: `3 → 15`
+
+---
+
+### v3.1 — March 2026 — Capital Deployment Overhaul
+
+- Kelly sizing floor fixed: fallback used `max_risk_per_trade` (tiny) not `max_single_exposure` (20%)
+- `detect_account_tier()` now called on every sizing computation (was stale from init)
+- Min order floor: `$10 → $50`
+- `MAX_PORTFOLIO_EXPOSURE_PCT: 0.85 → 0.95`, `MAX_SINGLE_EXPOSURE_PCT: 0.15 → 0.25`
+
+---
+
+### v3.0 — March 2026
+
+- Exchange-first data architecture; FIFO realized PnL; conviction/liquidity/TA multipliers in sizing
+- Bayesian engine: correct Bayes theorem replaces `× 6.5` normalisation
+- Frontend NAV Chart with Session/1H/6H/1D/7D intervals
+
+---
 
 ### v2.0 — March 2026
 
-- Exchange holdings receive stop loss + trailing stop + time exit protection
-- Limit-first exit execution (reprice up to 5× before aggressive limit)
-- Symbol cooldown after stop-loss exits (prevents revenge trading)
-- FIFO PnL in trade history endpoint
+- Exchange holdings get stop loss + trailing stop + time exit; limit-first exit execution; symbol cooldowns
+
+---
 
 ### v1.0 — Initial Release
 
-- Multi-agent swarm: Watcher, Analyzer, Context, Bayesian, Execution, Position, Risk, QuantMutator, BigBrother
-- Paper / demo / live mode support
-- Gate.io, Binance, KuCoin via CCXT
-- Next.js dashboard + TinyOffice chat interface
-- MongoDB persistence + Redis caching
-- Prometheus metrics + Discord/Telegram alerts
+- Multi-agent swarm, Paper/demo/live modes, Gate.io/Binance/KuCoin, Next.js dashboard, MongoDB + Redis

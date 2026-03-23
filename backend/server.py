@@ -87,6 +87,7 @@ _alerts: Optional[AlertManager] = None
 _min_score_live: float = cfg.analyzer_min_score
 _bayesian_threshold_live: float = cfg.bayesian_threshold_normal
 _swarm_task: Optional[asyncio.Task] = None
+_consecutive_zero_setups: int = 0  # cycles with 0 setups; drought relief triggers at 200
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -173,6 +174,8 @@ async def _startup():
         pyramid_min_r=cfg.pyramid_min_r_to_add,
         max_sell_retries=cfg.max_sell_retries,
         stop_loss_pct=cfg.stop_loss_pct,
+        momentum_recheck_interval_minutes=cfg.momentum_recheck_interval_minutes,
+        symbol_cooldown_minutes=cfg.symbol_cooldown_minutes,
     )
     _risk_manager = RiskManager(
         max_positions=cfg.max_positions,
@@ -207,6 +210,7 @@ async def _startup():
         openrouter_api_key=cfg.openrouter_api_key,
         openrouter_base_url=cfg.openrouter_base_url,
         openrouter_model=cfg.openrouter_primary_model,
+        llm_macro_enabled=cfg.llm_macro_enabled,
         regime_detection_interval_cycles=cfg.regime_detection_interval_cycles,
         bull_threshold=cfg.regime_bull_threshold,
         bear_threshold=cfg.regime_bear_threshold,
@@ -365,7 +369,7 @@ async def _swarm_loop():
 
 
 async def _run_cycle():
-    global _min_score_live, _bayesian_threshold_live
+    global _min_score_live, _bayesian_threshold_live, _consecutive_zero_setups
 
     STATE["cycle_count"] += 1
     cycle = STATE["cycle_count"]
@@ -387,8 +391,10 @@ async def _run_cycle():
     await asyncio.sleep(2)
     _analyzer.min_score = _min_score_live
     try:
-        setups = await _analyzer.analyze(candidates)
+        setups = await _analyzer.analyze(candidates, regime=STATE.get("regime", "sideways"))
         trace["steps"].append(f"analyzer:{len(setups)}")
+        if setups:
+            _consecutive_zero_setups = 0
     except Exception as exc:
         trace["steps"].append(f"analyzer_error:{exc}")
         logger.error(f"[Cycle {cycle}] Analyzer error: {exc}")
@@ -400,6 +406,7 @@ async def _run_cycle():
     logger.info(f"[Cycle {cycle}] Analyzer → {len(setups)} setups (min_score={_min_score_live})")
 
     if not setups:
+        _consecutive_zero_setups += 1
         await _tick_positions()
         return
 
@@ -455,8 +462,60 @@ async def _run_cycle():
 
     for setup in approved:
         symbol = setup["symbol"]
+
+        # ── Pre-compute desired size (needed for both scale and new-entry paths) ──
+        sl_pct = STATE.get("regime_params", {}).get("stop_loss_pct", cfg.stop_loss_pct)
+        decision = setup.get("decision", {})
+        size_usd = _risk_manager.compute_position_size(
+            symbol=symbol,
+            current_equity=equity,
+            stop_loss_pct=sl_pct,
+            posterior=float(decision.get("posterior", 0.65)),
+            threshold=float(decision.get("threshold", cfg.bayesian_threshold_normal)),
+            vol_usd=float(setup.get("vol_usd", 0.0)),
+            ta_score=float(setup.get("ta_score", 50.0)),
+            regime_size_mult=_regime_size_mult,
+            current_regime=_current_regime,
+        )
+        size_usd = min(size_usd, equity * cfg.max_single_exposure_pct)
+        if _uses_exchange_account_state():
+            size_usd = min(size_usd, available_cash_usd * 0.92)
+
+        # ── Already holding this symbol? → Scale instead of sell+rebuy ──────
         if symbol in open_syms:
-            trace["steps"].append(f"skip_held:{symbol}")
+            if cfg.position_scale_tolerance_pct > 0:
+                # Cooldown gate applies to scaling too — a symbol that just stopped out
+                # must not be immediately re-bought via scale_up (root cause of the
+                # "death by a thousand cuts" loop with TAO/MOODENG).
+                if _position_manager.is_symbol_on_cooldown(symbol):
+                    trace["steps"].append(f"skip_scale_cooldown:{symbol}")
+                    logger.info(f"[Swarm] {symbol} scale skipped: symbol cooldown active after stop-loss")
+                    continue
+
+                existing_pos = _position_manager.get_position_for_symbol(symbol)
+                if existing_pos and existing_pos.setup_type not in ("synced_holding", "exchange_holding"):
+                    try:
+                        _scale_price = await _execution.get_current_price(symbol)
+                        if _scale_price > 0 and size_usd >= _MIN_POSITION_USD:
+                            scale_result = await _position_manager.scale_position(
+                                existing_pos,
+                                target_usd=size_usd,
+                                current_price=_scale_price,
+                                tolerance_pct=cfg.position_scale_tolerance_pct,
+                            )
+                            trace["steps"].append(f"scale_{scale_result}:{symbol}")
+                            logger.info(f"[Swarm] {symbol} already held → scale={scale_result}")
+                            # Track committed cash so subsequent entries see accurate available
+                            if scale_result == "scaled_up":
+                                current_val = existing_pos.amount * _scale_price
+                                delta_spent = max(0.0, size_usd - current_val)
+                                available_cash_usd = max(0.0, available_cash_usd - delta_spent)
+                    except Exception as _se:
+                        logger.debug(f"[Swarm] Scale check failed for {symbol}: {_se}")
+                else:
+                    trace["steps"].append(f"skip_held:{symbol}")
+            else:
+                trace["steps"].append(f"skip_held:{symbol}")
             continue
 
         # Symbol cooldown gate — prevent revenge-trading after recent stop-loss
@@ -504,29 +563,11 @@ async def _run_cycle():
             asyncio.create_task(_save_rejected_setup_to_db(setup, gate_reason, "risk_gate"))
             continue
 
-        entry_zone = setup.get("entry_zone", {})
-        sl_pct = STATE.get("regime_params", {}).get("stop_loss_pct", cfg.stop_loss_pct)
-        decision = setup.get("decision", {})
-        size_usd = _risk_manager.compute_position_size(
-            symbol=symbol,
-            current_equity=equity,
-            stop_loss_pct=sl_pct,
-            posterior=float(decision.get("posterior", 0.65)),
-            threshold=float(decision.get("threshold", cfg.bayesian_threshold_normal)),
-            vol_usd=float(setup.get("vol_usd", 0.0)),
-            ta_score=float(setup.get("ta_score", 50.0)),
-            regime_size_mult=_regime_size_mult,     # v3.1: BigBrother regime multiplier
-            current_regime=_current_regime,         # v3.1: for win-streak gating
-        )
-        size_usd = min(size_usd, equity * cfg.max_single_exposure_pct)
-
-        # Cap to actual available cash (demo/live) so we never over-commit
-        if _uses_exchange_account_state():
-            size_usd = min(size_usd, available_cash_usd * 0.92)
-            if size_usd < _MIN_POSITION_USD:
-                trace["steps"].append(f"skip_{symbol}:cash_depleted:${available_cash_usd:.0f}")
-                logger.info(f"[Swarm] {symbol} skipped: only ${available_cash_usd:.2f} USDT left")
-                break
+        # Cash sufficiency check for new entries
+        if _uses_exchange_account_state() and size_usd < _MIN_POSITION_USD:
+            trace["steps"].append(f"skip_{symbol}:cash_depleted:${available_cash_usd:.0f}")
+            logger.info(f"[Swarm] {symbol} skipped: only ${available_cash_usd:.2f} USDT left")
+            break
 
         trace["steps"].append(f"sizing:{symbol}:${size_usd:.0f}")
 
@@ -599,6 +640,7 @@ async def _run_cycle():
         current_bayesian_threshold=_bayesian_threshold_live,
         closed_trades=closed_history,
         current_day_pnl_pct=day_pnl_pct,
+        consecutive_zero_setups=_consecutive_zero_setups,
     )
     if mutation["mutated"]:
         _min_score_live = mutation["min_score"]
@@ -628,8 +670,16 @@ async def _run_cycle():
     STATE["recent_events"].extend(bb_result.get("events", []))
     STATE["recent_events"] = STATE["recent_events"][-50:]
 
-    if old_regime != STATE["regime"] and STATE["regime"] in ("bear", "choppy"):
-        logger.warning(f"[Swarm] Regime shifted from {old_regime} to {STATE['regime']}. Sweeping vulnerable positions.")
+    # Track consecutive bear/choppy cycles — only sweep after 2+ cycles to avoid
+    # false sweeps from single-cycle regime blips (sideways→bear→sideways).
+    if STATE["regime"] in ("bear", "choppy"):
+        STATE["_bear_cycle_count"] = STATE.get("_bear_cycle_count", 0) + 1
+    else:
+        STATE["_bear_cycle_count"] = 0
+
+    if (old_regime != STATE["regime"] and STATE["regime"] in ("bear", "choppy")
+            and STATE.get("_bear_cycle_count", 0) >= 2):
+        logger.warning(f"[Swarm] Regime confirmed {STATE['regime']} for {STATE['_bear_cycle_count']} cycles (from {old_regime}). Sweeping vulnerable positions.")
         sweep_exits = await _position_manager.sweep_vulnerable_positions()
         for exit_result in sweep_exits:
             if exit_result and exit_result.get("pnl_usd") is not None:
@@ -675,7 +725,8 @@ async def _run_cycle():
 
 
 async def _tick_positions() -> list[dict]:
-    regime_params = STATE.get("regime_params")
+    regime_params = dict(STATE.get("regime_params") or {})
+    regime_params["regime"] = STATE.get("regime", "sideways")  # explicit name for is_aggressive check
     exits = await _position_manager.update_all(regime_params=regime_params)
     return [e for e in exits if e is not None]
 
@@ -893,6 +944,95 @@ async def _recover_positions_from_db():
                 )
     except Exception as e:
         logger.error(f"[Recovery] Failed to restore positions: {e}")
+
+    # ── Cancel orphaned sell orders for bot-tracked symbols ──────────────────
+    # When the bot crashes mid-exit, GTC limit sells stay on the exchange and
+    # can fill silently (selling coins without bot tracking the close).
+    # Only cancels SELL orders for symbols the bot has open positions in —
+    # preserves any user-placed manual orders for unrelated symbols.
+    if _exchange and _uses_exchange_account_state() and _position_manager:
+        try:
+            tracked_symbols = {
+                pos.symbol
+                for pos in _position_manager._positions.values()
+            }
+            # Also include symbols that were in DB as "open" before recovery
+            if _db is not None:
+                try:
+                    db_syms_cursor = _db.positions.find(
+                        {"status": {"$in": ["open", "closed_on_restart"]}, "exchange": cfg.exchange_name},
+                        {"_id": 0, "symbol": 1},
+                    )
+                    db_sym_docs = await db_syms_cursor.to_list(length=200)
+                    tracked_symbols |= {d["symbol"] for d in db_sym_docs if d.get("symbol")}
+                except Exception:
+                    pass
+
+            open_orders = await _exchange.fetch_open_orders()
+            orphans = [
+                o for o in open_orders
+                if o.get("side") == "sell" and o.get("symbol") in tracked_symbols
+            ]
+            if orphans:
+                logger.warning(
+                    f"[Recovery] Found {len(orphans)} orphaned SELL order(s) for bot symbols — cancelling."
+                )
+                for order in orphans:
+                    oid = order.get("id")
+                    sym = order.get("symbol")
+                    try:
+                        await _exchange.cancel_order(oid, sym)
+                        logger.info(
+                            f"[Recovery] Cancelled orphaned SELL {oid} for {sym} @ {order.get('price')}"
+                        )
+                    except Exception as ce:
+                        logger.debug(f"[Recovery] Could not cancel order {oid}: {ce}")
+        except Exception as e:
+            logger.debug(f"[Recovery] Orphan order sweep error: {e}")
+
+    # ── Seed risk manager trade history from DB so win rate is correct after restart ──
+    if _db is not None and _risk_manager is not None:
+        try:
+            cursor = _db.trades.find(
+                {"pnl_usd": {"$exists": True}, "exchange": cfg.exchange_name},
+                {"_id": 0, "pnl_usd": 1, "pnl_pct": 1},
+                sort=[("saved_at", 1)],
+                limit=500,
+            )
+            trade_docs = await cursor.to_list(length=500)
+            for t in trade_docs:
+                pnl = float(t.get("pnl_usd") or 0)
+                pct = float(t.get("pnl_pct") or 0)
+                r = pct / abs(cfg.stop_loss_pct) if cfg.stop_loss_pct else 0.0
+                _risk_manager.record_trade(pnl, pct, r)
+            if trade_docs:
+                wr = sum(1 for t in trade_docs if (t.get("pnl_usd") or 0) > 0) / len(trade_docs) * 100
+                logger.info(f"[Recovery] Seeded risk manager with {len(trade_docs)} historical trades (WR={wr:.0f}%)")
+            # Reset session-level safeguards — consecutive_loss_pause is a within-session
+            # guard, not persistent state. Replaying historical losses would re-trigger it
+            # every restart even though the session is fresh.
+            _risk_manager._consecutive_losses = 0
+            _risk_manager._consecutive_wins = 0
+            _risk_manager._pause_until = None
+        except Exception as e:
+            logger.debug(f"[Recovery] Risk manager seed error: {e}")
+
+    # ── Restore peak equity from snapshots so drawdown protection survives restarts ──
+    # Without this, every restart resets peak_equity to current equity → safety/drawdown
+    # mode never triggers across sessions even during persistent NAV declines.
+    if _db is not None and _risk_manager is not None:
+        try:
+            peak_cursor = _db.equity_snapshots.find(
+                {}, {"_id": 0, "v": 1}
+            ).sort("v", -1).limit(1)
+            peak_docs = await peak_cursor.to_list(length=1)
+            if peak_docs:
+                historical_peak = float(peak_docs[0]["v"])
+                if historical_peak > _risk_manager.peak_equity:
+                    _risk_manager.peak_equity = historical_peak
+                    logger.info(f"[Recovery] Restored peak equity ${historical_peak:.2f} from snapshots")
+        except Exception as e:
+            logger.debug(f"[Recovery] Peak equity restore error: {e}")
 
 
 
@@ -1122,13 +1262,24 @@ def _compute_pnl_from_fills(raw_fills: list[dict]) -> tuple[list[dict], float]:
     return completed_trades, round(total_pnl, 4)
 
 
+_exchange_fills_cache: list[dict] = []
+_exchange_fills_ts: float = 0.0
+_EXCHANGE_FILLS_TTL = 60.0  # seconds between actual exchange calls
+
+
 async def _get_exchange_trade_history(limit: int) -> list[dict]:
     """
     Fetch exchange fills, FIFO-match buys→sells, return completed trades
     with real realized pnl_usd. Falls back to raw fills if anything fails.
+    Results are cached for _EXCHANGE_FILLS_TTL seconds to avoid hammering
+    fetch_my_trades on every /api/trades poll.
     """
+    global _exchange_fills_cache, _exchange_fills_ts
     if not _exchange:
         return []
+
+    if time.time() - _exchange_fills_ts < _EXCHANGE_FILLS_TTL and _exchange_fills_cache:
+        return _exchange_fills_cache[:limit]
 
     # Fetch 3× more fills than needed so FIFO matching can find buy lots
     fetch_limit = min(limit * 4, 500)
@@ -1136,7 +1287,7 @@ async def _get_exchange_trade_history(limit: int) -> list[dict]:
         raw = await _exchange.fetch_my_trades(limit=fetch_limit)
     except Exception as e:
         logger.debug(f"[TradeHistory] fetch_my_trades error: {e}")
-        return []
+        return _exchange_fills_cache[:limit]  # return stale cache on error rather than []
 
     # Normalize timestamps and attach _ts_sec for FIFO sorting
     fills: list[dict] = []
@@ -1150,10 +1301,76 @@ async def _get_exchange_trade_history(limit: int) -> list[dict]:
 
     # Sort newest→oldest for display
     completed.sort(key=lambda x: x.get("closed_at", 0), reverse=True)
+    _exchange_fills_cache = completed
+    _exchange_fills_ts = time.time()
     return completed[:limit]
 
 
 # ── Cumulative realized PnL from exchange (cached) ───────────────────────────
+_equity_pnl_cache: dict = {"pnl": 0.0, "day_pnl": 0.0, "fetched_at": 0.0}
+_EQUITY_PNL_CACHE_TTL = 30  # seconds
+
+
+async def _compute_pnl_from_equity_snapshots(current_equity: float) -> dict:
+    """
+    Compute PnL from equity_snapshots (exchange ground truth).
+    total_pnl = current_equity - oldest-ever snapshot
+    day_pnl   = current_equity - first snapshot of today (UTC midnight)
+    Cached for 30 s.
+    """
+    global _equity_pnl_cache
+    now = time.time()
+    if now - _equity_pnl_cache["fetched_at"] < _EQUITY_PNL_CACHE_TTL:
+        # Re-apply live equity so the delta stays fresh even if snapshots are cached
+        cached_base = _equity_pnl_cache.get("_base_total", 0.0)
+        cached_today = _equity_pnl_cache.get("_base_day", 0.0)
+        return {
+            "pnl": round(current_equity - cached_base, 4) if cached_base else _equity_pnl_cache["pnl"],
+            "day_pnl": round(current_equity - cached_today, 4) if cached_today else _equity_pnl_cache["day_pnl"],
+        }
+
+    if _db is None:
+        return _equity_pnl_cache
+
+    try:
+        import datetime as _dt
+        today_start_ts = int(
+            _dt.datetime(
+                *_dt.datetime.now(_dt.timezone.utc).timetuple()[:3],
+                tzinfo=_dt.timezone.utc,
+            ).timestamp()
+        )
+
+        # Oldest snapshot ever → baseline for total PnL
+        oldest_cursor = _db.equity_snapshots.find({}, {"_id": 0, "t": 1, "v": 1}).sort("t", 1).limit(1)
+        oldest = await oldest_cursor.to_list(length=1)
+
+        # First snapshot of today → baseline for day PnL
+        today_cursor = _db.equity_snapshots.find(
+            {"t": {"$gte": today_start_ts}}, {"_id": 0, "t": 1, "v": 1}
+        ).sort("t", 1).limit(1)
+        today_first = await today_cursor.to_list(length=1)
+
+        base_total = float(oldest[0]["v"]) if oldest else current_equity
+        base_day = float(today_first[0]["v"]) if today_first else current_equity
+
+        total_pnl = current_equity - base_total
+        day_pnl = current_equity - base_day
+
+        _equity_pnl_cache = {
+            "pnl": round(total_pnl, 4),
+            "day_pnl": round(day_pnl, 4),
+            "fetched_at": now,
+            "_base_total": base_total,
+            "_base_day": base_day,
+        }
+        logger.debug(f"[PnL Snapshots] base_total={base_total:.2f} base_day={base_day:.2f} total={total_pnl:+.2f} today={day_pnl:+.2f}")
+    except Exception as e:
+        logger.debug(f"[PnL Snapshots] error: {e}")
+
+    return _equity_pnl_cache
+
+
 _exchange_pnl_cache: dict = {"pnl": 0.0, "day_pnl": 0.0, "fetched_at": 0.0}
 _EXCHANGE_PNL_CACHE_TTL = 60  # seconds
 
@@ -1249,6 +1466,7 @@ async def _build_ws_payload() -> dict:
         "last_decisions": STATE.get("last_decisions", [])[:3],
         "recent_events": STATE.get("recent_events", [])[-10:],
         "risk_health": _risk_manager.check_portfolio_health(STATE["current_equity"]) if _risk_manager else {},
+        "recent_trades": _position_manager.get_closed_history(10) if _position_manager else [],
     }
 
 
@@ -1339,7 +1557,7 @@ async def debug_pipeline():
 
     # Step 2: Analyzer
     _analyzer.min_score = _min_score_live
-    setups = await _analyzer.analyze(candidates)
+    setups = await _analyzer.analyze(candidates, regime=STATE.get("regime", "sideways"))
     trace["analyzer"]["count"] = len(setups)
     trace["analyzer"]["setups"] = [
         {
@@ -1510,8 +1728,14 @@ async def portfolio():
         snapshot = await _get_exchange_account_snapshot()
         health = _risk_manager.check_portfolio_health(snapshot["equity"]) if _risk_manager else {}
 
-        # Compute real realized PnL from exchange fill history (cached 60s)
-        pnl_data = await _compute_cumulative_exchange_pnl()
+        # PnL from equity snapshots = exchange ground truth (accounts for ALL
+        # equity changes: realized, unrealized, fees). Falls back to exchange
+        # fill FIFO only when no DB snapshots exist yet.
+        eq = snapshot["equity"]
+        if _db is not None:
+            pnl_data = await _compute_pnl_from_equity_snapshots(eq)
+        else:
+            pnl_data = await _compute_cumulative_exchange_pnl()
         total_pnl = pnl_data["pnl"]
         day_pnl = pnl_data["day_pnl"]
 
@@ -1520,7 +1744,6 @@ async def portfolio():
         STATE["day_pnl_usd"] = day_pnl
 
         # Update equity tracking
-        eq = snapshot["equity"]
         if eq > 0:
             STATE["current_equity"] = eq
             if eq > STATE.get("peak_equity", 0):
@@ -1672,27 +1895,50 @@ async def sync_holdings():
 
 @app.get("/api/trades")
 async def get_trades(limit: int = 50):
+    db_trades: list = []
+
+    # Priority 1: DB trades — actual bot close events (stop_loss, tp1, tp2, trailing…)
+    if _db is not None:
+        try:
+            cursor = _db.trades.find(
+                {"exchange": cfg.exchange_name},
+                {"_id": 0},
+                sort=[("saved_at", -1)],
+                limit=limit,
+            )
+            db_trades = await cursor.to_list(length=limit)
+        except Exception as e:
+            logger.debug(f"Trades DB fetch error: {e}")
+
+    # If DB is fully populated return it directly
+    if len(db_trades) >= limit:
+        return {"trades": db_trades, "source": "db"}
+
+    # Priority 2: supplement with exchange fills when DB is sparse (new session / few closes)
     if _uses_exchange_account_state():
         try:
-            return {"trades": await _get_exchange_trade_history(limit), "source": "exchange"}
+            remaining = limit - len(db_trades)
+            exchange_fills = await _get_exchange_trade_history(remaining)
+            # Avoid showing exchange fills that duplicate a DB entry (same symbol+close_reason)
+            db_ids = {(t.get("symbol"), t.get("close_reason")) for t in db_trades}
+            extra = [f for f in exchange_fills
+                     if (f.get("symbol"), f.get("close_reason")) not in db_ids]
+            merged = db_trades + extra
+            if merged:
+                return {"trades": merged, "source": "db+exchange" if db_trades else "exchange"}
         except Exception as e:
             logger.debug(f"Exchange trades fetch error: {e}")
-            return {"trades": [], "source": "exchange"}
-    if _db is None:
-        history = _position_manager.get_closed_history(limit) if _position_manager else []
-        return {"trades": history, "source": "internal"}
-    try:
-        cursor = _db.trades.find(
-            {},
-            {"_id": 0},
-            sort=[("saved_at", -1)],
-            limit=limit,
-        )
-        docs = await cursor.to_list(length=limit)
-        return {"trades": docs, "source": "db"}
-    except Exception as e:
-        logger.debug(f"Trades fetch error: {e}")
-        return {"trades": [], "source": "db"}
+
+    if db_trades:
+        return {"trades": db_trades, "source": "db"}
+
+    # Priority 3: In-memory closed history (paper/backtest mode, no DB)
+    if _position_manager:
+        history = _position_manager.get_closed_history(limit)
+        if history:
+            return {"trades": history, "source": "internal"}
+
+    return {"trades": [], "source": "none"}
 
 
 @app.get("/api/equity/history")

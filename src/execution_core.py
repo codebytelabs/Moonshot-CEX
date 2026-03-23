@@ -87,10 +87,20 @@ class ExecutionCore:
                 )
                 fill_price = fill.get("average") or fill.get("price") or price
                 raw_filled = fill.get("filled")
-                # Gate.io testnet returns 'filled' as quote cost (USDT) not base coin amount.
-                # Detect: if raw_filled >> sent amount, it's USDT cost — divide by fill_price.
-                if raw_filled is not None and fill_price and raw_filled > amount * 2:
-                    filled_amount = raw_filled / fill_price
+                # Gate.io (live & testnet) sometimes returns 'filled' in USDT cost (quote)
+                # rather than base-coin token count. Binance always returns base quantity.
+                is_gateio = getattr(self.exchange, "name", "") == "gateio"
+                if is_gateio and raw_filled is not None and fill_price:
+                    amount_usd_expected = amount * fill_price
+                    looks_like_quote = (
+                        (raw_filled > amount * 2)
+                        or (
+                            fill_price < 1.0
+                            and raw_filled > 0
+                            and abs(raw_filled - amount_usd_expected) / max(amount_usd_expected, 1e-9) < 0.5
+                        )
+                    )
+                    filled_amount = raw_filled / fill_price if looks_like_quote else raw_filled
                 else:
                     filled_amount = raw_filled if raw_filled is not None else amount
                 fee = fill.get("fee", {}) or {}
@@ -204,21 +214,16 @@ class ExecutionCore:
                     break
                 limit_price = await self._compute_exit_limit_price(symbol, price, attempt)
                 order = await asyncio.wait_for(
-                    self.exchange.create_limit_sell(symbol, remaining_amount, limit_price),
+                    self.exchange.create_limit_sell(symbol, remaining_amount, limit_price, time_in_force="ioc"),
                     timeout=30.0
                 )
                 fill = await asyncio.wait_for(
                     self._poll_fill(symbol, order["id"], max_polls=self.exit_limit_poll_seconds),
                     timeout=30.0
                 )
+                # IOC orders self-cancel on exchange if not immediately filled —
+                # no manual cancel needed. Just use whatever status was returned.
                 latest = fill
-                if latest.get("status") not in ("closed", "filled"):
-                    latest = await self.exchange.fetch_order(order["id"], symbol)
-                    if latest.get("status") not in ("closed", "filled"):
-                        try:
-                            await self.exchange.cancel_order(order["id"], symbol)
-                        except Exception as cancel_error:
-                            logger.warning(f"[Exec] Cancel failed for {symbol} order {order['id']}: {cancel_error}")
                 fill_price, filled_amount, fee_usd = self._parse_fill(symbol, latest, limit_price, remaining_amount)
                 if filled_amount > 0:
                     total_filled_amount += filled_amount
@@ -248,6 +253,36 @@ class ExecutionCore:
                 raise  # propagate ghost-close signal immediately
             except Exception as e:
                 err_str = str(e).lower()
+                # ── Insufficient balance on sell → re-verify actual holdings ────
+                # Binance demo sometimes returns stale balance data, so the pre-check
+                # passes but the actual order fails. Re-fetch and ghost-close if the
+                # real balance is gone, or clamp to actual free balance and retry.
+                if "insufficient balance" in err_str or "account has insufficient" in err_str:
+                    try:
+                        recheck = await self.exchange.fetch_balance()
+                        actual_free = float(
+                            (recheck.get(base_currency) or {}).get("free", 0) or 0
+                        )
+                        if actual_free < amount_adj * 0.05:  # <5% of tracked → already sold
+                            logger.warning(
+                                f"[Exec] {symbol} actual free balance {actual_free:.6f} "
+                                f"vs tracked {amount_adj:.6f} — ghost-closing."
+                            )
+                            raise SubMinimumAmountError(
+                                symbol=symbol, amount=actual_free,
+                                min_amount=0.0, price=price, reason=reason,
+                            )
+                        # Clamp to actual free balance and retry with corrected amount
+                        amount_adj = self.exchange.amount_to_precision(
+                            symbol, min(amount_adj, actual_free * 0.995)
+                        )
+                        logger.debug(
+                            f"[Exec] {symbol} balance clamped to {amount_adj:.6f} after insufficient-balance error"
+                        )
+                    except SubMinimumAmountError:
+                        raise
+                    except Exception:
+                        pass  # balance re-check failed — fall through to normal retry
                 # ── Second-layer dust detection ──────────────────────────────
                 # Gate.io and other exchanges return human-readable "too small"
                 # errors when amount OR notional is below their minimums.
@@ -325,8 +360,20 @@ class ExecutionCore:
     def _parse_fill(self, symbol: str, fill: dict, fallback_price: float, requested_amount: float) -> tuple[float, float, float]:
         fill_price = float(fill.get("average") or fill.get("price") or fallback_price or 0.0)
         raw_filled = fill.get("filled")
-        if raw_filled is not None and fill_price and raw_filled > requested_amount * 2:
-            filled_amount = raw_filled / fill_price
+        # Gate.io returns 'filled' in USDT cost for both testnet and some live pairs.
+        # Binance always returns base quantity — skip the heuristic for Binance.
+        is_gateio = getattr(self.exchange, "name", "") == "gateio"
+        if is_gateio and raw_filled is not None and fill_price:
+            amount_usd_expected = requested_amount * fill_price
+            looks_like_quote = (
+                raw_filled > requested_amount * 2
+                or (
+                    fill_price < 1.0
+                    and raw_filled > 0
+                    and abs(raw_filled - amount_usd_expected) / max(amount_usd_expected, 1e-9) < 0.5
+                )
+            )
+            filled_amount = raw_filled / fill_price if looks_like_quote else float(raw_filled)
         else:
             filled_amount = float(raw_filled or 0.0)
         fee = fill.get("fee", {}) or {}
@@ -345,17 +392,26 @@ class ExecutionCore:
             return 0.0
 
     async def _poll_fill(self, symbol: str, order_id: str, max_polls: int = 10) -> dict:
-        """Poll order status until filled."""
-        for _ in range(max_polls):
+        """Poll order status until filled or cancelled (IOC self-cancel counts as done).
+
+        Binance market orders fill instantly and may return -2013 (ORDER_NOT_FOUND)
+        on subsequent fetch_order calls. Fall back to fetch_my_trades to recover
+        the actual fill price instead of using the unknown/fallback dict.
+        """
+        for attempt in range(max_polls):
             try:
                 order = await self.exchange.fetch_order(order_id, symbol)
                 status = order.get("status", "open")
-                if status in ("closed", "filled"):
+                if status in ("closed", "filled", "canceled"):
                     return order
-                if status == "canceled":
-                    raise Exception(f"Order {order_id} was canceled")
                 await asyncio.sleep(1.0)
             except Exception as e:
+                err = str(e)
+                # Binance -2013: order already filled and purged from active orders.
+                # Return closed immediately — the caller falls back to requested price
+                # which is accurate enough for instant market fills (<0.1% drift).
+                if "-2013" in err or "Order does not exist" in err:
+                    return {"status": "closed", "average": None, "filled": None, "fee": {}}
                 logger.debug(f"[Exec] Poll error for {order_id}: {e}")
                 await asyncio.sleep(1.0)
         return {"status": "unknown", "average": None, "filled": None, "fee": {}}

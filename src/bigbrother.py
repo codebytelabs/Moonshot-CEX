@@ -38,47 +38,63 @@ REGIME_SCALE = {
 # ── Per-regime capital deployment limits ───────────────────────────────────────
 # max_exposure_pct: max fraction of equity deployed simultaneously
 # size_mult:        multiplier on RiskManager base position size
+#
+# Capital deployment per regime.
+# BEAR/CHOPPY: deploy both long (relative-strength breakouts that pass the 4h
+# EMA50 gate) AND short tokens simultaneously. The quality gates already prevent
+# trend-fighting — no need for a blanket capital lockdown.
+# Bull/sideways → full throttle with good TA confirmation.
 REGIME_CAPITAL = {
     "bull":     {"max_exposure_pct": 0.90, "size_mult": 1.00},
-    "sideways": {"max_exposure_pct": 0.80, "size_mult": 0.90},
-    # BEAR: still trade — keep 70% deployed, size down 10% for caution
-    "bear":     {"max_exposure_pct": 0.70, "size_mult": 0.90},
-    # CHOPPY: scale back exposure but never stop fully — 50% deployed at 70% size
-    "choppy":   {"max_exposure_pct": 0.50, "size_mult": 0.70},
+    "sideways": {"max_exposure_pct": 0.82, "size_mult": 0.92},
+    # BEAR: allow relative-strength longs + short tokens. Bayesian 0.52 + EMA50 gate.
+    "bear":     {"max_exposure_pct": 0.55, "size_mult": 0.65},
+    # CHOPPY: allow breakout longs + short tokens. Highest Bayesian bar (0.55).
+    "choppy":   {"max_exposure_pct": 0.42, "size_mult": 0.55},
 }
 
 # ── Per-regime setup allowlist ─────────────────────────────────────────────────
 # Only setups in the allowlist are considered for entry in that regime.
+#
+# BEAR: allow breakout + momentum for relative-strength longs (tokens that are
+# ABOVE their own 4h EMA50 = outperforming the market) AND short tokens.
+# The 4h EMA50 trend gate in analyzer.py blocks trend-fighting longs at the
+# individual-token level — no need for a regime-level blanket ban.
+# CHOPPY: breakout longs only (cleanest signal) + short tokens.
+# pullback/mean_reversion are dangerous in bear/choppy (dip-buying in a downtrend).
 REGIME_SETUP_ALLOWLIST = {
-    "bull":     {"breakout", "momentum", "pullback", "consolidation_breakout", "mean_reversion", "neutral"},
-    "sideways": {"breakout", "momentum", "pullback", "consolidation_breakout", "neutral"},
-    # BEAR: allow momentum + breakouts + short ETF tokens (momentum_short)
-    "bear":     {"breakout", "momentum", "pullback", "consolidation_breakout", "momentum_short"},
-    # CHOPPY: allow breakout + momentum for short bursts + short tokens for hedging
-    "choppy":   {"breakout", "momentum", "momentum_short"},
+    "bull":     {"breakout", "momentum", "pullback", "consolidation_breakout", "mean_reversion"},
+    "sideways": {"breakout", "momentum", "pullback", "consolidation_breakout"},
+    # BEAR: relative-strength breakout/momentum longs + short tokens
+    "bear":     {"breakout", "momentum", "momentum_short"},
+    # CHOPPY: cleanest signal only — breakout longs + short tokens
+    "choppy":   {"breakout", "momentum_short"},
 }
 
-# Minimum ta_score required for choppy regime entries (stricter than normal)
-CHOPPY_MIN_TA_SCORE = 75.0
+# Minimum ta_score required for choppy/bear regime short-token entries
+CHOPPY_MIN_TA_SCORE = 82.0
 
 # ── Per-regime max concurrent positions ───────────────────────────────────────
 REGIME_MAX_POSITIONS = {
     "bull":     10,
     "sideways": 8,
-    # BEAR: allow more positions — diversification protects in bear markets
+    # BEAR: up to 6 positions (mix of short tokens + relative-strength longs)
     "bear":     6,
+    # CHOPPY: up to 4 (only highest-quality breakouts + short tokens pass the bar)
     "choppy":   4,
 }
 
 # ── Per-regime Bayesian threshold override ────────────────────────────────────
-# BigBrother tells the Bayesian engine to raise its bar in dangerous regimes.
+# BigBrother RAISES the bar in dangerous regimes (more selective, not less).
+# CRITICAL: volatile/bear threshold must be HIGHER than normal (0.45),
+# not lower. Lower threshold = easier to enter in a bear market = bleeding.
 REGIME_BAYESIAN_THRESHOLD = {
     "bull":     None,    # leave as QuantMutator / mode-computed value
-    "sideways": None,    # leave as default
-    # BEAR: keep same as normal — momentum is still valid in bear rallies
-    "bear":     None,
-    # CHOPPY: modest raise, not a full lockout
-    "choppy":   0.45,
+    "sideways": None,    # leave as default (0.45)
+    # BEAR: only the highest-conviction short-token setups pass
+    "bear":     0.52,
+    # CHOPPY: most restrictive — exceptional setups only
+    "choppy":   0.55,
 }
 
 
@@ -93,6 +109,7 @@ class BigBrotherAgent:
         openrouter_api_key: Optional[str] = None,
         openrouter_base_url: str = "https://openrouter.ai/api/v1",
         openrouter_model: str = "google/gemini-2.5-flash-lite-preview-09-2025",
+        llm_macro_enabled: bool = False,
         regime_detection_interval_cycles: int = 10,
         bull_threshold: float = 3.0,
         bear_threshold: float = -3.0,
@@ -109,6 +126,7 @@ class BigBrotherAgent:
         self.api_key = openrouter_api_key
         self.api_base = openrouter_base_url
         self.model = openrouter_model
+        self._llm_macro_enabled = llm_macro_enabled
         self.regime_interval = regime_detection_interval_cycles
         self.bull_threshold = bull_threshold
         self.bear_threshold = bear_threshold
@@ -132,6 +150,7 @@ class BigBrotherAgent:
         self._llm_macro_label: str = "unknown"
         self._llm_macro_updated: int = 0      # cycle number of last LLM update
         self._llm_macro_interval: int = 30    # query LLM every 30 cycles (≈7.5 min)
+        self._last_equity: float = 0.0        # last known equity for status summary drawdown
 
     async def supervise(
         self,
@@ -147,6 +166,8 @@ class BigBrotherAgent:
         self._cycle_count += 1
         events = []
 
+        # Track last equity for status reporting
+        self._last_equity = current_equity
         # Update peak equity
         self.risk.update_peak_equity(current_equity)
 
@@ -154,7 +175,8 @@ class BigBrotherAgent:
         if self._cycle_count % self.regime_interval == 0:
             # Fetch LLM macro signal asynchronously (fire & forget — never blocks cycle)
             if (
-                self.api_key
+                self._llm_macro_enabled
+                and self.api_key
                 and (self._cycle_count - self._llm_macro_updated) >= self._llm_macro_interval
             ):
                 try:
@@ -229,7 +251,7 @@ class BigBrotherAgent:
             "regime_params": regime_params,
             "regime_capital": regime_capital,
             "regime_setup_allowlist": list(REGIME_SETUP_ALLOWLIST.get(self.regime, set())),
-            "choppy_min_ta_score": CHOPPY_MIN_TA_SCORE if self.regime == "choppy" else 0.0,
+            "choppy_min_ta_score": CHOPPY_MIN_TA_SCORE if self.regime in ("choppy", "bear") else 0.0,
             "regime_max_positions": REGIME_MAX_POSITIONS.get(self.regime, 5),
             "drawdown": round(drawdown, 4),
             "win_rate": health["win_rate"],
@@ -494,7 +516,7 @@ class BigBrotherAgent:
 
     def get_status_summary(self) -> dict:
         uptime_hours = (time.time() - self._start_time) / 3600.0
-        health = self.risk.check_portfolio_health(self.risk.peak_equity)
+        health = self.risk.check_portfolio_health(self._last_equity if self._last_equity > 0 else self.risk.peak_equity)
         return {
             "regime": self.regime,
             "mode": self.mode,
