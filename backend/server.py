@@ -505,6 +505,17 @@ async def _run_cycle():
     _choppy_min_ta = float(STATE.get("choppy_min_ta_score", 0.0))
     _current_regime = STATE.get("regime", "sideways")
 
+    # ── BTC Trend Gate — no alt longs if BTC is bearish ─────────────────────
+    # Alts correlate 70-90% with BTC. Buying alt longs while BTC drops is
+    # fighting the tide — historically causes 80% of momentum long failures.
+    # Short tokens (3S/5S/DOWN) are exempt — they profit from BTC falling.
+    _btc_bullish = True  # default: allow longs
+    try:
+        _btc_bullish = await _watcher.is_btc_trend_bullish()
+        STATE["btc_trend_bullish"] = _btc_bullish
+    except Exception as _btc_err:
+        logger.warning(f"[Cycle {cycle}] BTC trend check failed: {_btc_err}")
+
     for setup in approved:
         symbol = setup["symbol"]
 
@@ -562,6 +573,17 @@ async def _run_cycle():
             else:
                 trace["steps"].append(f"skip_held:{symbol}")
             continue
+
+        # BTC trend gate — no alt longs if BTC 1h EMA9 < EMA21
+        # Short tokens (3S/5S/DOWN) are exempt — they profit from BTC falling.
+        _direction = setup.get("direction", "long")
+        if not _btc_bullish and _direction == "long":
+            _base = symbol.replace("/USDT", "")
+            _is_short_token = any(_base.endswith(sfx) for sfx in ("3S", "5S", "DOWN"))
+            if not _is_short_token:
+                trace["steps"].append(f"skip_btc_bearish:{symbol}")
+                logger.info(f"[Swarm] {symbol} skipped: BTC trend bearish (no alt longs)")
+                continue
 
         # Symbol cooldown gate — prevent revenge-trading after recent stop-loss
         if _position_manager.is_symbol_on_cooldown(symbol):

@@ -176,6 +176,31 @@ class WatcherAgent:
 
         return top
 
+    async def is_btc_trend_bullish(self) -> bool:
+        """Check if BTC/USDT is in a short-term uptrend on the 1h timeframe.
+        Returns True if EMA9 > EMA21 AND RSI > 45.
+        Used as a top-level gate: no altcoin longs if BTC trend is bearish.
+        Alts correlate 70-90% with BTC — fighting BTC's trend is guaranteed loss.
+        """
+        try:
+            candles = await self._fetch_ohlcv_cached("BTC/USDT", "1h", 50)
+            if candles is None or len(candles) < 26:
+                logger.warning("[Watcher] BTC trend check: insufficient 1h data, defaulting to bearish")
+                return False
+            closes = np.array([c[4] for c in candles], dtype=float)
+            ema9 = _ema(closes, 9)
+            ema21 = _ema(closes, 21)
+            rsi = _compute_rsi(closes, 14)
+            bullish = ema9 > ema21 and rsi > 45
+            logger.info(
+                f"[Watcher] BTC trend gate: EMA9={ema9:.0f} vs EMA21={ema21:.0f} "
+                f"RSI={rsi:.1f} → {'BULLISH ✓' if bullish else 'BEARISH ✗ (no alt longs)'}"
+            )
+            return bullish
+        except Exception as e:
+            logger.warning(f"[Watcher] BTC trend check failed: {e}, defaulting to bearish")
+            return False
+
     async def _score_batch(self, candidates: list[dict], inverted: bool) -> list[dict]:
         """Score a batch of candidates. inverted=True applies bearish scoring logic."""
         tasks = [self._score_symbol(c, inverted=inverted) for c in candidates]

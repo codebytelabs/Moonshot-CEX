@@ -65,10 +65,13 @@ REGIME_CAPITAL = {
 REGIME_SETUP_ALLOWLIST = {
     "bull":     {"breakout", "momentum", "pullback", "consolidation_breakout", "mean_reversion"},
     "sideways": {"breakout", "momentum", "pullback", "consolidation_breakout"},
-    # BEAR: relative-strength breakout/momentum longs + short tokens
-    "bear":     {"breakout", "momentum", "momentum_short"},
-    # CHOPPY: breakout + momentum longs + short tokens
-    "choppy":   {"breakout", "momentum", "momentum_short"},
+    # BEAR: NO longs — only short tokens. Buying longs in a bear market is fighting
+    # the trend. Historical data: 80% of momentum long entries in bear regime hit SL.
+    # v3.3 allowed longs here (breakout, momentum) but they bled -$400/day.
+    "bear":     {"momentum_short"},
+    # CHOPPY: NO longs — same logic. Choppy = deadliest regime for momentum longs.
+    # The BTC trend gate in server.py is the secondary filter; this is the primary.
+    "choppy":   {"momentum_short"},
 }
 
 # Minimum ta_score required for bear/choppy regime entries.

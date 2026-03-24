@@ -377,18 +377,27 @@ class PositionManager:
         is_aggressive = bool(regime_params and regime_params.get("regime") in ("bear", "choppy"))
         review = max(1, self.momentum_recheck_interval_minutes // 2) if is_aggressive else self.momentum_recheck_interval_minutes
 
-        # NON-AGGRESSIVE thresholds: give momentum positions TIME to develop.
-        # Old: -1.5% at 30min killed SOL/AAVE/AVAX before their 5% pumps.
-        # A 2% dip on a momentum token while it pumps 5% is NORMAL intraday noise.
-        if hold_minutes >= review * 1.5 and peak_pnl_pct < 0.3 and pnl_pct <= (-1.0 if is_aggressive else -3.0) and (current_price < pos.entry_price if pos.side == "long" else current_price > pos.entry_price):
-            return "no_traction_aggressive" if is_aggressive else "no_traction_5m"
-        if hold_minutes >= review * 2 and peak_pnl_pct < (1.0 if is_aggressive else 2.0) and pnl_pct <= (-0.5 if is_aggressive else -2.0) and near_entry:
-            return "momentum_died_aggressive" if is_aggressive else "momentum_died_10m"
+        # ── PROFIT GUARD — let the trailing stop handle winners ─────────────
+        # If position is currently in profit, do NOT trigger momentum_died.
+        # The trailing stop (activates at +0.5%) will manage the exit.
+        # Without this guard, momentum_died_20m kills positions at +0.2% profit
+        # → avg win = $1.74. With trailing handling winners → avg win = $5-15.
+        # Exception: momentum_faded (gave back huge peak gain) still applies.
+        if pnl_pct > 0.0 and peak_pnl_pct < 3.0:
+            return None  # profitable, no huge peak → let trailing stop manage
+
+        # Momentum faded: had a big peak but gave most of it back
         if hold_minutes >= review * 2.5 and peak_pnl_pct >= 3.0 and giveback_pct >= max(peak_pnl_pct * 0.7, 2.5) and pnl_pct < 0.5:
             return "momentum_faded"
+
+        # ── LOSING POSITIONS — cut fast ────────────────────────────────────
+        if hold_minutes >= review * 1.5 and peak_pnl_pct < 0.3 and pnl_pct <= (-1.0 if is_aggressive else -2.0) and (current_price < pos.entry_price if pos.side == "long" else current_price > pos.entry_price):
+            return "no_traction_aggressive" if is_aggressive else "no_traction_5m"
+        if hold_minutes >= review * 2 and peak_pnl_pct < (1.0 if is_aggressive else 2.0) and pnl_pct <= (-0.5 if is_aggressive else -1.5) and near_entry:
+            return "momentum_died_aggressive" if is_aggressive else "momentum_died_10m"
         if hold_minutes >= review * 3 and peak_pnl_pct < 2.5 and pnl_pct < -0.5 and near_entry:
             return "momentum_died_15m"
-        if hold_minutes >= review * 4 and peak_pnl_pct < 4.0 and pnl_pct < 0.0:
+        if hold_minutes >= review * 4 and peak_pnl_pct < 4.0 and pnl_pct < -0.3:
             return "momentum_died_20m"
         return None
 
@@ -459,12 +468,13 @@ class PositionManager:
         hold_h = pos.hold_time_hours()
 
         # ── Hard loss cut (safety net between momentum exits and SL) ─────────
-        # Momentum thesis: if we're -3% after 15 min and never hit 0.5%, the wave
-        # didn't come. Cut immediately — don't wait for SL to bleed further.
-        # Old -2%/10min was too tight — SOL dips 2% before pumping 5%.
-        if not is_synced and hold_h >= 0.25 and pnl_pct <= -3.0:
+        # Momentum thesis: if we're -1.8% after 10 min and never hit 0.3%, the wave
+        # didn't come. Cut immediately — don't wait for SL at -2.5% to bleed further.
+        # With tighter SL (-2.5%), hard loss cut must also be tighter to capture
+        # dying trades before they hit the full stop.
+        if not is_synced and hold_h >= 0.17 and pnl_pct <= -1.8:
             peak_pnl = pos.current_pnl_pct(pos.highest_price if pos.side == "long" else pos.lowest_price)
-            if peak_pnl < 0.5:  # never reached 0.5% profit → bad momentum entry
+            if peak_pnl < 0.3:  # never reached 0.3% profit → bad momentum entry
                 return await self._execute_exit(pos, current_price, "hard_loss_cut", pos.amount)
 
         # Bot-only momentum exits (keep these specific to bot trades)
@@ -497,10 +507,10 @@ class PositionManager:
             # NON-AGGRESSIVE (bull/sideways — normal momentum longs):
             #   Give positions 45-90 min to work. A -0.5% dip in 15 min is noise.
             #   Old threshold (-0.5% / 15 min) caused a chop-machine death loop.
-            stall_hold  = 0.25 if is_aggressive else 1.0    # 15 min vs 60 min
-            stall_loss  = -1.5 if is_aggressive else -3.5   # -1.5% vs -3.5%
-            traction_hold  = 0.10 if is_aggressive else 0.75  # 6 min vs 45 min
-            traction_loss  = -1.0 if is_aggressive else -3.0  # -1.0% vs -3.0%
+            stall_hold  = 0.25 if is_aggressive else 0.75   # 15 min vs 45 min
+            stall_loss  = -1.5 if is_aggressive else -2.0   # -1.5% vs -2.0%
+            traction_hold  = 0.10 if is_aggressive else 0.50  # 6 min vs 30 min
+            traction_loss  = -1.0 if is_aggressive else -1.5  # -1.0% vs -1.5%
 
             if hold_h >= stall_hold and pnl_pct < stall_loss and (current_price <= pos.entry_price * 1.003 if pos.side == "long" else current_price >= pos.entry_price * 0.997):
                 return await self._execute_exit(pos, current_price, "momentum_stall_aggressive" if is_aggressive else "momentum_stall", pos.amount)
