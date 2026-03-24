@@ -296,10 +296,16 @@ class RiskManager:
                 return mult
         return 0.0
 
+    def record_entry(self):
+        """Increment the daily entry counter. Call this once per new position open.
+        Exits (TIME, momentum_died, stop_loss, etc.) must NOT count — only new entries do.
+        Counting exits inflated the counter by 20-30 per day on volatile sessions, blocking
+        all new trades while $12K sat idle."""
+        self._day_trade_count += 1
+
     def record_trade(self, pnl_usd: float, pnl_pct: float, r_multiple: float):
         """Record trade outcome for Kelly and circuit breaker logic."""
         won = pnl_usd > 0
-        self._day_trade_count += 1
         self._trade_history.append({
             "pnl_usd": pnl_usd,
             "pnl_pct": pnl_pct,
@@ -317,11 +323,17 @@ class RiskManager:
             self._consecutive_wins = 0
             self._consecutive_losses += 1
             if self._consecutive_losses >= self.consecutive_loss_threshold:
-                self._pause_until = time.time() + self.consecutive_loss_pause_minutes * 60
-                logger.warning(
-                    f"[Risk] {self.consecutive_loss_threshold} consecutive losses → "
-                    f"pause for {self.consecutive_loss_pause_minutes}min"
-                )
+                new_pause = time.time() + self.consecutive_loss_pause_minutes * 60
+                # Only log + set on first trigger; subsequent hits in the same burst
+                # (e.g. 15 exchange_holdings closing at once) silently extend if needed.
+                if not self._pause_until or new_pause > self._pause_until:
+                    first_trigger = not self._pause_until
+                    self._pause_until = new_pause
+                    if first_trigger:
+                        logger.warning(
+                            f"[Risk] {self.consecutive_loss_threshold} consecutive losses → "
+                            f"pause for {self.consecutive_loss_pause_minutes}min"
+                        )
 
         self._update_metrics()
 

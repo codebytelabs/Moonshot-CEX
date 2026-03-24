@@ -637,6 +637,7 @@ async def _run_cycle():
 
         if pos:
             entries.append(symbol)
+            _risk_manager.record_entry()  # count new entries only (not exits) toward daily limit
             available_cash_usd -= size_usd  # track committed cash within this cycle
             await _save_position_to_db(pos)
             if _alerts:
