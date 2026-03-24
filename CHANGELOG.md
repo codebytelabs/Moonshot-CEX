@@ -5,6 +5,133 @@ Format: **version → date → category → what changed → why**.
 
 ---
 
+## v3.3.1 — March 24, 2026 — Daily Trade Counter Hotfix
+
+> **Mission:** Bot had $12,062 USDT cash sitting idle, 6–7 valid setups ready every cycle, but refusing to open any positions. Traced to `_day_trade_count` counting **exits** instead of **entries**.
+
+---
+
+### BUG FIXES
+
+#### 1. `_day_trade_count` counting EXITS, not ENTRIES — blocked all new trades
+- **Files:** `src/risk_manager.py`, `backend/server.py`
+- **Bug:** `record_trade()` fires on every position **close** (TIME exit, stop_loss, momentum_died, regime_shift_sweep, etc.) and was incrementing `_day_trade_count`. With 26 exchange_holdings doing TIME exits throughout the day, the counter hit **25** against `MAX_DAILY_TRADES=15`. Every candidate in every cycle showed:
+  ```
+  [Swarm] KAITO/USDT blocked: max_daily_trades reached (25/15)
+  [Swarm] WLFI/USDT blocked: max_daily_trades reached (25/15)
+  [Swarm] TAO/USDT  blocked: max_daily_trades reached (25/15)
+  ```
+  **$12,062 USDT sat idle for hours.** The bot could see valid setups, size them, but refused to enter.
+- **Root cause:** `_day_trade_count += 1` was inside `record_trade()`. Every exit incremented it. The daily trade limit was designed to cap **new entries per day**, not closings — you can't control when markets close your positions.
+- **Fix:**
+  - Extracted `record_entry()` method — only called after a successful `open_position()` in `server.py`
+  - `record_trade()` (exits) no longer touches `_day_trade_count`
+  - Now the counter only tracks what it's supposed to: **new positions opened today**
+
+#### 2. Consecutive-loss storm — 15+ pause warnings in one second
+- **File:** `src/risk_manager.py`
+- **Bug:** When 15+ exchange_holdings closed in one cycle (e.g. regime_shift_sweep or mass TIME exits), each called `record_trade()` with a loss. Each incremented `_consecutive_losses`. Once `>= 5`, every subsequent call re-triggered the pause warning:
+  ```
+  [Risk] 5 consecutive losses → pause for 20min  (×15 in 1 second)
+  ```
+  The pause timer was being reset 15 times (final expiry = last reset + 20min, not first + 20min). Log noise made debugging harder.
+- **Fix:** Only log + set `_pause_until` on the **first** trigger. Subsequent hits in the same burst silently extend if needed (no log spam, no timer reset unless the new pause would last longer).
+
+#### 3. `MAX_DAILY_TRADES` raised: 15 → 30
+- **File:** `.env`
+- Even with correct entry-only counting, 15 new entries/day is too tight for an 8-position momentum bot in volatile conditions. With 8 positions averaging 1–3h hold time, the bot may open 15–24 positions per day naturally.
+- 30 provides comfortable headroom while the churn guard (3/symbol/4h) and 90-min cooldown prevent overtrading.
+
+---
+
+### CONFIGURATION CHANGES (v3.3.1)
+
+| Parameter | Old Value | New Value | File |
+|-----------|-----------|-----------|------|
+| `_day_trade_count` increment | In `record_trade()` (exits) | In `record_entry()` (entries only) | `src/risk_manager.py` |
+| `MAX_DAILY_TRADES` | `15` | `30` | `.env` |
+| Consecutive-loss pause | Fires on every loss past threshold | Fires once, silently extends | `src/risk_manager.py` |
+
+### FILES MODIFIED IN v3.3.1
+
+| File | Changes |
+|------|---------|
+| `src/risk_manager.py` | `record_entry()` extracted, `record_trade()` no longer touches `_day_trade_count`, consecutive-loss pause dedup |
+| `backend/server.py` | `record_entry()` wired after successful `open_position()` |
+| `.env` | `MAX_DAILY_TRADES` 15→30 |
+
+### VERIFIED WORKING
+
+```
+Cycle 1 complete | regime=sideways mode=normal open=8 total_pnl=$+0.00
+OPENED IQ/USDT    $789   OPENED TON/USDT   $1028
+OPENED KAITO/USDT $1064  OPENED FET/USDT   $1059
++ 4 more positions opened in first cycle
+```
+
+---
+
+### READINESS ASSESSMENT — Is the Bot Profit-Ready?
+
+After v3.1 → v3.2 → v3.3 → v3.3.1, here's an honest assessment of where we stand:
+
+#### ✅ Fixed — Previously Fatal Issues (no longer losing money from these)
+
+| Issue | Loss Caused | Version Fixed |
+|-------|-------------|---------------|
+| XRP IOC SL bug — no market sell fallback | -$747 single trade | v3.2 |
+| `is_aggressive` permanently False — bear exits used slow path | Slow exits in bear | v3.2 |
+| Bayesian threshold INVERTED — easier entry in volatile markets | Over-trading bad setups | v3.2 |
+| TRX/ANIME churn — same loser 16× in one session | Cumulative -$100+ | v3.3 (cooldown 90m + churn guard) |
+| `CHOPPY_MIN_TA_SCORE=82` — blocked all re-entries after crash | Missed entire reversal bounce | v3.3 |
+| `_day_trade_count` counting exits — blocked all entries | Hours of idle capital | v3.3.1 |
+| Consecutive-loss storm — 15× pause triggers in one cycle | Extended trading pauses | v3.3.1 |
+| Dust positions cycling forever (TAO/BAN ghosts) | Log noise + slot waste | v3.1 |
+| $5 daily loss cap halting bot | Bot stopped after 1 fee | v3.2 |
+| Quant Mutator raising min_score 40→60 in 10 min | All entries blocked | v3.2 (frozen at 40) |
+
+#### ✅ Strategy Improvements — Better Signal Quality
+
+| Change | Impact |
+|--------|--------|
+| 1h return scoring in watcher | Price momentum tokens rank first, not volume-only |
+| RSI cap 82→92 | Peak momentum zone (83–90) no longer rejected |
+| Momentum fast-track (>2% 1h) | Catches pumps before EMAs cross |
+| TF weights: less 4h, more 15m | Reacts faster, less lag |
+| `no_traction` → 50% partial | Preserves upside on slow starters |
+| `hard_loss_cut` -3%/15m | Stops killing SOL before it pumps |
+| 4h EMA50 trend gate | Blocks trend-fighting longs in bear |
+| 2% minimum stop distance | Survives normal tick noise |
+| Regime-specific Bayesian thresholds | Stricter entry in dangerous regimes |
+
+#### ⚠️ Known Risks to Monitor
+
+| Risk | Mitigation | What to Watch |
+|------|------------|---------------|
+| Fast-track buys topped pumps | -5% SL + -3%/15m hard loss cut | If fast-track entries consistently exit via hard_loss_cut within 10min, raise threshold to 3% |
+| 20% historical win rate | Most losses were from now-fixed bugs (churn, IOC, counting) — needs fresh data | Track win rate over next 24–48h; if still <30%, investigate entry quality |
+| Exchange holdings not managed | Bot tracks but doesn't actively protect them | Consider manual cleanup of exchange_holdings that shouldn't be there |
+| Volatile mode Bayesian 0.52 | Correct (stricter in volatile) but may block setups during whipsaws | If volatile mode lasts >1h with 0 entries, check if threshold is too high |
+
+#### Verdict
+
+**The bot is ready for monitored live trading.** The architecture is sound:
+
+```
+Watcher (446 pairs → 60 candidates, 1h return + volume + RSI scoring)
+  → Analyzer (60 → 6-7 setups, RSI/EMA/MACD + fast-track)
+    → BigBrother (regime gates: allowlist + ta_score + Bayesian threshold)
+      → Risk Manager (drawdown scaling, daily limit, consecutive-loss pause)
+        → Churn Guard (3/symbol/4h) + Cooldown (90m base)
+          → Position Manager (partial exits, trailing stops, time exits)
+```
+
+Every major loss vector from the last 48h has been identified and patched. The strategy improvements (1h scoring, fast-track, partial exits) are directionally correct for momentum trading and carry low overfitting risk.
+
+**What "profit-ready" means:** the bot will no longer lose money from **system bugs** (IOC SL, counting exits, unreachable gates, churn). Whether it **makes money** depends on market conditions and the quality of the momentum signals — that requires 24–48h of clean data to evaluate. The signal pipeline is now unblocked and correctly wired.
+
+---
+
 ## v3.3 — March 23–24, 2026 — Momentum Capture & Re-entry Overhaul
 
 > **Mission:** Bot was missing clear momentum pumps (SOL +5%, BTC +3%), exiting winners too early, and — after a market crash — **refusing to re-enter** even when the reversal was obvious. Two sessions of targeted fixes across watcher, analyzer, position manager, and BigBrother regime config.
