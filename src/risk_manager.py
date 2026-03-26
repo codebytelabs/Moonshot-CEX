@@ -43,10 +43,12 @@ ACCOUNT_TIER_THRESHOLDS = [
 # ── Drawdown-gradient size multipliers ────────────────────────────────────────
 DRAWDOWN_SCALE = [
     (0.00, 0.03, 1.00),  # (dd_min, dd_max, size_mult)
-    (0.03, 0.05, 0.80),
-    (0.05, 0.10, 0.60),
-    (0.10, 0.15, 0.40),  # safety mode active range — further de-risk
-    (0.15, 1.00, 0.00),  # > 15%: full halt (also enforced in can_open_position)
+    (0.03, 0.05, 0.85),
+    (0.05, 0.10, 0.65),
+    (0.10, 0.15, 0.45),
+    (0.15, 0.20, 0.30),  # reduced but STILL TRADING — 0.0× was a death spiral
+    (0.20, 0.30, 0.20),  # deep drawdown: trade small to recover, never zero
+    (0.30, 1.00, 0.15),  # extreme: minimum viable size, still in the game
 ]
 
 # ── Win-streak bonus table ─────────────────────────────────────────────────────
@@ -66,7 +68,7 @@ class RiskManager:
         max_portfolio_exposure_pct: float = 0.30,
         max_single_exposure_pct: float = 0.08,
         max_risk_per_trade_pct: float = 0.01,
-        max_drawdown_pct: float = 0.10,
+        max_drawdown_pct: float = 0.25,
         daily_loss_limit_pct: float = 0.03,
         consecutive_loss_threshold: int = 3,
         consecutive_loss_pause_minutes: int = 10,
@@ -162,10 +164,11 @@ class RiskManager:
         if exposure_pct >= eff_max_exposure:
             return False, f"max_exposure reached ({exposure_pct:.1%} >= {eff_max_exposure:.1%})"
 
-        # Full halt when drawdown > 15%
+        # Hard halt only at extreme drawdown — DRAWDOWN_SCALE handles sizing reduction.
+        # Old 15% halt was a death spiral: can't trade → can't recover → stuck forever.
         drawdown = self._compute_drawdown(current_equity)
-        if drawdown >= 0.15:
-            return False, f"drawdown_halt ({drawdown:.1%} > 15%)"
+        if drawdown >= 0.30:
+            return False, f"drawdown_halt ({drawdown:.1%} > 30%)"
 
         if self._pause_until and time.time() < self._pause_until:
             remaining = int(self._pause_until - time.time())
@@ -276,7 +279,8 @@ class RiskManager:
 
         # ── Final size ────────────────────────────────────────────────────────
         size = base_size * conviction_mult * liq_mult * ta_mult * reg_mult
-        size = min(size, max_single)   # hard cap
+        size = min(size, max_single)   # hard cap (% of equity)
+        size = min(size, 2500.0)       # absolute hard cap — no single position > $2500
         size = max(size, 50.0)         # minimum order floor — never open a sub-$50 position
 
         logger.info(
@@ -294,7 +298,7 @@ class RiskManager:
         for dd_min, dd_max, mult in DRAWDOWN_SCALE:
             if dd_min <= drawdown < dd_max:
                 return mult
-        return 0.0
+        return 0.15  # never zero — 0.0× was a death spiral preventing recovery
 
     def record_entry(self):
         """Increment the daily entry counter. Call this once per new position open.

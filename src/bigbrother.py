@@ -29,10 +29,13 @@ MODES = ("normal", "volatile", "safety", "paused")
 #   trail = trailing stop  (lower trail_activate = activates sooner)
 #   time  = time exit hours
 REGIME_SCALE = {
-    "bull":     {"sl": 1.6,  "trail": 1.5,  "time": 1.5},   # wider stops, longer rides
-    "sideways": {"sl": 1.0,  "trail": 1.0,  "time": 1.0},   # default
-    "bear":     {"sl": 0.6,  "trail": 0.7,  "time": 0.5},   # tight & fast: 2h exit
-    "choppy":   {"sl": 0.55, "trail": 0.55, "time": 0.25},  # very fast: 1h exit
+    # With simplified exits (SL + trailing + time only, no momentum kills),
+    # trailing stop is the PRIMARY profit-capture mechanism. Scaling must ensure
+    # trailing activates — never push trail_activate above 1.5% (base × scale).
+    "bull":     {"sl": 1.4,  "trail": 1.3,  "time": 1.5},   # wider stops, longer rides
+    "sideways": {"sl": 1.0,  "trail": 1.0,  "time": 1.0},   # default: SL=-3.5%, trail=1%/1%, time=2h
+    "bear":     {"sl": 0.7,  "trail": 0.8,  "time": 0.75},  # SL=-2.45%, trail=0.8%/0.8%, time=1.5h
+    "choppy":   {"sl": 0.65, "trail": 0.7,  "time": 0.75},  # SL=-2.28%, trail=0.7%/0.7%, time=1.5h
 }
 
 # ── Per-regime capital deployment limits ───────────────────────────────────────
@@ -65,13 +68,13 @@ REGIME_CAPITAL = {
 REGIME_SETUP_ALLOWLIST = {
     "bull":     {"breakout", "momentum", "pullback", "consolidation_breakout", "mean_reversion"},
     "sideways": {"breakout", "momentum", "pullback", "consolidation_breakout"},
-    # BEAR: NO longs — only short tokens. Buying longs in a bear market is fighting
-    # the trend. Historical data: 80% of momentum long entries in bear regime hit SL.
-    # v3.3 allowed longs here (breakout, momentum) but they bled -$400/day.
-    "bear":     {"momentum_short"},
-    # CHOPPY: NO longs — same logic. Choppy = deadliest regime for momentum longs.
-    # The BTC trend gate in server.py is the secondary filter; this is the primary.
-    "choppy":   {"momentum_short"},
+    # BEAR: momentum longs + shorts. The BTC trend gate (EMA9 >= EMA21*0.997, RSI>40)
+    # blocks longs when BTC is genuinely dropping. Regime-level blanket ban was
+    # redundant — it sat in 100% cash while alts pumped +11% (TAO, C, HUMA).
+    "bear":     {"momentum", "momentum_short"},
+    # CHOPPY: allow momentum longs. The BTC trend gate already blocks longs when BTC is genuinely bearish.
+    # Choppy just means volatility, and alts can still pump +9% in choppy markets.
+    "choppy":   {"momentum", "momentum_short"},
 }
 
 # Minimum ta_score required for bear/choppy regime entries.
@@ -82,12 +85,11 @@ CHOPPY_MIN_TA_SCORE = 50.0
 
 # ── Per-regime max concurrent positions ───────────────────────────────────────
 REGIME_MAX_POSITIONS = {
-    "bull":     10,
-    "sideways": 8,
-    # BEAR: up to 6 positions (mix of short tokens + relative-strength longs)
-    "bear":     6,
-    # CHOPPY: up to 4 (only highest-quality breakouts + short tokens pass the bar)
-    "choppy":   4,
+    "bull":     5,
+    "sideways": 5,
+    # BEAR/CHOPPY: fewer, higher-conviction entries only
+    "bear":     3,
+    "choppy":   3,
 }
 
 # ── Per-regime Bayesian threshold override ────────────────────────────────────

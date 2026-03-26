@@ -54,7 +54,7 @@ class QuantMutator:
         DROUGHT_CYCLES = 200
         if consecutive_zero_setups > DROUGHT_CYCLES:
             relief_score = max(self.min_score_floor, current_min_score - self.score_raise_step * 2)
-            relief_threshold = max(0.45, current_bayesian_threshold - 0.10)
+            relief_threshold = max(0.40, current_bayesian_threshold - 0.10)
             mutated = (relief_score != current_min_score or relief_threshold != current_bayesian_threshold)
             if mutated:
                 logger.info(
@@ -93,16 +93,18 @@ class QuantMutator:
         reason = ""
 
         # Emergency: today's PnL deeply negative → modest raise only, never lockout
-        # Cap threshold at 0.35 so we still allow high-velocity momentum trades
+        # Cap threshold at 0.45 — don't let emergency mode create garbage entries
         if current_day_pnl_pct < -0.05:
             new_score = min(self.min_score_ceiling, current_min_score + self.score_raise_step)
-            new_threshold = min(0.35, current_bayesian_threshold + 0.02)
+            new_threshold = min(0.45, current_bayesian_threshold + 0.02)
             reason = f"emergency_pnl ({current_day_pnl_pct:.1%})"
 
         elif win_rate >= self.high_win_rate:
-            # Hot streak → slightly lower bars to capture more trades
+            # Hot streak → slightly lower bars, but NEVER below 0.40.
+            # Old floor of 0.12 let every garbage setup through → 185 trades/day,
+            # 11 stop losses, 92 time exits. Bayesian < 0.40 is meaningless noise.
             new_score = max(self.min_score_floor, current_min_score - self.score_lower_step)
-            new_threshold = max(0.12, current_bayesian_threshold - 0.02)
+            new_threshold = max(0.40, current_bayesian_threshold - 0.02)
             reason = f"hot_streak (wr={win_rate:.0%})"
 
         elif win_rate < self.low_win_rate:

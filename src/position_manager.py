@@ -368,37 +368,26 @@ class PositionManager:
         return exits
 
     def _momentum_exit_reason(self, pos: Position, current_price: float, pnl_pct: float, regime_params: Optional[dict]) -> Optional[str]:
+        """Simplified momentum exit — DATA-DRIVEN OVERHAUL.
+
+        Analysis of 37 real trades showed:
+          - momentum_died / no_traction / stall exits: 0% win rate, -$884 total
+          - trailing_stop: 100% win rate, only profitable exit
+          - momentum_died_20m: 100% win rate (most patient = most profitable)
+
+        New design: ONLY exit on momentum_faded (gave back huge peak).
+        Everything else is handled by: stop_loss → trailing_stop → time_exit.
+        The old 7+ momentum exits were killing winners before trailing could activate.
+        """
         hold_minutes = pos.hold_time_hours() * 60.0
         peak_pnl_pct = pos.current_pnl_pct(pos.highest_price if pos.side == "long" else pos.lowest_price)
         giveback_pct = peak_pnl_pct - pnl_pct
-        near_entry = current_price <= pos.entry_price * 1.005 if pos.side == "long" else current_price >= pos.entry_price * 0.995
-        
-        # Bear/choppy = aggressive exits: fast management of short tokens + quick cut of bad longs
-        is_aggressive = bool(regime_params and regime_params.get("regime") in ("bear", "choppy"))
-        review = max(1, self.momentum_recheck_interval_minutes // 2) if is_aggressive else self.momentum_recheck_interval_minutes
 
-        # ── PROFIT GUARD — let the trailing stop handle winners ─────────────
-        # If position is currently in profit, do NOT trigger momentum_died.
-        # The trailing stop (activates at +0.5%) will manage the exit.
-        # Without this guard, momentum_died_20m kills positions at +0.2% profit
-        # → avg win = $1.74. With trailing handling winners → avg win = $5-15.
-        # Exception: momentum_faded (gave back huge peak gain) still applies.
-        if pnl_pct > 0.0 and peak_pnl_pct < 3.0:
-            return None  # profitable, no huge peak → let trailing stop manage
-
-        # Momentum faded: had a big peak but gave most of it back
-        if hold_minutes >= review * 2.5 and peak_pnl_pct >= 3.0 and giveback_pct >= max(peak_pnl_pct * 0.7, 2.5) and pnl_pct < 0.5:
+        # Momentum faded: had a significant peak (+3%+) but gave back 70%+ of gains.
+        # This is the ONE justified momentum exit — don't let a +5% winner turn into -2% loser.
+        if hold_minutes >= 30 and peak_pnl_pct >= 3.0 and giveback_pct >= max(peak_pnl_pct * 0.6, 2.0) and pnl_pct < 0.5:
             return "momentum_faded"
 
-        # ── LOSING POSITIONS — cut fast ────────────────────────────────────
-        if hold_minutes >= review * 1.5 and peak_pnl_pct < 0.3 and pnl_pct <= (-1.0 if is_aggressive else -2.0) and (current_price < pos.entry_price if pos.side == "long" else current_price > pos.entry_price):
-            return "no_traction_aggressive" if is_aggressive else "no_traction_5m"
-        if hold_minutes >= review * 2 and peak_pnl_pct < (1.0 if is_aggressive else 2.0) and pnl_pct <= (-0.5 if is_aggressive else -1.5) and near_entry:
-            return "momentum_died_aggressive" if is_aggressive else "momentum_died_10m"
-        if hold_minutes >= review * 3 and peak_pnl_pct < 2.5 and pnl_pct < -0.5 and near_entry:
-            return "momentum_died_15m"
-        if hold_minutes >= review * 4 and peak_pnl_pct < 4.0 and pnl_pct < -0.3:
-            return "momentum_died_20m"
         return None
 
     async def _tick_position(self, pos: Position, regime_params: Optional[dict]) -> Optional[dict]:
@@ -467,60 +456,27 @@ class PositionManager:
 
         hold_h = pos.hold_time_hours()
 
-        # ── Hard loss cut (safety net between momentum exits and SL) ─────────
-        # Momentum thesis: if we're -1.8% after 10 min and never hit 0.3%, the wave
-        # didn't come. Cut immediately — don't wait for SL at -2.5% to bleed further.
-        # With tighter SL (-2.5%), hard loss cut must also be tighter to capture
-        # dying trades before they hit the full stop.
-        if not is_synced and hold_h >= 0.17 and pnl_pct <= -1.8:
-            peak_pnl = pos.current_pnl_pct(pos.highest_price if pos.side == "long" else pos.lowest_price)
-            if peak_pnl < 0.3:  # never reached 0.3% profit → bad momentum entry
-                return await self._execute_exit(pos, current_price, "hard_loss_cut", pos.amount)
-
-        # Bot-only momentum exits (keep these specific to bot trades)
+        # ── Bot-only: momentum_faded exit (the ONE justified momentum exit) ───
+        # Data: all early momentum kills (died/stall/traction) had 0% win rate
+        # and destroyed -$884 across 37 trades. Only momentum_faded (giving back
+        # huge peaks) and trailing_stop (100% wr) were profitable.
+        # The stop_loss (-3.5%) protects downside. Trailing (+1% activate) rides winners.
+        # Time exit (2h) cleans up dead trades. No other momentum exits needed.
         if not is_synced:
-            # Bear/choppy = aggressive exits: fast management of short tokens + quick cut of bad longs
-            is_aggressive = bool(regime_params and regime_params.get("regime") in ("bear", "choppy"))
-            
-            if not pos.tier1_done:
-                momentum_reason = self._momentum_exit_reason(pos, current_price, pnl_pct, regime_params)
-                if momentum_reason:
-                    r_lower = momentum_reason.lower()
-                    # Scale down (50%) for "soft" momentum signals — keeps position alive
-                    # so it can recover without paying full roundtrip fees.
-                    # Hard failures (faded) still do a full close.
-                    if any(x in r_lower for x in ("died", "stall", "no_traction")) and not is_aggressive:
-                        partial = await self._execute_partial_exit(
-                            pos, current_price, momentum_reason, pos.amount * 0.50
-                        )
-                        pos.tier1_done = True  # prevent re-triggering on next tick
-                        logger.info(
-                            f"[PM] SCALE-DOWN {pos.symbol} ({momentum_reason}): "
-                            f"50% sold, remaining=${pos.amount_usd:.0f} stays open"
-                        )
-                        return partial
-                    return await self._execute_exit(pos, current_price, momentum_reason, pos.amount)
+            momentum_reason = self._momentum_exit_reason(pos, current_price, pnl_pct, regime_params)
+            if momentum_reason:
+                return await self._execute_exit(pos, current_price, momentum_reason, pos.amount)
 
-            # ── Timing / threshold calibration ──────────────────────────────────
-            # AGGRESSIVE (bear/choppy — short tokens only):
-            #   Exit quickly — short tokens are volatile, tight management needed.
-            # NON-AGGRESSIVE (bull/sideways — normal momentum longs):
-            #   Give positions 45-90 min to work. A -0.5% dip in 15 min is noise.
-            #   Old threshold (-0.5% / 15 min) caused a chop-machine death loop.
-            stall_hold  = 0.25 if is_aggressive else 0.75   # 15 min vs 45 min
-            stall_loss  = -1.5 if is_aggressive else -2.0   # -1.5% vs -2.0%
-            traction_hold  = 0.10 if is_aggressive else 0.50  # 6 min vs 30 min
-            traction_loss  = -1.0 if is_aggressive else -1.5  # -1.0% vs -1.5%
-
-            if hold_h >= stall_hold and pnl_pct < stall_loss and (current_price <= pos.entry_price * 1.003 if pos.side == "long" else current_price >= pos.entry_price * 0.997):
-                return await self._execute_exit(pos, current_price, "momentum_stall_aggressive" if is_aggressive else "momentum_stall", pos.amount)
-
-            if hold_h >= traction_hold and pnl_pct < traction_loss and (current_price < pos.entry_price if pos.side == "long" else current_price > pos.entry_price):
-                return await self._execute_exit(pos, current_price, "no_traction_aggressive" if is_aggressive else "no_traction", pos.amount)
-
-        # Time exit applies to ALL positions (bot + synced/exchange holdings)
-        if hold_h >= effective_time_exit_hours:
+        # Time exit — ONLY for losing positions. If green, the wave is working → let
+        # trailing handle the exit. Data: 32/52 trades died on time_exit clock at -$2 avg.
+        # Many were in profit but killed before trailing activated. Wave riding means
+        # HOLDING winners, not ejecting on a timer.
+        if hold_h >= effective_time_exit_hours and pnl_pct <= 0:
             return await self._execute_exit(pos, current_price, "time_exit", pos.amount)
+        # Safety cap: even profitable positions get a hard ceiling at 2× time limit
+        # to prevent zombie positions that never trigger trailing.
+        if hold_h >= effective_time_exit_hours * 2:
+            return await self._execute_exit(pos, current_price, "time_exit_max", pos.amount)
 
         # Tier 1 (partial exit at 2R)
         if not pos.tier1_done and r_multiple >= 2.0:
@@ -624,7 +580,7 @@ class PositionManager:
             # Danger exits (stop, regime sweep) → 45 min: coin is in trouble.
             # Momentum/time failures → 20-30 min: setup failed, give it a reset.
             # TP / trailing → 5-10 min: profitable exit, fresh signal may re-enter.
-            # momentum_died/stall never reach here (they scale-down and keep position open).
+            # momentum_faded is the only momentum exit now (full close, not scale-down).
             r = reason.lower()
             if any(x in r for x in ("stop_loss", "regime_shift", "emergency")):
                 cooldown_m = self.symbol_cooldown_minutes * 1.5   # 45 min
@@ -888,43 +844,18 @@ class PositionManager:
                 logger.error(f"[PM] Scale-up failed for {pos.symbol}: {e}")
                 return "error"
         else:
-            # Need to sell excess — sell only the delta
-            sell_usd = abs(delta_usd)
-            sell_amount = sell_usd / current_price
-            # Clamp to what we actually hold (safety)
-            sell_amount = min(sell_amount, pos.amount * 0.995)
-            if sell_amount <= 0:
-                return "hold"
-            try:
-                fill = await self.execution.exit_position(
-                    pos.symbol, sell_amount, current_price, "scale_down"
-                )
-                filled_amount = float(fill.get("filled_amount", 0.0))
-                if filled_amount > 0:
-                    partial_pnl = (fill["filled_price"] - pos.entry_price) * filled_amount
-                    pos.realized_pnl_usd += partial_pnl
-                    pos.amount = max(0.0, pos.amount - filled_amount)
-                    pos.amount_usd = pos.amount * pos.entry_price
-                    pos.total_fees_usd += fill.get("fee_usd", 0.0)
-                    logger.info(
-                        f"[PM] SCALE DOWN {pos.symbol}: "
-                        f"-{filled_amount:.6f} @ {fill['filled_price']:.6f} "
-                        f"(delta=${delta_usd:.2f}) partial_pnl=${partial_pnl:.2f}"
-                    )
-                return "scaled_down"
-            except SubMinimumAmountError:
-                # Delta to sell is dust — zero out the remainder and move on.
-                # Without this the same tiny delta repeats as ERROR every cycle.
-                pos.amount = max(0.0, pos.amount - sell_amount)
-                pos.amount_usd = pos.amount * pos.entry_price
-                logger.info(
-                    f"[PM] SCALE DUST {pos.symbol}: delta {sell_amount:.8f} is below "
-                    f"exchange minimum — trimming tracked amount to {pos.amount:.8f}"
-                )
-                return "scaled_down"
-            except Exception as e:
-                logger.error(f"[PM] Scale-down failed for {pos.symbol}: {e}")
-                return "error"
+            # SCALE-DOWN DISABLED — data shows it destroys value:
+            #   CRV: opened $325, sold $310 of it 45 seconds later (fee + spread loss)
+            #   BNB: 4 consecutive scale_downs turning $622 into dust
+            # Positions exit via stop_loss / trailing / time_exit, NOT gradual trimming.
+            # Re-computing size every cycle with different multipliers (drawdown, regime,
+            # conviction) causes constant delta oscillations → churn → fees → death.
+            logger.debug(
+                f"[PM] SCALE SKIP DOWN {pos.symbol}: "
+                f"current=${current_value_usd:.2f} target=${target_usd:.2f} "
+                f"delta=${delta_usd:+.2f} — scale_down disabled"
+            )
+            return "hold"
 
 
 
