@@ -166,11 +166,13 @@ class AnalyzerAgent:
                     _ft_green_count = sum(1 for i in range(-3, 0) if _closes_5m[i] > _closes_5m[i - 1])
                 _ft_candles_ok = _ft_green_count >= 2 or (_ft_pullback < 1.0 and _ft_green_count >= 1)
 
-                # Exhaustion check 3: 5m RSI should not be plummeting from overbought
+                # Exhaustion check 3: 5m RSI must be in momentum zone (>45) but NOT overbought (>78)
+                # RSI >78 = parabolic blowoff territory (DEGO entered at RSI=79, reversed immediately)
+                # RSI <45 = momentum has already faded
                 _ft_rsi = _compute_rsi(_closes_5m, 14) if len(_closes_5m) >= 15 else 50.0
-                _ft_rsi_ok = _ft_rsi < 78 or _ft_rsi > 55  # allow momentum zone, block if crashing
+                _ft_rsi_ok = 45 < _ft_rsi < 78
 
-                if _ft_near_high and _ft_candles_ok:
+                if _ft_near_high and _ft_candles_ok and _ft_rsi_ok:
                     _fast_track = True
                     logger.info(
                         f"[Analyzer] {symbol} FAST-TRACK: 1h return +{_return_1h:.1f}% "
@@ -201,16 +203,16 @@ class AnalyzerAgent:
                 logger.debug(f"[Analyzer] {symbol} filtered: neither 1h nor 15m EMA9>EMA21")
                 return None
 
-        # ── RSI gate: 40-80, block overbought entries ─────────────────────────
-        # RSI 70-80 = strong momentum (still OK to enter).
-        # RSI >80 = overbought — entering here is chasing completed moves.
+        # ── RSI gate: 40-78, block overbought entries ─────────────────────────
+        # RSI 70-78 = strong momentum (still OK to enter).
+        # RSI >78 = overbought — entering here is chasing completed moves.
         # Old 92 cap was way too permissive — allowed entries into parabolic tops.
-        # Fast-track can push to 85 (genuine early breakouts can spike RSI fast).
+        # Fast-track cap also 78 (aligned with 5m RSI gate in fast-track logic).
         if direction == "long" and "1h" in tf_data:
             _c1h_rsi = tf_data["1h"][:, 4]
             if len(_c1h_rsi) >= 14:
                 rsi_1h = _compute_rsi(_c1h_rsi, 14)
-                _rsi_cap = 85.0 if _fast_track else 80.0
+                _rsi_cap = 78.0
                 if rsi_1h > _rsi_cap:
                     logger.info(f"[Analyzer] {symbol} filtered: 1h RSI {rsi_1h:.1f} > {_rsi_cap:.0f} (overbought)")
                     return None

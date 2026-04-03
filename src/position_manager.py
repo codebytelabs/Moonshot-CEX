@@ -333,6 +333,20 @@ class PositionManager:
         direction = setup.get("direction", "long")
         leverage = int(setup.get("leverage", 1))
 
+        # ── DUPLICATE POSITION GUARD ──────────────────────────────────────
+        # Hard block: never open a second position on the same symbol.
+        # Root cause: after restarts, crash recovery can miss positions
+        # (transient exchange API), leaving the bot unaware of an existing
+        # Binance position. Without this guard, the bot stacks 3+ entries
+        # on one symbol (BTR opened 3× for $9k+ combined exposure).
+        existing = self.get_position_for_symbol(symbol)
+        if existing:
+            logger.warning(
+                f"[PM] BLOCKED duplicate open for {symbol} — already tracking "
+                f"id={existing.id} entry={existing.entry_price:.6f}"
+            )
+            return None
+
         if direction == "long":
             stop_loss = float(entry_zone.get("stop_loss", price * 0.94))  # fallback: 6% below entry
         else:

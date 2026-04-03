@@ -97,6 +97,10 @@ _strategy_manager: Optional[StrategyManager] = None
 _futures_exchange: Optional[FuturesExchangeConnector] = None
 _futures_execution: Optional[FuturesExecutionCore] = None
 _leverage_engine: Optional[LeverageEngine] = None
+# Cached set of symbols with LIVE exchange positions — updated at startup + every
+# orphan sweep. Used as a safety net to prevent duplicate opens when crash recovery
+# misses a position (the BTR 3× bug: transient API → bot lost track → re-entered).
+_exchange_open_symbols: set[str] = set()
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -825,6 +829,17 @@ async def _run_cycle():
             if _uses_exchange_account_state():
                 size_usd = min(size_usd, available_cash_usd * 0.92)
 
+        # ── Exchange-level duplicate guard ─────────────────────────────────
+        # Even if crash recovery missed this position (transient API), block
+        # re-entry if the exchange still has it open. Prevents BTR 3× bug.
+        if symbol in _exchange_open_symbols and symbol not in open_syms:
+            trace["steps"].append(f"skip_exchange_dup:{symbol}")
+            logger.warning(
+                f"[Swarm] {symbol} BLOCKED: exchange has open position but bot lost track "
+                f"(crash recovery gap) — will sync on next orphan sweep"
+            )
+            continue
+
         # ── Already holding this symbol? → Scale instead of sell+rebuy ──────
         if symbol in open_syms:
             if cfg.position_scale_tolerance_pct > 0:
@@ -854,6 +869,8 @@ async def _run_cycle():
                                 current_val = existing_pos.amount * _scale_price
                                 delta_spent = max(0.0, size_usd - current_val)
                                 available_cash_usd = max(0.0, available_cash_usd - delta_spent)
+                                # Persist updated position to DB so crash recovery has accurate amounts
+                                await _save_position_to_db(existing_pos)
                     except Exception as _se:
                         logger.debug(f"[Swarm] Scale check failed for {symbol}: {_se}")
                 else:
@@ -1240,18 +1257,19 @@ async def _check_position_health():
                 )
 
             elif health >= 0.6:
-                logger.debug(
+                logger.info(
                     f"[HealthCheck] {pos.symbol} HEALTHY health={health:.2f} pnl={pnl_pct:+.1f}% "
                     f"EMA={ema_gap_pct:+.2f}% RSI={rsi:.0f}"
                 )
 
             else:
-                logger.debug(
-                    f"[HealthCheck] {pos.symbol} NEUTRAL health={health:.2f} pnl={pnl_pct:+.1f}%"
+                logger.info(
+                    f"[HealthCheck] {pos.symbol} NEUTRAL health={health:.2f} pnl={pnl_pct:+.1f}% "
+                    f"EMA={ema_gap_pct:+.2f}% RSI={rsi:.0f}"
                 )
 
         except Exception as e:
-            logger.debug(f"[HealthCheck] {pos.symbol} check failed: {e}")
+            logger.warning(f"[HealthCheck] {pos.symbol} check failed: {e}")
             continue
 
 
@@ -1270,6 +1288,7 @@ async def _sweep_orphan_algo_orders_and_positions():
         return
 
     try:
+        global _exchange_open_symbols
         # Step 1: Get live exchange positions
         raw_positions = await _futures_exchange.exchange.fetch_positions()
         exchange_symbols = set()
@@ -1277,6 +1296,8 @@ async def _sweep_orphan_algo_orders_and_positions():
             contracts = abs(float(pos.get("contracts", 0)))
             if contracts > 0:
                 exchange_symbols.add(pos.get("symbol", ""))
+        # Update global cache so entry loop can block duplicate opens
+        _exchange_open_symbols = set(exchange_symbols)
 
         # Step 2: Cancel orphaned algo orders
         try:
@@ -1546,6 +1567,7 @@ async def _recover_positions_from_db():
         if not docs:
             return
 
+        global _exchange_open_symbols
         # Fetch live exchange state for amount reconciliation
         live_balances: dict[str, float] = {}
         _is_futures_recovery = STATE.get("trading_mode") == "futures" and _futures_exchange
@@ -1560,6 +1582,9 @@ async def _recover_positions_from_db():
                         if contracts > 0:
                             fsymbol = fpos.get("symbol", "")
                             live_balances[fsymbol] = contracts
+                    # Seed _exchange_open_symbols at startup so the entry loop
+                    # blocks duplicate opens even before the first orphan sweep.
+                    _exchange_open_symbols = set(live_balances.keys())
                     logger.info(f"[Recovery] Futures positions on exchange: {list(live_balances.keys())}")
                     _live_fetch_ok = True
                 else:
