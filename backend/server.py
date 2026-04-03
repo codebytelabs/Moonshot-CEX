@@ -975,7 +975,7 @@ async def _run_cycle():
             # When max_positions is the blocker and a strong signal appears,
             # close the worst-performing losing position to make room.
             _rotated = False
-            if "max_positions" in gate_reason and _setup_rank_score >= 40.0:
+            if "max_positions" in gate_reason and _setup_rank_score >= 35.0:
                 try:
                     _worst_pos = None
                     _worst_pnl = float("inf")
@@ -997,7 +997,7 @@ async def _run_cycle():
                         except Exception:
                             continue
 
-                    if _worst_pos and _worst_pnl <= -1.5:
+                    if _worst_pos and _worst_pnl <= -1.0:
                         logger.info(
                             f"[ROTATION] Closing {_worst_pos.symbol} "
                             f"(PnL={_worst_pnl:+.2f}% hold={_worst_pos.hold_time_hours():.1f}h) "
