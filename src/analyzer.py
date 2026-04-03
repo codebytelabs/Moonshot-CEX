@@ -166,12 +166,14 @@ class AnalyzerAgent:
                     _ft_green_count = sum(1 for i in range(-3, 0) if _closes_5m[i] > _closes_5m[i - 1])
                 _ft_candles_ok = _ft_green_count >= 2 or (_ft_pullback < 1.0 and _ft_green_count >= 1)
 
-                # Exhaustion check 3: 5m RSI must be in momentum zone (>45) but NOT parabolic (>82)
-                # RSI 78-82 = strong momentum (CHR/ALT/JCT blocked at 78 — lost profits)
-                # RSI >82 = parabolic blowoff territory — pullback+candle checks catch dying pumps
+                # Exhaustion check 3: 5m RSI must be in momentum zone (>45)
+                # Pullback + candle checks are the REAL dying-pump protection.
+                # RSI cap is tiered by strength: strong pumps (≥5%) tolerate RSI up to 96,
+                # moderate (2-5%) up to 92. CYS +15.2%/RSI=94 was blocked at 82 — lost profits.
                 # RSI <45 = momentum has already faded
                 _ft_rsi = _compute_rsi(_closes_5m, 14) if len(_closes_5m) >= 15 else 50.0
-                _ft_rsi_ok = 45 < _ft_rsi < 82
+                _ft_rsi_cap = 96.0 if _return_1h >= 5.0 else 92.0
+                _ft_rsi_ok = 45 < _ft_rsi < _ft_rsi_cap
 
                 if _ft_near_high and _ft_candles_ok and _ft_rsi_ok:
                     _fast_track = True
@@ -214,7 +216,7 @@ class AnalyzerAgent:
             _c1h_rsi = tf_data["1h"][:, 4]
             if len(_c1h_rsi) >= 14:
                 rsi_1h = _compute_rsi(_c1h_rsi, 14)
-                _rsi_cap = 82.0
+                _rsi_cap = 88.0
                 if rsi_1h > _rsi_cap:
                     logger.info(f"[Analyzer] {symbol} filtered: 1h RSI {rsi_1h:.1f} > {_rsi_cap:.0f} (overbought)")
                     return None
