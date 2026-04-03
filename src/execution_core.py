@@ -7,7 +7,7 @@ import asyncio
 from typing import Optional
 from loguru import logger
 
-from .exchange_ccxt import ExchangeConnector
+from .exchange_ccxt import ExchangeConnector, FuturesExchangeConnector
 from .metrics import trades_total, errors_total
 
 
@@ -140,8 +140,9 @@ class ExecutionCore:
         amount: float,
         price: float,
         reason: str = "exit",
+        direction: str = "long",
     ) -> dict:
-        """Execute a position exit (sell)."""
+        """Execute a position exit (sell). direction is ignored in spot mode."""
         if self.mode == "paper":
             return self._paper_fill(symbol, "sell", amount * price, price, reason)
 
@@ -198,7 +199,8 @@ class ExecutionCore:
         # ───────────────────────────────────────────────────────────────────
 
 
-        amount_adj = self.exchange.amount_to_precision(symbol, safe_amount)
+        _raw_adj = self.exchange.amount_to_precision(symbol, safe_amount)
+        amount_adj = float(_raw_adj) if _raw_adj is not None else safe_amount
         if amount_adj <= 0:
             raise ValueError(f"Invalid sell amount {amount_adj} for {symbol}")
 
@@ -268,7 +270,8 @@ class ExecutionCore:
 
         for attempt in range(self.max_retries):
             try:
-                remaining_amount = self.exchange.amount_to_precision(symbol, amount_adj - total_filled_amount)
+                _raw_rem = self.exchange.amount_to_precision(symbol, amount_adj - total_filled_amount)
+                remaining_amount = float(_raw_rem) if _raw_rem is not None else (amount_adj - total_filled_amount)
                 if remaining_amount <= 0:
                     break
                 limit_price = await self._compute_exit_limit_price(symbol, price, attempt)
@@ -332,9 +335,10 @@ class ExecutionCore:
                                 min_amount=0.0, price=price, reason=reason,
                             )
                         # Clamp to actual free balance and retry with corrected amount
-                        amount_adj = self.exchange.amount_to_precision(
+                        _raw_clamp = self.exchange.amount_to_precision(
                             symbol, min(amount_adj, actual_free * 0.995)
                         )
+                        amount_adj = float(_raw_clamp) if _raw_clamp is not None else min(amount_adj, actual_free * 0.995)
                         logger.debug(
                             f"[Exec] {symbol} balance clamped to {amount_adj:.6f} after insufficient-balance error"
                         )
@@ -439,7 +443,9 @@ class ExecutionCore:
         fee_cost = float(fee.get("cost", 0.0))
         fee_currency = fee.get("currency", "USDT")
         fee_usd = fee_cost if fee_currency == "USDT" else fee_cost * fill_price
-        return fill_price, self.exchange.amount_to_precision(symbol, filled_amount), fee_usd
+        _raw_fa = self.exchange.amount_to_precision(symbol, filled_amount)
+        safe_filled = float(_raw_fa) if _raw_fa is not None else filled_amount
+        return fill_price, safe_filled, fee_usd
 
     async def get_current_price(self, symbol: str) -> float:
         """Fetch latest price for a symbol."""
@@ -509,3 +515,181 @@ class ExecutionCore:
             "timestamp": int(time.time()),
             "mode": "paper",
         }
+
+
+class FuturesExecutionCore(ExecutionCore):
+    """Extends ExecutionCore for futures trading with leverage and short support.
+
+    Uses FuturesExchangeConnector methods (open_long, close_long, open_short,
+    close_short) with reduceOnly flags for exits.
+    """
+
+    def __init__(
+        self,
+        exchange: FuturesExchangeConnector,
+        exchange_mode: str = "paper",
+        max_retries: int = 3,
+        **kwargs,
+    ):
+        super().__init__(exchange, exchange_mode, max_retries, **kwargs)
+        self.futures_exchange: FuturesExchangeConnector = exchange
+
+    async def enter_position(
+        self,
+        symbol: str,
+        side: str,
+        amount_usd: float,
+        price: float,
+        setup_type: str = "unknown",
+        leverage: int = 1,
+        direction: str = "long",
+    ) -> dict:
+        """Execute a futures position entry (long or short).
+
+        Args:
+            direction: "long" or "short" — determines order side
+            leverage: leverage to set before opening
+        """
+        if self.mode == "paper":
+            fill = self._paper_fill(symbol, side, amount_usd, price, "entry", setup_type)
+            fill["leverage"] = leverage
+            fill["direction"] = direction
+            return fill
+
+        amount = self.exchange.cost_to_amount(symbol, amount_usd, price)
+        if amount <= 0:
+            raise ValueError(f"Invalid amount {amount} for {symbol} at {price}")
+
+        for attempt in range(self.max_retries):
+            try:
+                if direction == "short":
+                    order = await asyncio.wait_for(
+                        self.futures_exchange.open_short(symbol, amount, leverage),
+                        timeout=30.0,
+                    )
+                else:
+                    order = await asyncio.wait_for(
+                        self.futures_exchange.open_long(symbol, amount, leverage),
+                        timeout=30.0,
+                    )
+
+                fill = await asyncio.wait_for(
+                    self._poll_fill(symbol, order["id"]),
+                    timeout=30.0,
+                )
+                fill_price = fill.get("average") or fill.get("price") or price
+                filled_amount = float(fill.get("filled") or amount)
+                fee = fill.get("fee", {}) or {}
+                fee_cost = float(fee.get("cost", 0.0))
+                fee_currency = fee.get("currency", "USDT")
+                fee_usd = fee_cost if fee_currency == "USDT" else fee_cost * fill_price
+
+                trades_total.labels(side=direction, exchange=self.exchange.name).inc()
+                logger.info(
+                    f"[FuturesExec] FILLED {direction.upper()} {symbol}: "
+                    f"amount={filled_amount:.6f} @ {fill_price:.6f} "
+                    f"lev={leverage}x fee=${fee_usd:.4f}"
+                )
+                return {
+                    "order_id": order["id"],
+                    "symbol": symbol,
+                    "side": "buy" if direction == "long" else "sell",
+                    "direction": direction,
+                    "leverage": leverage,
+                    "filled_price": fill_price,
+                    "filled_amount": filled_amount,
+                    "amount_usd": fill_price * filled_amount,
+                    "fee_usd": fee_usd,
+                    "slippage_pct": (fill_price - price) / price * 100 if price else 0.0,
+                    "timestamp": int(time.time()),
+                    "mode": self.mode,
+                }
+
+            except SubMinimumAmountError:
+                logger.warning(f"[FuturesExec] {symbol}: order size rejected by exchange (dust/max qty) — not retrying")
+                raise
+            except Exception as e:
+                logger.warning(f"[FuturesExec] Entry attempt {attempt+1} failed for {symbol}: {e}")
+                errors_total.labels(component="futures_execution", error_type="order_failed").inc()
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+
+        raise Exception(f"Futures entry failed after {self.max_retries} attempts for {symbol}")
+
+    async def exit_position(
+        self,
+        symbol: str,
+        amount: float,
+        price: float,
+        reason: str = "exit",
+        direction: str = "long",
+    ) -> dict:
+        """Execute a futures position exit (close long or close short).
+
+        Uses reduceOnly orders to avoid accidentally opening a new position.
+        """
+        if self.mode == "paper":
+            return self._paper_fill(symbol, "sell", amount * price, price, reason)
+
+        # amount_to_precision can return None or a string — guard against both.
+        # BUG FIX (2026-04-04): TOWNS exit crashed with 'float() argument must
+        # be a string or a real number, not NoneType' because precision lookup
+        # returned None for the symbol.
+        raw_adj = self.exchange.amount_to_precision(symbol, amount)
+        amount_adj = float(raw_adj) if raw_adj is not None else amount
+        if amount_adj <= 0:
+            raise ValueError(f"Invalid exit amount {amount_adj} for {symbol}")
+
+        for attempt in range(self.max_retries):
+            try:
+                if direction == "short":
+                    order = await asyncio.wait_for(
+                        self.futures_exchange.close_short(symbol, amount_adj),
+                        timeout=30.0,
+                    )
+                else:
+                    order = await asyncio.wait_for(
+                        self.futures_exchange.close_long(symbol, amount_adj),
+                        timeout=30.0,
+                    )
+
+                fill = await asyncio.wait_for(
+                    self._poll_fill(symbol, order.get("id", ""), max_polls=5),
+                    timeout=15.0,
+                )
+                fill_price = float(fill.get("average") or fill.get("price") or price or 0)
+                filled_amount = float(fill.get("filled") or amount_adj or 0)
+                fee = fill.get("fee", {}) or {}
+                fee_cost = float(fee.get("cost", 0.0))
+                fee_currency = fee.get("currency", "USDT")
+                fee_usd = fee_cost if fee_currency == "USDT" else fee_cost * fill_price
+
+                if filled_amount > 0:
+                    trades_total.labels(side=f"close_{direction}", exchange=self.exchange.name).inc()
+                    logger.info(
+                        f"[FuturesExec] CLOSED {direction.upper()} {symbol} ({reason}): "
+                        f"amount={filled_amount:.6f} @ {fill_price:.6f}"
+                    )
+                    return {
+                        "order_id": order.get("id", f"fclose_{int(time.time())}"),
+                        "symbol": symbol,
+                        "side": "sell" if direction == "long" else "buy",
+                        "direction": direction,
+                        "filled_price": fill_price,
+                        "filled_amount": filled_amount,
+                        "amount_usd": fill_price * filled_amount,
+                        "fee_usd": fee_usd,
+                        "reason": reason,
+                        "timestamp": int(time.time()),
+                        "mode": self.mode,
+                    }
+
+            except SubMinimumAmountError:
+                raise
+            except Exception as e:
+                logger.warning(f"[FuturesExec] Exit attempt {attempt+1} failed for {symbol} ({reason}): {e}")
+                errors_total.labels(component="futures_execution", error_type="close_failed").inc()
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+
+        raise Exception(f"Futures exit failed after {self.max_retries} attempts for {symbol}")

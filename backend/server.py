@@ -486,21 +486,34 @@ async def _run_cycle():
     trace = {"cycle": cycle, "steps": []}
 
     # ── CIRCUIT BREAKER: emergency stop if day loss exceeds threshold ──
-    # Uses actual equity vs day-start equity (captures unrealized losses too)
+    # Uses actual equity vs day-start equity (captures unrealized losses too).
     # Grace period: skip for first 5 cycles after startup — equity is stale
-    # before futures margin is accounted for (e.g. $10k → $5k phantom drop).
+    # before futures margin is accounted for.
+    #
+    # BUG FIX (2026-04-04): CB used to re-anchor every grace cycle, so if a
+    # position pumped +$477 in cycles 1-4 the anchor inflated to $5,353.
+    # When the pump reversed, CB saw a "loss" of $455 (8.5%) and nuked
+    # everything.  Now: anchor ONCE at cycle 1 (clean wallet balance before
+    # any position PnL contaminates it).
+    #
+    # Futures mode: leverage amplifies equity swings.  7× leverage means a 1%
+    # adverse move = 7% equity swing at full deployment.  Using 15% threshold
+    # for futures (was 8%) to avoid false trips on normal volatility.
     _CB_GRACE_CYCLES = 5
-    _CB_THRESHOLD = cfg.circuit_breaker_pct  # 0.03=3% for spot, 0.08+ for futures
+    _is_futures_cb = STATE.get("trading_mode") == "futures"
+    _CB_THRESHOLD = 0.15 if _is_futures_cb else cfg.circuit_breaker_pct
     equity = STATE.get("current_equity", 0)
     _today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if cycle <= _CB_GRACE_CYCLES:
-        # Re-anchor day-start equity each grace cycle so it stabilizes
-        if equity > 0:
+        # Anchor ONCE at cycle 1 — before positions inflate equity with unrealized PnL.
+        # Do NOT re-anchor on later grace cycles (that's what caused the $5,353 phantom).
+        if equity > 0 and "_cb_day_start_equity" not in STATE:
             STATE["_cb_day_start_equity"] = equity
             STATE["_cb_day_date"] = _today_str
             STATE["_circuit_breaker_tripped"] = False
         if cycle == _CB_GRACE_CYCLES:
-            logger.info(f"[CIRCUIT BREAKER] Armed after {_CB_GRACE_CYCLES} cycles — start equity ${equity:.2f}")
+            _cb_anchor = STATE.get("_cb_day_start_equity", equity)
+            logger.info(f"[CIRCUIT BREAKER] Armed after {_CB_GRACE_CYCLES} cycles — start equity ${_cb_anchor:.2f} threshold={_CB_THRESHOLD:.0%}")
     elif STATE["_cb_day_date"] != _today_str and equity > 0:
         STATE["_cb_day_start_equity"] = equity
         STATE["_cb_day_date"] = _today_str
