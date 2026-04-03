@@ -152,18 +152,19 @@ class AnalyzerAgent:
         if len(_closes_5m) >= 13:
             _return_1h = (_closes_5m[-1] - _closes_5m[-13]) / _closes_5m[-13] * 100.0
             if _return_1h >= 2.0:
-                # Exhaustion check 1: price must be within 1.5% of recent 1h high
+                # Exhaustion check 1: price must be within 2.5% of recent 1h high
                 # If it's already pulled back more, the move is dying
                 _ft_high = float(np.max(_highs_5m[-12:])) if len(_highs_5m) >= 12 else _closes_5m[-1]
                 _ft_pullback = (_ft_high - _closes_5m[-1]) / _ft_high * 100.0 if _ft_high > 0 else 0
-                _ft_near_high = _ft_pullback < 1.5
+                _ft_near_high = _ft_pullback < 2.5
 
-                # Exhaustion check 2: last 2 of 3 candles must be green
-                # If candles are red, selling pressure has started — move is over
+                # Exhaustion check 2: candle quality
+                # Near high (<1%): 1/3 green is enough (move is fresh, one doji is OK)
+                # Further out (1-2.5%): need 2/3 green (prove buyers are still here)
                 _ft_green_count = 0
                 if len(_closes_5m) >= 4:
                     _ft_green_count = sum(1 for i in range(-3, 0) if _closes_5m[i] > _closes_5m[i - 1])
-                _ft_candles_ok = _ft_green_count >= 2
+                _ft_candles_ok = _ft_green_count >= 2 or (_ft_pullback < 1.0 and _ft_green_count >= 1)
 
                 # Exhaustion check 3: 5m RSI should not be plummeting from overbought
                 _ft_rsi = _compute_rsi(_closes_5m, 14) if len(_closes_5m) >= 15 else 50.0
