@@ -148,10 +148,11 @@ class RiskManager:
         v3.1: regime_max_positions and regime_max_exposure_pct override defaults
         when the current regime calls for reduced capital deployment.
         """
-        # Effective limits: use regime constraint if stricter than config
-        eff_max_positions = min(
-            self.max_positions,
-            regime_max_positions if regime_max_positions is not None else self.max_positions,
+        # Effective limits: BigBrother is regime-aware — trust its limits.
+        # Use regime limit when provided (it handles both up/down: bull=10, bear=4).
+        # Config max_positions is only the fallback when no regime data exists.
+        eff_max_positions = (
+            regime_max_positions if regime_max_positions is not None else self.max_positions
         )
         eff_max_exposure = min(
             self.max_portfolio_exposure_pct,
