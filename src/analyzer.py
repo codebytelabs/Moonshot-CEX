@@ -166,11 +166,12 @@ class AnalyzerAgent:
                     _ft_green_count = sum(1 for i in range(-3, 0) if _closes_5m[i] > _closes_5m[i - 1])
                 _ft_candles_ok = _ft_green_count >= 2 or (_ft_pullback < 1.0 and _ft_green_count >= 1)
 
-                # Exhaustion check 3: 5m RSI must be in momentum zone (>45) but NOT overbought (>78)
-                # RSI >78 = parabolic blowoff territory (DEGO entered at RSI=79, reversed immediately)
+                # Exhaustion check 3: 5m RSI must be in momentum zone (>45) but NOT parabolic (>82)
+                # RSI 78-82 = strong momentum (CHR/ALT/JCT blocked at 78 — lost profits)
+                # RSI >82 = parabolic blowoff territory — pullback+candle checks catch dying pumps
                 # RSI <45 = momentum has already faded
                 _ft_rsi = _compute_rsi(_closes_5m, 14) if len(_closes_5m) >= 15 else 50.0
-                _ft_rsi_ok = 45 < _ft_rsi < 78
+                _ft_rsi_ok = 45 < _ft_rsi < 82
 
                 if _ft_near_high and _ft_candles_ok and _ft_rsi_ok:
                     _fast_track = True
@@ -203,16 +204,17 @@ class AnalyzerAgent:
                 logger.debug(f"[Analyzer] {symbol} filtered: neither 1h nor 15m EMA9>EMA21")
                 return None
 
-        # ── RSI gate: 40-78, block overbought entries ─────────────────────────
-        # RSI 70-78 = strong momentum (still OK to enter).
-        # RSI >78 = overbought — entering here is chasing completed moves.
-        # Old 92 cap was way too permissive — allowed entries into parabolic tops.
-        # Fast-track cap also 78 (aligned with 5m RSI gate in fast-track logic).
+        # ── RSI gate: 40-82, block overbought entries ─────────────────────────
+        # RSI 70-82 = strong momentum (still OK to enter).
+        # RSI >82 = overbought — entering here is chasing completed moves.
+        # 78 cap was too aggressive — blocked CHR(80), ALT(79), JCT(78) which
+        # were valid momentum entries with 0% pullback and 2/3 green candles.
+        # Dying-pump protection comes from pullback gate + candle check, not RSI.
         if direction == "long" and "1h" in tf_data:
             _c1h_rsi = tf_data["1h"][:, 4]
             if len(_c1h_rsi) >= 14:
                 rsi_1h = _compute_rsi(_c1h_rsi, 14)
-                _rsi_cap = 78.0
+                _rsi_cap = 82.0
                 if rsi_1h > _rsi_cap:
                     logger.info(f"[Analyzer] {symbol} filtered: 1h RSI {rsi_1h:.1f} > {_rsi_cap:.0f} (overbought)")
                     return None
