@@ -1205,6 +1205,15 @@ async def _tick_positions() -> list[dict]:
     regime_params = dict(STATE.get("regime_params") or {})
     regime_params["regime"] = STATE.get("regime", "sideways")  # explicit name for is_aggressive check
     exits = await _position_manager.update_all(regime_params=regime_params)
+    # Persist all open positions to DB so trailing_stop, highest_price,
+    # exchange_sl_order_id etc. survive restarts. With 8-10 positions max,
+    # cost is ~10ms total per cycle — negligible vs. 15s cycle time.
+    for pos in _position_manager._positions.values():
+        if pos.status == "open":
+            try:
+                await _save_position_to_db(pos)
+            except Exception:
+                pass  # non-critical — next tick will retry
     return [e for e in exits if e is not None]
 
 
