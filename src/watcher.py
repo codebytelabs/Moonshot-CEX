@@ -176,30 +176,79 @@ class WatcherAgent:
 
         return top
 
-    async def is_btc_trend_bullish(self) -> bool:
-        """Check if BTC/USDT is in a short-term uptrend on the 1h timeframe.
-        Returns True if EMA9 > EMA21 AND RSI > 45.
-        Used as a top-level gate: no altcoin longs if BTC trend is bearish.
-        Alts correlate 70-90% with BTC — fighting BTC's trend is guaranteed loss.
+    async def btc_momentum_score(self) -> dict:
+        """Compute BTC momentum as a continuous score for graduated alt sizing.
+
+        Returns dict with:
+          score: float 0.0-1.2 (0=crash, 0.5=weak, 1.0=healthy, 1.2=strong bull)
+          bullish: bool (backward compat — True if score >= 0.5)
+          ema_gap_pct: float (EMA9-EMA21 gap %)
+          rsi: float (14-period RSI)
+          return_1h: float (1h price return %)
+
+        Scoring model (continuous, not binary):
+          - EMA gap component (40% weight): maps -2%..+2% gap to 0.0..1.0
+          - RSI component (30% weight): maps 20..70 RSI to 0.0..1.0
+          - 1h return component (30% weight): maps -3%..+3% return to 0.0..1.0
+          - Bull bonus: score > 1.0 when all signals strongly positive (up to 1.2)
+          - Crash floor: score = 0.0 when EMA gap < -1% AND RSI < 30
+
+        Alts correlate 0.6-0.95 with BTC (SUI 0.93, ADA 0.91).
+        This score scales alt position sizes proportionally instead of binary block.
         """
         try:
             candles = await self._fetch_ohlcv_cached("BTC/USDT", "1h", 50)
             if candles is None or len(candles) < 26:
-                logger.warning("[Watcher] BTC trend check: insufficient 1h data, defaulting to bearish")
-                return False
+                logger.warning("[Watcher] BTC momentum: insufficient data, returning 0.3")
+                return {"score": 0.3, "bullish": False, "ema_gap_pct": 0.0, "rsi": 50.0, "return_1h": 0.0}
+
             closes = np.array([c[4] for c in candles], dtype=float)
             ema9 = _ema(closes, 9)
             ema21 = _ema(closes, 21)
             rsi = _compute_rsi(closes, 14)
-            bullish = ema9 > ema21 and rsi > 45
+            ema_gap_pct = (ema9 - ema21) / ema21 * 100 if ema21 > 0 else 0.0
+            return_1h = (closes[-1] - closes[-13]) / closes[-13] * 100 if len(closes) >= 13 and closes[-13] > 0 else 0.0
+
+            # ── EMA gap component (40%): -2% → 0.0, 0% → 0.5, +2% → 1.0
+            ema_comp = min(max((ema_gap_pct + 2.0) / 4.0, 0.0), 1.0)
+
+            # ── RSI component (30%): 20 → 0.0, 45 → 0.5, 70 → 1.0
+            rsi_comp = min(max((rsi - 20.0) / 50.0, 0.0), 1.0)
+
+            # ── 1h return component (30%): -3% → 0.0, 0% → 0.5, +3% → 1.0
+            ret_comp = min(max((return_1h + 3.0) / 6.0, 0.0), 1.0)
+
+            score = ema_comp * 0.4 + rsi_comp * 0.3 + ret_comp * 0.3
+
+            # Bull bonus: when all three signals are strongly positive, allow up to 1.2x
+            if ema_gap_pct > 0.5 and rsi > 55 and return_1h > 0.5:
+                score = min(score * 1.2, 1.2)
+
+            # Crash floor: genuine BTC crash → 0.0 (full block)
+            if ema_gap_pct < -1.0 and rsi < 30:
+                score = 0.0
+
+            bullish = score >= 0.5
+            label = f"{'BULL' if score >= 0.8 else 'OK' if bullish else 'WEAK' if score >= 0.3 else 'CRASH'} ({score:.2f})"
             logger.info(
-                f"[Watcher] BTC trend gate: EMA9={ema9:.0f} vs EMA21={ema21:.0f} "
-                f"RSI={rsi:.1f} → {'BULLISH ✓' if bullish else 'BEARISH ✗ (no alt longs)'}"
+                f"[Watcher] BTC momentum: EMA_gap={ema_gap_pct:+.2f}% RSI={rsi:.1f} "
+                f"ret_1h={return_1h:+.2f}% → score={score:.2f} {label}"
             )
-            return bullish
+            return {
+                "score": round(score, 3),
+                "bullish": bullish,
+                "ema_gap_pct": round(ema_gap_pct, 3),
+                "rsi": round(rsi, 1),
+                "return_1h": round(return_1h, 3),
+            }
         except Exception as e:
-            logger.warning(f"[Watcher] BTC trend check failed: {e}, defaulting to bearish")
-            return False
+            logger.warning(f"[Watcher] BTC momentum check failed: {e}, returning 0.3")
+            return {"score": 0.3, "bullish": False, "ema_gap_pct": 0.0, "rsi": 50.0, "return_1h": 0.0}
+
+    async def is_btc_trend_bullish(self) -> bool:
+        """Backward-compatible wrapper — returns True if BTC momentum score >= 0.5."""
+        result = await self.btc_momentum_score()
+        return result["bullish"]
 
     async def _score_batch(self, candidates: list[dict], inverted: bool) -> list[dict]:
         """Score a batch of candidates. inverted=True applies bearish scoring logic."""

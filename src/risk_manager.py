@@ -35,9 +35,9 @@ from .metrics import current_drawdown, win_rate, avg_r_multiple
 #   max_single   — per-position ceiling as fraction of equity
 #   max_risk     — risk-based floor fallback when trade history is thin
 ACCOUNT_TIER_THRESHOLDS = [
-    (2_000,  "small",  0.50, 0.15, 0.05),   # (max_equity, tier, kelly_mult, max_single, max_risk)
-    (20_000, "medium", 0.75, 0.25, 0.08),   # 25% per position × 4-5 slots ≈ 80-100% deployed
-    (float("inf"), "large", 0.90, 0.25, 0.10),
+    (2_000,  "small",  0.50, 0.12, 0.05),   # (max_equity, tier, kelly_mult, max_single, max_risk)
+    (20_000, "medium", 0.75, 0.18, 0.08),   # 15-18% per position × 6-8 slots ≈ 90-144% deployed (leveraged)
+    (float("inf"), "large", 0.90, 0.20, 0.10),
 ]
 
 # ── Drawdown-gradient size multipliers ────────────────────────────────────────
@@ -100,6 +100,7 @@ class RiskManager:
         self._pause_until: Optional[float] = None
         self._trade_history: list[dict] = []
         self._day_trade_count: int = 0
+        self._drawdown_halt_cycles: int = 0  # consecutive cycles blocked by drawdown_halt
 
         # Account tier — re-computed whenever detect_account_tier() is called
         # Defaults match the medium-tier row of ACCOUNT_TIER_THRESHOLDS so that
@@ -165,10 +166,27 @@ class RiskManager:
             return False, f"max_exposure reached ({exposure_pct:.1%} >= {eff_max_exposure:.1%})"
 
         # Hard halt only at extreme drawdown — DRAWDOWN_SCALE handles sizing reduction.
-        # Old 15% halt was a death spiral: can't trade → can't recover → stuck forever.
+        # Drawdown recovery: if halted for 100+ consecutive cycles (~50 min), the peak
+        # is likely stale/inflated (e.g. from spot wallet bleed-through). Reset peak to
+        # current equity so the bot can trade again. Real drawdowns recover via smaller
+        # sizing (DRAWDOWN_SCALE), not permanent lockout.
+        _DRAWDOWN_RECOVERY_CYCLES = 100
         drawdown = self._compute_drawdown(current_equity)
         if drawdown >= 0.30:
-            return False, f"drawdown_halt ({drawdown:.1%} > 30%)"
+            self._drawdown_halt_cycles += 1
+            if self._drawdown_halt_cycles >= _DRAWDOWN_RECOVERY_CYCLES:
+                old_peak = self.peak_equity
+                self.peak_equity = current_equity
+                self._drawdown_halt_cycles = 0
+                logger.warning(
+                    f"[Risk] Drawdown recovery: peak reset ${old_peak:,.2f} → ${current_equity:,.2f} "
+                    f"after {_DRAWDOWN_RECOVERY_CYCLES} halted cycles (was {drawdown:.1%} drawdown)"
+                )
+                drawdown = 0.0  # allow this cycle through
+            else:
+                return False, f"drawdown_halt ({drawdown:.1%} > 30%) [{self._drawdown_halt_cycles}/{_DRAWDOWN_RECOVERY_CYCLES} cycles]"
+        else:
+            self._drawdown_halt_cycles = 0  # reset counter when not halted
 
         if self._pause_until and time.time() < self._pause_until:
             remaining = int(self._pause_until - time.time())
@@ -280,7 +298,7 @@ class RiskManager:
         # ── Final size ────────────────────────────────────────────────────────
         size = base_size * conviction_mult * liq_mult * ta_mult * reg_mult
         size = min(size, max_single)   # hard cap (% of equity)
-        size = min(size, 2500.0)       # absolute hard cap — no single position > $2500
+        size = min(size, 5000.0)       # absolute hard cap — no single position > $5000
         size = max(size, 50.0)         # minimum order floor — never open a sub-$50 position
 
         logger.info(
@@ -292,6 +310,83 @@ class RiskManager:
             f"regime={reg_mult:.2f}×)"
         )
         return size
+
+    def compute_futures_position_size(
+        self,
+        symbol: str,
+        current_equity: float,
+        stop_loss_pct: float,
+        leverage: int = 1,
+        posterior: float = 0.65,
+        threshold: float = 0.65,
+        vol_usd: float = 0.0,
+        ta_score: float = 50.0,
+        regime: str = "sideways",
+        regime_size_mult: float = 1.0,
+        current_regime: str = "sideways",
+    ) -> float:
+        """Leverage-aware position sizing for futures.
+
+        Key principle: MARGIN at risk per trade stays at 1-2% of equity.
+        Notional = margin × leverage.
+
+        With 5x leverage and $1000 equity:
+          - margin_risk = 1% × $1000 = $10
+          - notional = $10 × 5 = $50 position
+          - If price moves -20% → loss = $50 × 20% = $10 = 1% of equity ✓
+
+        The spot sizing logic runs first (without leverage) to get the
+        risk-adjusted margin amount, then we multiply by leverage.
+        """
+        if leverage <= 1:
+            return self.compute_position_size(
+                symbol=symbol,
+                current_equity=current_equity,
+                stop_loss_pct=stop_loss_pct,
+                posterior=posterior,
+                threshold=threshold,
+                vol_usd=vol_usd,
+                ta_score=ta_score,
+                regime=regime,
+                regime_size_mult=regime_size_mult,
+                current_regime=current_regime,
+            )
+
+        # For futures: compute margin (spot-equivalent) size first
+        # Use tighter risk per trade for leveraged positions
+        original_risk = self.max_risk_per_trade_pct
+        self.max_risk_per_trade_pct = min(original_risk, 0.02)  # cap at 2% for futures
+
+        margin_size = self.compute_position_size(
+            symbol=symbol,
+            current_equity=current_equity,
+            stop_loss_pct=stop_loss_pct,
+            posterior=posterior,
+            threshold=threshold,
+            vol_usd=vol_usd,
+            ta_score=ta_score,
+            regime=regime,
+            regime_size_mult=regime_size_mult,
+            current_regime=current_regime,
+        )
+
+        self.max_risk_per_trade_pct = original_risk
+
+        # Notional = margin × leverage
+        notional = margin_size * leverage
+
+        # Hard caps for futures
+        max_notional = current_equity * 0.80 * leverage  # deploy up to 80% equity as margin across positions
+        notional = min(notional, max_notional)
+        notional = min(notional, 50_000.0)  # absolute hard cap for futures notional
+        notional = max(notional, 50.0)
+
+        logger.info(
+            f"[Risk] {symbol} FUTURES size: notional=${notional:.2f} "
+            f"(margin=${margin_size:.2f} × {leverage}x) "
+            f"max_margin_risk={self.max_risk_per_trade_pct:.1%}"
+        )
+        return notional
 
     def _drawdown_size_mult(self, drawdown: float) -> float:
         """Return size multiplier based on current drawdown level."""
@@ -344,6 +439,13 @@ class RiskManager:
     def update_peak_equity(self, equity: float):
         if equity > self.peak_equity:
             self.peak_equity = equity
+
+    def force_reset_peak(self, equity: float):
+        """Force-reset peak equity to a specific value. Use when peak is known to be stale."""
+        old = self.peak_equity
+        self.peak_equity = equity
+        self._drawdown_halt_cycles = 0
+        logger.info(f"[Risk] Peak equity force-reset: ${old:,.2f} → ${equity:,.2f}")
 
     def check_portfolio_health(self, current_equity: float = None) -> dict:
         equity = current_equity or self.peak_equity

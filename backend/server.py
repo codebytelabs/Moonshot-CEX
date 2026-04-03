@@ -25,12 +25,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.config import get_settings
 from src.logger import setup_logging
 from src.redis_client import RedisClient
-from src.exchange_ccxt import ExchangeConnector
+from src.exchange_ccxt import ExchangeConnector, FuturesExchangeConnector
 from src.watcher import WatcherAgent
 from src.analyzer import AnalyzerAgent
 from src.context_agent import ContextAgent
 from src.bayesian_engine import BayesianDecisionEngine
-from src.execution_core import ExecutionCore
+from src.execution_core import ExecutionCore, FuturesExecutionCore
 from src.position_manager import PositionManager
 from src.risk_manager import RiskManager
 from src.quant_mutator import QuantMutator
@@ -38,6 +38,8 @@ from src.bigbrother import BigBrotherAgent
 from src.alerts import AlertManager
 from src.metrics import account_equity, portfolio_value
 from src.performance_tracker import PerformanceTracker
+from src.strategy_manager import StrategyManager
+from src.leverage_engine import LeverageEngine
 
 # ── Global state ──────────────────────────────────────────────────────────────
 cfg = get_settings()
@@ -51,6 +53,7 @@ STATE: dict = {
     "mode": "paper",
     "regime": "sideways",
     "regime_params": {},
+    "regime_capital": {"max_exposure_pct": 0.82, "size_mult": 0.92, "max_single_pct": 0.15, "max_positions": 6},
     # NOTE: 0.0 = equity not yet known. Will be set from exchange at startup.
     # NEVER use a hardcoded value here — position sizing must be based on real account size.
     "current_equity": 0.0,
@@ -90,6 +93,10 @@ _min_score_live: float = cfg.analyzer_min_score
 _bayesian_threshold_live: float = cfg.bayesian_threshold_normal
 _swarm_task: Optional[asyncio.Task] = None
 _consecutive_zero_setups: int = 0  # cycles with 0 setups; drought relief triggers at 200
+_strategy_manager: Optional[StrategyManager] = None
+_futures_exchange: Optional[FuturesExchangeConnector] = None
+_futures_execution: Optional[FuturesExecutionCore] = None
+_leverage_engine: Optional[LeverageEngine] = None
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -104,6 +111,7 @@ async def _startup():
     global _mongo_client, _db, _exchange, _redis, _watcher, _analyzer, _context
     global _bayesian, _execution, _position_manager, _risk_manager, _quant_mutator
     global _bigbrother, _alerts, _swarm_task
+    global _futures_exchange, _futures_execution, _leverage_engine
 
     logger.info("=" * 60)
     logger.info("  MOONSHOT-CEX  starting up")
@@ -224,6 +232,101 @@ async def _startup():
         trailing_distance_pct=cfg.trailing_stop_distance_pct,
         time_exit_hours=cfg.time_exit_hours,
     )
+
+    # ── Strategy Manager (multi-strategy YOLO engine) ────────────────────
+    global _strategy_manager
+    _strategy_manager = StrategyManager(
+        exchange=_exchange,
+        config={
+            "max_total_positions": cfg.max_positions,
+            "max_per_strategy": max(2, cfg.max_positions // 2),
+            "signal_cooldown_seconds": 60,
+            "scalper": {
+                "scan_interval_seconds": 10,
+                "min_volume_24h": 1_000_000,
+                "tp1_pct": 0.5,
+                "tp2_pct": 1.0,
+                "sl_pct": -0.5,
+                "trail_activate_pct": 0.6,
+                "trail_distance_pct": 0.4,
+                "max_hold_minutes": 15,
+                "min_score": 55,
+            },
+            "breakout": {
+                "scan_interval_seconds": 30,
+                "min_volume_24h": 2_000_000,
+                "tp1_pct": 1.5,
+                "tp2_pct": 3.0,
+                "sl_pct": -1.5,
+                "trail_activate_pct": 1.5,
+                "trail_distance_pct": 1.0,
+                "max_hold_minutes_loser": 120,
+                "max_hold_minutes_hard": 240,
+                "min_score": 55,
+            },
+            "mean_reversion": {
+                "scan_interval_seconds": 20,
+                "min_volume_24h": 1_500_000,
+                "tp1_pct": 1.0,
+                "tp2_pct": 2.0,
+                "sl_pct": -1.2,
+                "trail_activate_pct": 1.0,
+                "trail_distance_pct": 0.6,
+                "max_hold_minutes_loser": 60,
+                "max_hold_minutes_hard": 180,
+                "min_score": 55,
+            },
+        },
+    )
+    logger.info(f"[Startup] StrategyManager initialized: {_strategy_manager.active_strategies}")
+
+    # ── Futures Mode Setup ─────────────────────────────────────────────────
+    _is_futures = cfg.trading_mode.lower() == "futures"
+    STATE["trading_mode"] = cfg.trading_mode
+    if _is_futures:
+        logger.info("=" * 40)
+        logger.info("  FUTURES MODE ACTIVE")
+        logger.info(f"  Default leverage: {cfg.futures_default_leverage}x")
+        logger.info(f"  Max leverage: {cfg.futures_max_leverage}x")
+        logger.info(f"  Margin type: {cfg.futures_margin_type}")
+        logger.info("=" * 40)
+
+        _futures_exchange = FuturesExchangeConnector(
+            name="binance",
+            api_key=cfg.binance_futures_testnet_api_key,
+            api_secret=cfg.binance_futures_testnet_api_secret,
+            futures_url=cfg.binance_futures_testnet_url,
+            default_leverage=cfg.futures_default_leverage,
+            margin_type=cfg.futures_margin_type,
+        )
+        await _futures_exchange.initialize()
+
+        _futures_execution = FuturesExecutionCore(
+            exchange=_futures_exchange,
+            exchange_mode=cfg.exchange_mode,
+            max_retries=cfg.max_sell_retries,
+        )
+
+        _leverage_engine = LeverageEngine(
+            default_leverage=cfg.futures_default_leverage,
+            max_leverage=cfg.futures_max_leverage,
+            min_leverage=cfg.futures_min_leverage,
+        )
+
+        # Re-wire: use futures exchange/execution as the primary connectors
+        # so strategies, position manager, and watcher use futures markets
+        _exchange = _futures_exchange
+        _execution = _futures_execution
+        _position_manager.execution = _futures_execution
+
+        # Update watcher and strategy manager to use futures exchange
+        _watcher.exchange = _futures_exchange
+        if _strategy_manager:
+            _strategy_manager._exchange = _futures_exchange
+            for strat in _strategy_manager._strategies.values():
+                strat.exchange = _futures_exchange
+
+        logger.info("[Startup] Futures wiring complete — all agents use futures exchange")
 
     STATE["mode"] = cfg.exchange_mode
     STATE["start_time"] = time.time()
@@ -378,22 +481,34 @@ async def _run_cycle():
     cycle = STATE["cycle_count"]
     trace = {"cycle": cycle, "steps": []}
 
-    # ── CIRCUIT BREAKER: emergency stop if day loss exceeds 3% of equity ──
+    # ── CIRCUIT BREAKER: emergency stop if day loss exceeds threshold ──
     # Uses actual equity vs day-start equity (captures unrealized losses too)
+    # Grace period: skip for first 5 cycles after startup — equity is stale
+    # before futures margin is accounted for (e.g. $10k → $5k phantom drop).
+    _CB_GRACE_CYCLES = 5
+    _CB_THRESHOLD = cfg.circuit_breaker_pct  # 0.03=3% for spot, 0.08+ for futures
     equity = STATE.get("current_equity", 0)
     _today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if STATE["_cb_day_date"] != _today_str and equity > 0:
+    if cycle <= _CB_GRACE_CYCLES:
+        # Re-anchor day-start equity each grace cycle so it stabilizes
+        if equity > 0:
+            STATE["_cb_day_start_equity"] = equity
+            STATE["_cb_day_date"] = _today_str
+            STATE["_circuit_breaker_tripped"] = False
+        if cycle == _CB_GRACE_CYCLES:
+            logger.info(f"[CIRCUIT BREAKER] Armed after {_CB_GRACE_CYCLES} cycles — start equity ${equity:.2f}")
+    elif STATE["_cb_day_date"] != _today_str and equity > 0:
         STATE["_cb_day_start_equity"] = equity
         STATE["_cb_day_date"] = _today_str
         STATE["_circuit_breaker_tripped"] = False
         logger.info(f"[CIRCUIT BREAKER] New day — start equity ${equity:.2f}")
     cb_start = STATE.get("_cb_day_start_equity", 0)
     day_pnl = equity - cb_start if cb_start > 0 else 0
-    if equity > 0 and cb_start > 0 and day_pnl < 0 and abs(day_pnl) / cb_start > 0.03:
+    if cycle > _CB_GRACE_CYCLES and equity > 0 and cb_start > 0 and day_pnl < 0 and abs(day_pnl) / cb_start > _CB_THRESHOLD:
         if not STATE.get("_circuit_breaker_tripped"):
             STATE["_circuit_breaker_tripped"] = True
             logger.warning(
-                f"[CIRCUIT BREAKER] Day loss ${day_pnl:.2f} exceeds 3% of equity ${equity:.2f}. "
+                f"[CIRCUIT BREAKER] Day loss ${day_pnl:.2f} exceeds {_CB_THRESHOLD:.0%} of equity ${equity:.2f}. "
                 f"Emergency closing all positions and pausing."
             )
             if _position_manager:
@@ -410,51 +525,157 @@ async def _run_cycle():
         STATE["_circuit_breaker_tripped"] = False
         logger.info("[CIRCUIT BREAKER] Reset — day PnL back to positive.")
 
-    # ── Step 1: Watcher scan ────────────────────────────────────────────────
+    # ── Step 1: Watcher scan + Strategy Manager scan (PARALLEL) ────────────
     current_regime = STATE.get("regime", "sideways")
-    candidates = await _watcher.scan(regime=current_regime)
-    STATE["last_watcher_candidates"] = candidates[:10]
-    trace["steps"].append(f"watcher:{len(candidates)}")
-    logger.info(f"[Cycle {cycle}] Watcher → {len(candidates)} candidates")
+    open_syms_pre = _position_manager.get_open_symbols()
 
-    if not candidates:
+    # Run legacy pipeline and strategy manager in parallel
+    async def _legacy_pipeline():
+        """Legacy watcher → analyzer → context → bayesian pipeline."""
+        cands = await _watcher.scan(regime=current_regime)
+        if not cands:
+            return []
+        await asyncio.sleep(1)
+        _analyzer.min_score = _min_score_live
+        try:
+            setups = await _analyzer.analyze(cands, regime=current_regime)
+        except Exception as exc:
+            logger.error(f"[Cycle {cycle}] Analyzer error: {exc}")
+            return []
+        if not setups:
+            return []
+        enriched = await _context.enrich(setups)
+        _bayesian.mode = STATE.get("bigbrother_mode", "normal")
+        return _bayesian.batch_decide(enriched)
+
+    async def _strategy_pipeline():
+        """Multi-strategy scanning (scalper + breakout + mean reversion)."""
+        if not _strategy_manager:
+            return []
+        try:
+            signals = await _strategy_manager.scan_all(
+                regime=current_regime,
+                open_positions=list(open_syms_pre),
+            )
+            return [sig.to_setup_dict() for sig in signals]
+        except Exception as exc:
+            logger.error(f"[Cycle {cycle}] Strategy manager error: {exc}")
+            return []
+
+    legacy_result, strategy_result = await asyncio.gather(
+        _legacy_pipeline(),
+        _strategy_pipeline(),
+        return_exceptions=True,
+    )
+
+    # Handle exceptions from gather
+    legacy_approved = legacy_result if isinstance(legacy_result, list) else []
+    strategy_setups = strategy_result if isinstance(strategy_result, list) else []
+
+    # Track legacy pipeline stats
+    candidates = STATE.get("last_watcher_candidates", [])
+    trace["steps"].append(f"legacy:{len(legacy_approved)}")
+    trace["steps"].append(f"strategies:{len(strategy_setups)}")
+
+    if legacy_approved:
+        _consecutive_zero_setups = 0
+    else:
+        _consecutive_zero_setups += 1
+
+    # Merge: deduplicate by symbol — strategy signals take priority over legacy
+    seen_symbols = set()
+    approved = []
+    for setup in strategy_setups:
+        sym = setup.get("symbol", "")
+        if sym not in seen_symbols:
+            seen_symbols.add(sym)
+            approved.append(setup)
+    for setup in legacy_approved:
+        sym = setup.get("symbol", "")
+        if sym not in seen_symbols:
+            seen_symbols.add(sym)
+            approved.append(setup)
+
+    # ── Unified quality ranking — best opportunities fill limited slots first ──
+    # Composite rank = posterior (Bayesian confidence) × ta_score (TA quality).
+    # Without this sort, slots were filled first-come-first-served: if 12 signals
+    # passed threshold but only 3 slots free, slots went to the first 3 iterated
+    # rather than the top 3 by quality.
+    def _rank_score(setup: dict) -> float:
+        posterior = float(setup.get("decision", {}).get("posterior", setup.get("confidence", 0.5)))
+        ta = float(setup.get("ta_score", setup.get("score", 50.0)))
+        return posterior * ta  # higher = better opportunity
+
+    approved.sort(key=_rank_score, reverse=True)
+
+    # Log the ranked leaderboard so we can see which tokens win slots
+    if approved:
+        _rank_lines = []
+        for _ri, _rs in enumerate(approved):
+            _rk = _rank_score(_rs)
+            _sym = _rs.get("symbol", "?")
+            _post = float(_rs.get("decision", {}).get("posterior", _rs.get("confidence", 0)))
+            _ta = float(_rs.get("ta_score", _rs.get("score", 0)))
+            _rank_lines.append(f"#{_ri+1} {_sym} rank={_rk:.1f} (post={_post:.3f} ta={_ta:.0f})")
+        logger.info(f"[Cycle {cycle}] Opportunity ranking: {' | '.join(_rank_lines)}")
+
+    STATE["last_decisions"] = approved[:5]
+    trace["approved_syms"] = [s["symbol"] for s in approved]
+    trace["ranking"] = [
+        {"symbol": s.get("symbol"), "rank_score": round(_rank_score(s), 1)}
+        for s in approved
+    ]
+    logger.info(
+        f"[Cycle {cycle}] Signals: legacy={len(legacy_approved)} strategy={len(strategy_setups)} "
+        f"merged={len(approved)} (ranked by posterior×ta_score)"
+    )
+
+    if not approved:
         STATE["_cycle_trace"] = trace
         await _tick_positions()
         return
 
-    # ── Step 2: Analyzer ───────────────────────────────────────────────────
-    await asyncio.sleep(2)
-    _analyzer.min_score = _min_score_live
-    try:
-        setups = await _analyzer.analyze(candidates, regime=STATE.get("regime", "sideways"))
-        trace["steps"].append(f"analyzer:{len(setups)}")
-        if setups:
-            _consecutive_zero_setups = 0
-    except Exception as exc:
-        trace["steps"].append(f"analyzer_error:{exc}")
-        logger.error(f"[Cycle {cycle}] Analyzer error: {exc}")
-        setups = []
-    STATE["last_setups"] = [
-        {k: v for k, v in s.items() if k != "features"} for s in setups[:5]
-    ]
-    STATE["_cycle_trace"] = trace
-    logger.info(f"[Cycle {cycle}] Analyzer → {len(setups)} setups (min_score={_min_score_live})")
+    # ── Funding Rate Awareness (futures only) ──────────────────────────────
+    # Fetch funding rates for approved symbols and inject into setups.
+    # Skip trades where funding is extreme and direction is unfavorable.
+    _funding_rates: dict[str, float] = {}
+    if STATE.get("trading_mode", "spot") == "futures" and _futures_exchange:
+        try:
+            _approved_syms = [s["symbol"] for s in approved]
+            _funding_rates = await _futures_exchange.fetch_funding_rates(_approved_syms)
+            if _funding_rates:
+                logger.info(f"[Cycle {cycle}] Funding rates: { {k: f'{v:.6f}' for k, v in _funding_rates.items() if abs(v) > 0.0001} }")
+        except Exception as _fr_err:
+            logger.debug(f"[Cycle {cycle}] Funding rate fetch failed: {_fr_err}")
 
-    if not setups:
-        _consecutive_zero_setups += 1
+    # Inject funding rates and apply funding gate
+    _pre_funding_count = len(approved)
+    _funding_filtered = []
+    for setup in approved:
+        sym = setup.get("symbol", "")
+        fr = _funding_rates.get(sym, 0.0)
+        setup["funding_rate"] = fr
+
+        # Funding gate: skip if extreme funding opposes our direction
+        _dir = setup.get("direction", "long")
+        abs_fr = abs(fr)
+        if abs_fr > 0.001:  # >0.1% per 8h is extreme
+            if (fr > 0 and _dir == "long") or (fr < 0 and _dir == "short"):
+                trace["steps"].append(f"skip_funding:{sym}:{_dir}:fr={fr:.6f}")
+                logger.info(
+                    f"[Swarm] {sym} {_dir} skipped: extreme funding rate {fr:.6f} opposes direction"
+                )
+                continue
+        _funding_filtered.append(setup)
+
+    approved = _funding_filtered
+    if _pre_funding_count > len(approved):
+        logger.info(f"[Cycle {cycle}] Funding gate filtered {_pre_funding_count - len(approved)} signals")
+
+    if not approved:
+        STATE["_cycle_trace"] = trace
         await _tick_positions()
         return
-
-    # ── Step 3: Context enrichment ─────────────────────────────────────────
-    enriched = await _context.enrich(setups)
-    trace["steps"].append(f"context:{len(enriched)}")
-
-    # ── Step 4: Bayesian decisions ─────────────────────────────────────────
-    _bayesian.mode = STATE.get("bigbrother_mode", "normal")
-    approved = _bayesian.batch_decide(enriched)
-    STATE["last_decisions"] = approved[:3]
-    trace["steps"].append(f"bayesian:{len(approved)}")
-    trace["approved_syms"] = [s["symbol"] for s in approved]
 
     # ── Step 5: Risk gates + entry ─────────────────────────────────────────
     equity = STATE["current_equity"]
@@ -464,16 +685,22 @@ async def _run_cycle():
 
     # In demo/live mode: fetch real available USDT cash so we never send an
     # order larger than what the exchange account actually holds.
-    _MIN_POSITION_USD = 50.0
+    _MIN_POSITION_USD = 110.0 if STATE.get("trading_mode") == "futures" else 50.0
     available_cash_usd = equity  # paper fallback: treat full equity as available
-    if _uses_exchange_account_state() and _exchange:
+    _is_futures_cycle = STATE.get("trading_mode") == "futures" and _futures_exchange
+    if _uses_exchange_account_state():
         try:
-            _bal = await _exchange.fetch_balance()
+            if _is_futures_cycle:
+                _bal = await _futures_exchange.exchange.fetch_balance()
+            elif _exchange:
+                _bal = await _exchange.fetch_balance()
+            else:
+                _bal = {}
             _usdt = _bal.get("USDT", {})
             available_cash_usd = float(
                 _usdt.get("free") or _usdt.get("total") or 0.0
             )
-            logger.info(f"[Cycle {cycle}] Available USDT cash: ${available_cash_usd:.2f}")
+            logger.info(f"[Cycle {cycle}] Available USDT cash: ${available_cash_usd:.2f} ({'futures' if _is_futures_cycle else 'spot'})")
         except Exception as _e:
             logger.warning(f"[Cycle {cycle}] Could not fetch cash balance, using equity: {_e}")
 
@@ -502,40 +729,101 @@ async def _run_cycle():
     _regime_size_mult = float(_regime_capital.get("size_mult", 1.0))
     _regime_max_positions = _regime_capital.get("max_positions")
     _regime_max_exposure = _regime_capital.get("max_exposure_pct")
+    _regime_max_single_pct = float(_regime_capital.get("max_single_pct", cfg.max_single_exposure_pct))
     _choppy_min_ta = float(STATE.get("choppy_min_ta_score", 0.0))
     _current_regime = STATE.get("regime", "sideways")
 
-    # ── BTC Trend Gate — no alt longs if BTC is bearish ─────────────────────
-    # Alts correlate 70-90% with BTC. Buying alt longs while BTC drops is
-    # fighting the tide — historically causes 80% of momentum long failures.
+    # ── BTC Momentum Score — graduated alt sizing based on BTC strength ─────
+    # Alts correlate 0.6-0.95 with BTC (SUI 0.93, ADA 0.91, XLM 0.91).
+    # Instead of binary block/allow, BTC momentum continuously scales alt sizing:
+    #   score=0.0 (crash) → full block | 0.5 → half size | 1.0 → full size | 1.2 → bull bonus
     # Short tokens (3S/5S/DOWN) are exempt — they profit from BTC falling.
-    _btc_bullish = True  # default: allow longs
+    _btc_momentum = {"score": 0.7, "bullish": True}  # default: moderate
     try:
-        _btc_bullish = await _watcher.is_btc_trend_bullish()
-        STATE["btc_trend_bullish"] = _btc_bullish
+        _btc_momentum = await _watcher.btc_momentum_score()
+        STATE["btc_trend_bullish"] = _btc_momentum["bullish"]
+        STATE["btc_momentum_score"] = _btc_momentum["score"]
     except Exception as _btc_err:
-        logger.warning(f"[Cycle {cycle}] BTC trend check failed: {_btc_err}")
+        logger.warning(f"[Cycle {cycle}] BTC momentum check failed: {_btc_err}")
+    _btc_size_mult = min(max(_btc_momentum["score"], 0.0), 1.2)  # sizing multiplier
 
-    for setup in approved:
+    for _slot_rank, setup in enumerate(approved, 1):
         symbol = setup["symbol"]
+        _setup_rank_score = _rank_score(setup)
 
         # ── Pre-compute desired size (needed for both scale and new-entry paths) ──
         sl_pct = STATE.get("regime_params", {}).get("stop_loss_pct", cfg.stop_loss_pct)
         decision = setup.get("decision", {})
-        size_usd = _risk_manager.compute_position_size(
-            symbol=symbol,
-            current_equity=equity,
-            stop_loss_pct=sl_pct,
-            posterior=float(decision.get("posterior", 0.65)),
-            threshold=float(decision.get("threshold", cfg.bayesian_threshold_normal)),
-            vol_usd=float(setup.get("vol_usd", 0.0)),
-            ta_score=float(setup.get("ta_score", 50.0)),
-            regime_size_mult=_regime_size_mult,
-            current_regime=_current_regime,
-        )
-        size_usd = min(size_usd, equity * cfg.max_single_exposure_pct)
-        if _uses_exchange_account_state():
-            size_usd = min(size_usd, available_cash_usd * 0.92)
+        _direction = setup.get("direction", "long")
+        _is_futures_mode = STATE.get("trading_mode", "spot") == "futures"
+
+        # Compute dynamic leverage for futures mode
+        _trade_leverage = 1
+        if _is_futures_mode and _leverage_engine:
+            _signal_score = float(setup.get("ta_score", setup.get("score", 50.0)))
+            # Use Bayesian posterior as confidence — it actually varies per signal (0.45-0.90)
+            # unlike the static 0.65 fallback which made all leverages identical
+            _signal_conf = float(decision.get("posterior", setup.get("confidence", 0.50)))
+            _trade_leverage = _leverage_engine.compute_leverage(
+                signal_score=_signal_score,
+                confidence=_signal_conf,
+                regime=_current_regime,
+                vol_usd_24h=float(setup.get("vol_usd", 0.0)),
+                win_streak=_risk_manager._consecutive_wins,
+                consecutive_losses=_risk_manager._consecutive_losses,
+                drawdown_pct=_risk_manager._compute_drawdown(equity) * 100,
+                funding_rate=float(setup.get("funding_rate", 0.0)),
+                direction=_direction,
+                btc_momentum=_btc_momentum.get("score", 0.7),
+            )
+            _trade_leverage = _leverage_engine.adjust_for_account_tier(_trade_leverage, equity)
+            # Inject leverage into setup so position_manager picks it up
+            setup["leverage"] = _trade_leverage
+
+        # Futures: leverage-aware sizing | Spot: standard sizing
+        if _is_futures_mode and _trade_leverage > 1:
+            size_usd = _risk_manager.compute_futures_position_size(
+                symbol=symbol,
+                current_equity=equity,
+                stop_loss_pct=sl_pct,
+                leverage=_trade_leverage,
+                posterior=float(decision.get("posterior", 0.65)),
+                threshold=float(decision.get("threshold", cfg.bayesian_threshold_normal)),
+                vol_usd=float(setup.get("vol_usd", 0.0)),
+                ta_score=float(setup.get("ta_score", 50.0)),
+                regime_size_mult=_regime_size_mult,
+                current_regime=_current_regime,
+            )
+        else:
+            size_usd = _risk_manager.compute_position_size(
+                symbol=symbol,
+                current_equity=equity,
+                stop_loss_pct=sl_pct,
+                posterior=float(decision.get("posterior", 0.65)),
+                threshold=float(decision.get("threshold", cfg.bayesian_threshold_normal)),
+                vol_usd=float(setup.get("vol_usd", 0.0)),
+                ta_score=float(setup.get("ta_score", 50.0)),
+                regime_size_mult=_regime_size_mult,
+                current_regime=_current_regime,
+            )
+        # Cap: use regime-dynamic max_single_pct (from BigBrother) instead of static config.
+        # For futures, size_usd is NOTIONAL so cap must be leverage-aware.
+        # Margin cap = equity × regime_max_single_pct → notional cap = margin × leverage.
+        _pre_cap = size_usd
+        if _is_futures_mode and _trade_leverage > 1:
+            _margin_cap = equity * _regime_max_single_pct
+            size_usd = min(size_usd, _margin_cap * _trade_leverage)
+            # Cash guard: don't exceed available margin × leverage
+            if _uses_exchange_account_state():
+                size_usd = min(size_usd, available_cash_usd * 0.92 * _trade_leverage)
+            logger.info(
+                f"[Sizing] {symbol} FINAL notional=${size_usd:.0f} margin=${size_usd/_trade_leverage:.0f} "
+                f"(lev={_trade_leverage}x cap={_regime_max_single_pct:.0%} regime={_current_regime})"
+            )
+        else:
+            size_usd = min(size_usd, equity * _regime_max_single_pct)
+            if _uses_exchange_account_state():
+                size_usd = min(size_usd, available_cash_usd * 0.92)
 
         # ── Already holding this symbol? → Scale instead of sell+rebuy ──────
         if symbol in open_syms:
@@ -574,16 +862,35 @@ async def _run_cycle():
                 trace["steps"].append(f"skip_held:{symbol}")
             continue
 
-        # BTC trend gate — no alt longs if BTC 1h EMA9 < EMA21
+        # BTC momentum gate — graduated alt sizing based on BTC strength.
+        # score=0.0 → full block (crash), 0.3 → 30% size, 1.0 → full, 1.2 → bull bonus.
+        # Strategy-originated signals bypass this gate — they have built-in trend filters.
         # Short tokens (3S/5S/DOWN) are exempt — they profit from BTC falling.
         _direction = setup.get("direction", "long")
-        if not _btc_bullish and _direction == "long":
-            _base = symbol.replace("/USDT", "")
+        _is_strategy_signal = bool(setup.get("strategy", ""))
+        if _direction == "long" and not _is_strategy_signal:
+            _base = symbol.replace("/USDT", "").replace(":USDT", "")
             _is_short_token = any(_base.endswith(sfx) for sfx in ("3S", "5S", "DOWN"))
             if not _is_short_token:
-                trace["steps"].append(f"skip_btc_bearish:{symbol}")
-                logger.info(f"[Swarm] {symbol} skipped: BTC trend bearish (no alt longs)")
-                continue
+                if _btc_size_mult <= 0.05:
+                    # Crash floor: BTC in freefall → full block
+                    trace["steps"].append(f"skip_btc_crash:{symbol}")
+                    logger.info(f"[Swarm] {symbol} skipped: BTC crash (momentum={_btc_momentum['score']:.2f})")
+                    continue
+                elif _btc_size_mult < 1.0:
+                    # Graduated: reduce size proportionally to BTC weakness
+                    size_usd *= _btc_size_mult
+                    logger.info(
+                        f"[Sizing] {symbol} BTC momentum scaling: ×{_btc_size_mult:.2f} → ${size_usd:.0f} "
+                        f"(BTC score={_btc_momentum['score']:.2f})"
+                    )
+                elif _btc_size_mult > 1.0:
+                    # Bull bonus: BTC strongly bullish → slight size boost for alt longs
+                    size_usd *= _btc_size_mult
+                    logger.info(
+                        f"[Sizing] {symbol} BTC bull bonus: ×{_btc_size_mult:.2f} → ${size_usd:.0f} "
+                        f"(BTC score={_btc_momentum['score']:.2f})"
+                    )
 
         # Symbol cooldown gate — prevent revenge-trading after recent stop-loss
         if _position_manager.is_symbol_on_cooldown(symbol):
@@ -599,8 +906,9 @@ async def _run_cycle():
             continue
 
         # v3.1: Setup allowlist gate — regime restricts which setup types are allowed
+        # Strategy signals bypass — they have built-in regime awareness.
         setup_type = setup.get("setup_type", "neutral")
-        if _regime_setup_allowlist and setup_type not in _regime_setup_allowlist:
+        if _regime_setup_allowlist and setup_type not in _regime_setup_allowlist and not _is_strategy_signal:
             trace["steps"].append(f"skip_regime_setup:{symbol}:{setup_type}")
             logger.info(
                 f"[Swarm] {symbol} skipped: setup_type '{setup_type}' not allowed in "
@@ -609,7 +917,7 @@ async def _run_cycle():
             continue
 
         # v3.1: Choppy regime — additional ta_score gate (only high-quality breakouts)
-        if _choppy_min_ta > 0:
+        if _choppy_min_ta > 0 and not _is_strategy_signal:
             ta_score_check = float(setup.get("ta_score", 0.0))
             if ta_score_check < _choppy_min_ta:
                 trace["steps"].append(f"skip_choppy_ta:{symbol}:score={ta_score_check:.0f}<{_choppy_min_ta:.0f}")
@@ -660,13 +968,20 @@ async def _run_cycle():
         if pos:
             entries.append(symbol)
             _risk_manager.record_entry()  # count new entries only (not exits) toward daily limit
-            available_cash_usd -= size_usd  # track committed cash within this cycle
+            # In futures, exchange deducts margin (not notional) from wallet
+            _cash_committed = size_usd / _trade_leverage if _is_futures_mode and _trade_leverage > 1 else size_usd
+            available_cash_usd -= _cash_committed
             await _save_position_to_db(pos)
+            # Register with strategy manager so exit logic uses correct strategy rules
+            _strat_name = setup.get("strategy", "")
+            if _strategy_manager and _strat_name:
+                _strategy_manager.register_position(symbol, _strat_name)
             if _alerts:
                 decision = setup.get("decision", {})
+                strat_label = f" [{_strat_name}]" if _strat_name else ""
                 await _alerts.send(
-                    f"🟢 ENTERED {symbol}\n"
-                    f"Setup: {setup.get('setup_type')} | Score: {setup.get('ta_score'):.1f}\n"
+                    f"🟢 ENTERED {symbol}{strat_label} (Rank #{_slot_rank}/{len(approved)})\n"
+                    f"Setup: {setup.get('setup_type')} | Score: {setup.get('ta_score'):.1f} | Rank={_setup_rank_score:.1f}\n"
                     f"Entry: {pos.entry_price:.6f} | Size: ${size_usd:.2f}\n"
                     f"Posterior: {decision.get('posterior', 0):.3f}",
                     priority="medium",
@@ -689,6 +1004,10 @@ async def _run_cycle():
             STATE["total_pnl_usd"] += pnl
             STATE["day_pnl_usd"] += pnl
             await _save_trade_to_db(exit_result)
+            # Unregister from strategy manager
+            _exit_sym = exit_result.get("symbol", "")
+            if _strategy_manager and _exit_sym:
+                _strategy_manager.unregister_position(_exit_sym)
             # Mark position closed in DB (so crash recovery skips it)
             if _db is not None:
                 try:
@@ -745,43 +1064,15 @@ async def _run_cycle():
     STATE["recent_events"].extend(bb_result.get("events", []))
     STATE["recent_events"] = STATE["recent_events"][-50:]
 
-    # Track consecutive bear/choppy cycles — only sweep after 2+ cycles to avoid
-    # false sweeps from single-cycle regime blips (sideways→bear→sideways).
-    if STATE["regime"] in ("bear", "choppy"):
-        STATE["_bear_cycle_count"] = STATE.get("_bear_cycle_count", 0) + 1
-    else:
-        STATE["_bear_cycle_count"] = 0
-
-    if (old_regime != STATE["regime"] and STATE["regime"] in ("bear", "choppy")
-            and STATE.get("_bear_cycle_count", 0) >= 2):
-        logger.warning(f"[Swarm] Regime confirmed {STATE['regime']} for {STATE['_bear_cycle_count']} cycles (from {old_regime}). Sweeping vulnerable positions.")
-        sweep_exits = await _position_manager.sweep_vulnerable_positions()
-        for exit_result in sweep_exits:
-            if exit_result and exit_result.get("pnl_usd") is not None:
-                pnl = float(exit_result["pnl_usd"])
-                pnl_pct = float(exit_result.get("pnl_pct", 0))
-                r_mult = float(exit_result.get("decision", {}).get("r_multiple", 0))
-                hold_h = float(exit_result.get("hold_time_hours", 0))
-                _risk_manager.record_trade(pnl, pnl_pct, r_mult)
-                STATE["total_pnl_usd"] += pnl
-                STATE["day_pnl_usd"] += pnl
-                await _save_trade_to_db(exit_result)
-                if _db is not None:
-                    try:
-                        await _db.positions.update_one(
-                            {"id": exit_result.get("id")},
-                            {"$set": {"status": "closed", "close_reason": exit_result.get("close_reason")}},
-                        )
-                    except Exception:
-                        pass
-                _bayesian.update_prior(exit_result.get("setup_type", "neutral"), pnl > 0)
-                if _alerts:
-                    emoji = "🟢" if pnl > 0 else "🔴"
-                    await _alerts.send(
-                        f"{emoji} CLOSED {exit_result.get('symbol')} ({exit_result.get('close_reason')})\n"
-                        f"PnL: ${pnl:+.2f} ({pnl_pct:+.1f}%) | Hold: {hold_h:.1f}h | Regime: {STATE['regime']}",
-                        priority="high",
-                    )
+    # ── Regime sweep DISABLED ─────────────────────────────────────────────
+    # The sweep was nuking ALL positions on every bear↔choppy oscillation.
+    # Bug: both bear and choppy increment _bear_cycle_count, so transitions
+    # between them (bear→choppy→bear) always had count >= 2 and always fired.
+    # Result: massive losses from force-selling during normal volatility.
+    # Positions now exit via their own stop losses, trailing stops, and
+    # momentum exits. The BTC trend gate blocks NEW entries when appropriate.
+    if old_regime != STATE["regime"]:
+        logger.info(f"[Swarm] Regime changed: {old_regime} → {STATE['regime']} (no sweep — positions manage their own exits)")
 
     if bb_result["mode"] == "paused":
         STATE["paused"] = True
@@ -790,6 +1081,14 @@ async def _run_cycle():
     await _update_equity()
     STATE["last_cycle_at"] = int(time.time())
     await _broadcast_ws()
+
+    # ── Step 10: Periodic orphan algo order + position sync (every 10 cycles) ──
+    # Exchange data is golden — clean up any algo stop orders that don't match
+    # real exchange positions, and ghost-close bot-tracked positions that the
+    # exchange no longer has (e.g. exchange-side SL triggered).
+    _ORPHAN_SWEEP_INTERVAL = 10
+    if cycle % _ORPHAN_SWEEP_INTERVAL == 0:
+        await _sweep_orphan_algo_orders_and_positions()
 
     logger.info(
         f"[Swarm] Cycle {cycle} complete | "
@@ -806,6 +1105,92 @@ async def _tick_positions() -> list[dict]:
     return [e for e in exits if e is not None]
 
 
+async def _sweep_orphan_algo_orders_and_positions():
+    """Periodic sweep: cancel orphaned algo stop orders + sync bot positions with exchange.
+
+    Exchange data is golden. This function:
+    1. Fetches LIVE exchange positions → builds set of symbols actually open on exchange
+    2. Fetches ALL open algo orders → cancels any for symbols NOT in exchange positions
+    3. Ghost-closes bot-tracked positions that no longer exist on exchange
+       (e.g. exchange-side SL triggered without bot knowing)
+    """
+    if not _futures_exchange or STATE.get("trading_mode") != "futures":
+        return
+    if not _uses_exchange_account_state():
+        return
+
+    try:
+        # Step 1: Get live exchange positions
+        raw_positions = await _futures_exchange.exchange.fetch_positions()
+        exchange_symbols = set()
+        for pos in raw_positions:
+            contracts = abs(float(pos.get("contracts", 0)))
+            if contracts > 0:
+                exchange_symbols.add(pos.get("symbol", ""))
+
+        # Step 2: Cancel orphaned algo orders
+        try:
+            open_algo_orders = await _futures_exchange.exchange.request(
+                "openAlgoOrders", "fapiPrivate", "GET", params={}
+            )
+            orders_list = open_algo_orders if isinstance(open_algo_orders, list) else open_algo_orders.get("orders", [])
+            cancelled = 0
+            for order in orders_list:
+                order_symbol_raw = order.get("symbol", "")
+                # Binance returns symbol without slash (e.g., "BTCUSDT"), normalize to CCXT format
+                algo_id = order.get("algoId")
+                # Match against exchange positions using raw symbol
+                matched = False
+                for ex_sym in exchange_symbols:
+                    # CCXT format: "BTC/USDT:USDT" → raw: "BTCUSDT"
+                    raw = ex_sym.replace("/", "").replace(":USDT", "")
+                    if raw == order_symbol_raw:
+                        matched = True
+                        break
+                if not matched and algo_id:
+                    try:
+                        await _futures_exchange.exchange.request(
+                            "algoOrder", "fapiPrivate", "DELETE",
+                            params={"algoId": str(algo_id)}
+                        )
+                        cancelled += 1
+                        logger.info(f"[OrphanSweep] Cancelled orphan algo order {algo_id} for {order_symbol_raw} (no exchange position)")
+                    except Exception as ce:
+                        logger.debug(f"[OrphanSweep] Failed to cancel algo {algo_id}: {ce}")
+            if cancelled > 0:
+                logger.info(f"[OrphanSweep] Cancelled {cancelled} orphaned algo orders")
+        except Exception as ae:
+            logger.debug(f"[OrphanSweep] Algo order fetch error: {ae}")
+
+        # Step 3: Ghost-close bot-tracked positions not on exchange
+        if _position_manager:
+            for pos_id, pos in list(_position_manager._positions.items()):
+                if pos.status != "open":
+                    continue
+                if pos.symbol not in exchange_symbols:
+                    logger.warning(
+                        f"[OrphanSweep] Bot tracks {pos.symbol} but exchange has NO position → ghost-closing"
+                    )
+                    try:
+                        current_price = await _position_manager.execution.get_current_price(pos.symbol)
+                        if current_price <= 0:
+                            current_price = pos.entry_price
+                        result = await _position_manager._execute_exit(
+                            pos, current_price, "ghost_close_sync", pos.amount
+                        )
+                        if result and _db is not None:
+                            await _save_trade_to_db(result)
+                            await _db.positions.update_one(
+                                {"id": pos.id},
+                                {"$set": {"status": "closed", "close_reason": "ghost_close_sync"}},
+                            )
+                    except Exception as ge:
+                        logger.debug(f"[OrphanSweep] Ghost-close error for {pos.symbol}: {ge}")
+
+    except Exception as e:
+        logger.debug(f"[OrphanSweep] Sweep error: {e}")
+
+
 async def _get_btc_ticker() -> Optional[dict]:
     try:
         btc_symbol = "BTC/USDT"
@@ -820,6 +1205,53 @@ async def _get_btc_ticker() -> Optional[dict]:
 async def _update_equity():
     """Compute total portfolio NAV: USDT balance + all coin holdings at current market prices."""
     try:
+        # ── Futures mode: use futures wallet, not spot ──────────────────
+        # The spot wallet and futures wallet are separate on Binance.
+        # Reading from spot gives inflated equity (e.g. $10k spot vs $5k futures)
+        # which causes the circuit breaker to false-trip.
+        _is_futures_mode = STATE.get("trading_mode") == "futures" and _futures_exchange
+        if _is_futures_mode:
+            try:
+                fut_balance = await _futures_exchange.exchange.fetch_balance()
+                usdt_info = fut_balance.get("USDT", {})
+                total_usd = float(usdt_info.get("total", 0.0) or 0.0)
+                if total_usd == 0:
+                    total_usd = float(usdt_info.get("free", 0.0) or 0.0)
+                # Add unrealized PnL from open positions
+                raw_positions = await _futures_exchange.exchange.fetch_positions()
+                for fpos in raw_positions:
+                    contracts = abs(float(fpos.get("contracts", 0)))
+                    if contracts > 0:
+                        total_usd += float(fpos.get("unrealizedPnl", 0) or 0)
+                equity = total_usd
+                if equity > 0:
+                    STATE["current_equity"] = equity
+                    if equity > STATE.get("peak_equity", 0):
+                        STATE["peak_equity"] = equity
+                    # Keep risk_manager peak in sync (only increases)
+                    if _risk_manager:
+                        _risk_manager.update_peak_equity(equity)
+                    account_equity.set(equity)
+                    STATE["equity_history"].append({"t": int(time.time()), "v": round(equity, 2)})
+                    if len(STATE["equity_history"]) > 2000:
+                        STATE["equity_history"] = STATE["equity_history"][-2000:]
+                    if _db is not None:
+                        ts_now = int(time.time())
+                        try:
+                            await _db.equity_snapshots.insert_one({"t": ts_now, "v": round(equity, 2)})
+                            cutoff = ts_now - 30 * 86400
+                            await _db.equity_snapshots.delete_many({"t": {"$lt": cutoff}})
+                        except Exception as _dbe:
+                            logger.debug(f"[Equity] DB snapshot error: {_dbe}")
+                return
+            except Exception as fe:
+                # CRITICAL: Do NOT fall through to spot wallet in futures mode.
+                # Spot wallet has ~$10k+ which inflates peak_equity permanently
+                # and creates a drawdown death spiral (50%+ phantom drawdown).
+                logger.warning(f"[Equity] Futures balance error (NOT falling back to spot): {fe}")
+                return
+
+        # ── Spot mode: USDT + coin holdings ─────────────────────────────
         balance = await _exchange.fetch_balance()
 
         # USDT base
@@ -907,6 +1339,7 @@ async def _save_trade_to_db(trade: dict):
         doc = dict(trade)
         doc["exchange"] = cfg.exchange_name
         doc["exchange_mode"] = cfg.exchange_mode
+        doc["trading_mode"] = STATE.get("trading_mode", "spot")
         doc["saved_at"] = int(time.time())
         await _db.trades.insert_one(doc)
     except Exception as e:
@@ -963,16 +1396,31 @@ async def _recover_positions_from_db():
         if not docs:
             return
 
-        # Fetch live exchange balance for amount reconciliation if possible
+        # Fetch live exchange state for amount reconciliation
         live_balances: dict[str, float] = {}
+        _is_futures_recovery = STATE.get("trading_mode") == "futures" and _futures_exchange
+        _live_fetch_ok = False  # True = we successfully queried the exchange
         if _exchange and _uses_exchange_account_state():
             try:
-                raw_balance = await _exchange.fetch_balance()
-                for currency, amounts in raw_balance.items():
-                    if isinstance(amounts, dict):
-                        live_balances[currency] = float(
-                            amounts.get("total", 0) or amounts.get("free", 0) or 0
-                        )
+                if _is_futures_recovery:
+                    # Futures: fetch actual open positions from exchange
+                    raw_positions = await _futures_exchange.exchange.fetch_positions()
+                    for fpos in raw_positions:
+                        contracts = abs(float(fpos.get("contracts", 0)))
+                        if contracts > 0:
+                            fsymbol = fpos.get("symbol", "")
+                            live_balances[fsymbol] = contracts
+                    logger.info(f"[Recovery] Futures positions on exchange: {list(live_balances.keys())}")
+                    _live_fetch_ok = True
+                else:
+                    # Spot: fetch wallet balances
+                    raw_balance = await _exchange.fetch_balance()
+                    for currency, amounts in raw_balance.items():
+                        if isinstance(amounts, dict):
+                            live_balances[currency] = float(
+                                amounts.get("total", 0) or amounts.get("free", 0) or 0
+                            )
+                    _live_fetch_ok = True
             except Exception as e:
                 logger.warning(f"[Recovery] Could not fetch live balances: {e}")
 
@@ -1017,9 +1465,16 @@ async def _recover_positions_from_db():
                 continue
 
             # Reconcile: if exchange shows < 1% of expected amount, position is gone
-            if live_balances:
-                currency = symbol.split("/")[0] if "/" in symbol else symbol
-                live_qty = live_balances.get(currency, 0.0)
+            # NOTE: use _live_fetch_ok (not `if live_balances`) — empty dict {} is
+            # falsy but means "exchange has 0 positions", so all DB entries are ghosts.
+            if _live_fetch_ok:
+                if _is_futures_recovery:
+                    # Futures: live_balances keyed by full symbol (e.g. "BTC/USDT:USDT")
+                    live_qty = live_balances.get(symbol, 0.0)
+                else:
+                    # Spot: live_balances keyed by currency (e.g. "BTC")
+                    currency = symbol.split("/")[0] if "/" in symbol else symbol
+                    live_qty = live_balances.get(currency, 0.0)
                 if live_qty < pos.amount * 0.01:
                     logger.warning(
                         f"[Recovery] {symbol} shows {live_qty:.6f} on exchange "
@@ -1061,6 +1516,16 @@ async def _recover_positions_from_db():
             from src.metrics import active_positions
             active_positions.set(len(_position_manager._positions))
             logger.info(f"[Recovery] ✅ Restored {recovered} open position(s) from DB")
+
+            # Place exchange-side SL orders for recovered futures positions
+            if _is_futures_recovery:
+                for pos in _position_manager._positions.values():
+                    try:
+                        await _position_manager._place_exchange_sl(pos)
+                    except Exception as sl_err:
+                        logger.warning(f"[Recovery] Could not place exchange SL for {pos.symbol}: {sl_err}")
+                logger.info(f"[Recovery] Exchange SL orders placed for {recovered} recovered position(s)")
+
             if _alerts:
                 await _alerts.send(
                     f"♻️ Crash recovery: {recovered} position(s) reloaded from DB.",
@@ -1114,11 +1579,104 @@ async def _recover_positions_from_db():
         except Exception as e:
             logger.debug(f"[Recovery] Orphan order sweep error: {e}")
 
+    # ── Cancel orphaned ALGO orders (futures conditional orders) ────────────
+    # When bot restarts, stale STOP_MARKET algo orders from previous runs
+    # linger on the exchange as GTC. Cancel any that don't match tracked positions.
+    if _futures_exchange and _uses_exchange_account_state() and _position_manager:
+        _is_futures_mode = STATE.get("trading_mode") == "futures"
+        if _is_futures_mode:
+            try:
+                tracked_symbols_raw = {
+                    _futures_exchange.exchange.market(pos.symbol)["id"]
+                    for pos in _position_manager._positions.values()
+                    if pos.status == "open"
+                }
+                open_algo = await _futures_exchange.exchange.request(
+                    "openAlgoOrders", "fapiPrivate", "GET", params={}
+                )
+                if isinstance(open_algo, list) and open_algo:
+                    orphan_algo = [
+                        o for o in open_algo
+                        if o.get("symbol") not in tracked_symbols_raw
+                    ]
+                    if orphan_algo:
+                        logger.warning(
+                            f"[Recovery] Found {len(orphan_algo)} orphaned algo order(s) — cancelling"
+                        )
+                        for ao in orphan_algo:
+                            algo_id = str(ao.get("algoId", ""))
+                            sym = ao.get("symbol", "?")
+                            try:
+                                await _futures_exchange.exchange.request(
+                                    "algoOrder", "fapiPrivate", "DELETE",
+                                    params={"algoId": algo_id},
+                                )
+                                logger.info(
+                                    f"[Recovery] Cancelled orphan algo order {algo_id} for {sym}"
+                                )
+                            except Exception as ce:
+                                logger.debug(f"[Recovery] Could not cancel algo {algo_id}: {ce}")
+            except Exception as e:
+                logger.debug(f"[Recovery] Algo order sweep error: {e}")
+
+    # ── Close orphan futures positions not tracked by bot ──────────────────
+    # When bot restarts, there may be positions on the exchange that the bot
+    # doesn't know about (not in DB or failed recovery). These bleed with NO
+    # stop loss. Close them immediately.
+    if _futures_exchange and _uses_exchange_account_state() and _position_manager:
+        _is_futures_mode = STATE.get("trading_mode") == "futures"
+        if _is_futures_mode:
+            try:
+                tracked_symbols = {
+                    pos.symbol for pos in _position_manager._positions.values()
+                }
+                raw_positions = await _futures_exchange.exchange.fetch_positions()
+                orphan_count = 0
+                for fpos in raw_positions:
+                    contracts = abs(float(fpos.get("contracts", 0)))
+                    if contracts <= 0:
+                        continue
+                    fsymbol = fpos.get("symbol", "")
+                    fside = fpos.get("side", "long")
+                    if fsymbol in tracked_symbols:
+                        continue  # bot is managing this one
+                    # Orphan — close it
+                    pnl = float(fpos.get("unrealizedPnl", 0) or 0)
+                    logger.warning(
+                        f"[Recovery] ORPHAN futures position: {fsymbol} {fside} "
+                        f"{contracts} contracts, PnL=${pnl:.2f} — CLOSING"
+                    )
+                    try:
+                        amount = float(_futures_exchange.exchange.amount_to_precision(fsymbol, contracts))
+                        if fside == "long":
+                            await _futures_exchange.close_long(fsymbol, amount)
+                        else:
+                            await _futures_exchange.close_short(fsymbol, amount)
+                        orphan_count += 1
+                        logger.info(f"[Recovery] Closed orphan {fsymbol} ✅")
+                    except Exception as close_err:
+                        logger.error(f"[Recovery] Failed to close orphan {fsymbol}: {close_err}")
+                if orphan_count > 0:
+                    logger.warning(f"[Recovery] Closed {orphan_count} orphan futures position(s)")
+                    if _alerts:
+                        await _alerts.send(
+                            f"⚠️ Closed {orphan_count} orphan futures position(s) on startup.",
+                            priority="high",
+                        )
+            except Exception as e:
+                logger.error(f"[Recovery] Orphan futures scan failed: {e}")
+
     # ── Seed risk manager trade history from DB so win rate is correct after restart ──
     if _db is not None and _risk_manager is not None:
         try:
+            # In futures mode, only load futures-era trades — old spot trades have
+            # terrible win rates that poison Kelly sizing and trigger safety mode.
+            trade_filter = {"pnl_usd": {"$exists": True}, "exchange": cfg.exchange_name}
+            _trading_mode = STATE.get("trading_mode", "spot")
+            if _trading_mode == "futures":
+                trade_filter["trading_mode"] = "futures"
             cursor = _db.trades.find(
-                {"pnl_usd": {"$exists": True}, "exchange": cfg.exchange_name},
+                trade_filter,
                 {"_id": 0, "pnl_usd": 1, "pnl_pct": 1},
                 sort=[("saved_at", 1)],
                 limit=500,
@@ -1145,7 +1703,13 @@ async def _recover_positions_from_db():
     # ── Restore peak equity from snapshots so drawdown protection survives restarts ──
     # Without this, every restart resets peak_equity to current equity → safety/drawdown
     # mode never triggers across sessions even during persistent NAV declines.
-    if _db is not None and _risk_manager is not None:
+    #
+    # FUTURES MODE EXCEPTION: When trading futures, the old spot-era peak equity
+    # (e.g. $14K from spot wallet) is irrelevant to the futures wallet ($5K).
+    # Restoring it creates a phantom 65% drawdown → 0.15× size multiplier → safety
+    # mode → bot can barely trade.  In futures mode, peak = current equity at startup.
+    _is_futures_recovery = STATE.get("trading_mode") == "futures" and _futures_exchange
+    if _db is not None and _risk_manager is not None and not _is_futures_recovery:
         try:
             peak_cursor = _db.equity_snapshots.find(
                 {}, {"_id": 0, "v": 1}
@@ -1158,6 +1722,23 @@ async def _recover_positions_from_db():
                     logger.info(f"[Recovery] Restored peak equity ${historical_peak:.2f} from snapshots")
         except Exception as e:
             logger.debug(f"[Recovery] Peak equity restore error: {e}")
+    elif _is_futures_recovery and _risk_manager is not None:
+        eq = STATE.get("current_equity", 0)
+        if eq > 0:
+            _risk_manager.peak_equity = eq
+            STATE["peak_equity"] = eq
+            logger.info(f"[Recovery] Futures mode: peak equity reset to current ${eq:,.2f} (ignoring old spot peak)")
+            # Clear old spot-era equity snapshots so total_pnl doesn't show phantom -$7K
+            if _db is not None:
+                try:
+                    del_result = await _db.equity_snapshots.delete_many({})
+                    await _db.equity_snapshots.insert_one({"t": int(time.time()), "v": round(eq, 2)})
+                    logger.info(
+                        f"[Recovery] Cleared {del_result.deleted_count} old equity snapshots, "
+                        f"fresh baseline: ${eq:,.2f}"
+                    )
+                except Exception as e:
+                    logger.debug(f"[Recovery] Equity snapshot reset error: {e}")
 
 
 
@@ -1182,9 +1763,30 @@ async def _get_exchange_account_snapshot() -> dict:
             "exposure_usd": 0.0,
         }
 
-    balance = await _exchange.fetch_balance()
-    usdt = balance.get("USDT", {})
-    cash_usd = _extract_balance_amount(usdt)
+    # ── Futures mode: use futures wallet, not spot ──────────────────────
+    _is_futures_snap = STATE.get("trading_mode") == "futures" and _futures_exchange
+    if _is_futures_snap:
+        try:
+            fut_balance = await _futures_exchange.exchange.fetch_balance()
+            fut_usdt = fut_balance.get("USDT", {})
+            cash_usd = _extract_balance_amount(fut_usdt)
+        except Exception as fe:
+            # CRITICAL: Do NOT fall back to spot wallet in futures mode.
+            # Spot wallet has different balance that inflates peak_equity permanently.
+            logger.warning(f"[Snapshot] Futures balance error (NOT falling back to spot): {fe}")
+            return {
+                "source": "futures_exchange",
+                "equity": STATE.get("current_equity", 0),
+                "cash_usd": 0.0,
+                "open_positions": [],
+                "open_count": 0,
+                "exposure_usd": 0.0,
+            }
+    else:
+        balance = await _exchange.fetch_balance()
+        usdt = balance.get("USDT", {})
+        cash_usd = _extract_balance_amount(usdt)
+
     tracked_by_symbol = {}
     if _position_manager:
         tracked_by_symbol = {
@@ -1193,6 +1795,11 @@ async def _get_exchange_account_snapshot() -> dict:
             if pos.status == "open"
         }
 
+    # ── Futures mode: fetch positions from exchange ──────────────────────
+    if _is_futures_snap:
+        return await _get_futures_account_snapshot(cash_usd, tracked_by_symbol)
+
+    # ── Spot mode: scan coin holdings in balance ────────────────────────
     holdings: list[tuple[str, float]] = []
     markets = _exchange.exchange.markets or {}
     for currency, amounts in balance.items():
@@ -1229,7 +1836,6 @@ async def _get_exchange_account_snapshot() -> dict:
         if current_price <= 0:
             continue
         amount_usd = amount * current_price
-        # Skip dust positions below Gate.io minimum order size
         if amount_usd < 3.0:
             continue
         exposure_usd += amount_usd
@@ -1275,6 +1881,89 @@ async def _get_exchange_account_snapshot() -> dict:
     open_positions.sort(key=lambda item: item["amount_usd"], reverse=True)
     return {
         "source": "exchange",
+        "equity": round(equity, 2),
+        "cash_usd": round(cash_usd, 2),
+        "open_positions": open_positions,
+        "open_count": len(open_positions),
+        "exposure_usd": round(exposure_usd, 2),
+    }
+
+
+async def _get_futures_account_snapshot(cash_usd: float, tracked_by_symbol: dict) -> dict:
+    """Futures-specific snapshot: reads positions from exchange, not coin holdings."""
+    open_positions = []
+    exposure_usd = 0.0
+    equity = cash_usd
+    now = time.time()
+
+    try:
+        raw_positions = await _futures_exchange.exchange.fetch_positions()
+        for pos in raw_positions:
+            contracts = abs(float(pos.get("contracts", 0)))
+            if contracts <= 0:
+                continue
+            symbol = pos.get("symbol", "")
+            side = pos.get("side", "long")
+            entry_price = float(pos.get("entryPrice", 0) or 0)
+            mark_price = float(pos.get("markPrice", 0) or pos.get("lastPrice", 0) or entry_price)
+            notional = float(pos.get("notional", 0) or (contracts * mark_price))
+            unrealized_pnl = float(pos.get("unrealizedPnl", 0) or 0)
+            _raw_leverage = int(float(pos.get("leverage", 0) or 0))
+            # ccxt often returns leverage=0 or 1 on testnet; prefer tracked position's leverage
+            tracked = tracked_by_symbol.get(symbol)
+            if tracked and tracked.leverage > 1:
+                leverage = tracked.leverage
+            elif _raw_leverage > 1:
+                leverage = _raw_leverage
+            else:
+                leverage = cfg.futures_default_leverage or 6  # fallback to configured default
+            margin_usd = abs(notional) / leverage if leverage > 0 else abs(notional)
+
+            exposure_usd += abs(notional)
+            equity += unrealized_pnl
+
+            opened_at = tracked.opened_at if tracked else int(now)
+            posterior = tracked.decision.get("posterior", 0.0) if tracked else 0.0
+            cost_basis = contracts * entry_price if entry_price > 0 else abs(notional)
+            unrealized_pnl_pct = (unrealized_pnl / cost_basis * 100.0) if cost_basis > 0 else 0.0
+
+            open_positions.append({
+                "id": tracked.id if tracked else f"futures-{symbol.replace('/', '-').lower()}",
+                "symbol": symbol,
+                "status": "open",
+                "side": side,
+                "leverage": leverage,
+                "setup_type": tracked.setup_type if tracked else "futures_position",
+                "entry_price": entry_price,
+                "amount": contracts,
+                "amount_usd": round(abs(notional), 4),
+                "margin_usd": round(margin_usd, 4),
+                "current_price": mark_price,
+                "unrealized_pnl_usd": round(unrealized_pnl, 4),
+                "unrealized_pnl_pct": round(unrealized_pnl_pct, 2),
+                "stop_loss": tracked.stop_loss if tracked else 0.0,
+                "take_profit_1": tracked.take_profit_1 if tracked else 0.0,
+                "take_profit_2": tracked.take_profit_2 if tracked else 0.0,
+                "highest_price": tracked.highest_price if tracked else mark_price,
+                "trailing_stop": tracked.trailing_stop if tracked else None,
+                "tier1_done": tracked.tier1_done if tracked else False,
+                "tier2_done": tracked.tier2_done if tracked else False,
+                "pyramid_count": tracked.pyramid_count if tracked else 0,
+                "realized_pnl_usd": tracked.realized_pnl_usd if tracked else 0.0,
+                "total_fees_usd": tracked.total_fees_usd if tracked else 0.0,
+                "opened_at": opened_at,
+                "closed_at": None,
+                "close_reason": None,
+                "hold_time_hours": round((now - opened_at) / 3600.0, 2) if opened_at else 0.0,
+                "posterior": posterior,
+                "source": "futures_exchange",
+            })
+    except Exception as e:
+        logger.warning(f"[Snapshot] Futures positions fetch error: {e}")
+
+    open_positions.sort(key=lambda item: item["amount_usd"], reverse=True)
+    return {
+        "source": "futures_exchange",
         "equity": round(equity, 2),
         "cash_usd": round(cash_usd, 2),
         "open_positions": open_positions,
@@ -1664,6 +2353,14 @@ async def account_snapshot():
     return snapshot
 
 
+@app.get("/api/strategies/status")
+async def strategies_status():
+    """Return status of all trading strategies."""
+    if not _strategy_manager:
+        return {"error": "Strategy manager not initialized"}
+    return _strategy_manager.get_status()
+
+
 @app.get("/api/debug/pipeline")
 async def debug_pipeline():
     """Run a single pipeline trace and return results at each stage."""
@@ -1781,6 +2478,23 @@ async def swarm_stop():
 async def swarm_resume():
     STATE["paused"] = False
     return {"status": "resumed"}
+
+
+@app.post("/api/risk/reset-peak")
+async def reset_peak_equity():
+    """Force-reset peak equity to current equity. Breaks drawdown death spiral
+    caused by stale/inflated peak (e.g. spot wallet bleed-through)."""
+    eq = STATE.get("current_equity", 0)
+    if eq <= 0:
+        return {"error": "No current equity available"}
+    old_peak = STATE.get("peak_equity", 0)
+    STATE["peak_equity"] = eq
+    if _risk_manager:
+        _risk_manager.force_reset_peak(eq)
+    logger.warning(f"[API] Peak equity force-reset: ${old_peak:,.2f} → ${eq:,.2f}")
+    if _alerts:
+        await _alerts.send(f"⚠️ Peak equity reset: ${old_peak:,.2f} → ${eq:,.2f}", priority="medium")
+    return {"status": "ok", "old_peak": round(old_peak, 2), "new_peak": round(eq, 2)}
 
 
 @app.post("/api/swarm/emergency-stop")
