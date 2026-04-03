@@ -31,6 +31,19 @@ class Settings(BaseSettings):
     binance_demo_api_secret: Optional[str] = Field(default=None, alias="BINANCE_DEMO_API_SECRET")
     binance_demo_url: str = Field(default="https://demo-api.binance.com", alias="BINANCE_DEMO_URL")
 
+    # ── Binance Futures Testnet ──────────────────────────────────────────
+    binance_futures_testnet_api_key: Optional[str] = Field(default=None, alias="BINANCE_FUTURES_TESTNET_API_KEY")
+    binance_futures_testnet_api_secret: Optional[str] = Field(default=None, alias="BINANCE_FUTURES_TESTNET_API_SECRET")
+    binance_futures_testnet_url: str = Field(default="https://testnet.binancefuture.com", alias="BINANCE_FUTURES_TESTNET_URL")
+
+    # ── Futures / Leverage ───────────────────────────────────────────────
+    trading_mode: str = Field(default="spot", alias="TRADING_MODE", description="spot | futures")
+    futures_default_leverage: int = Field(default=3, alias="FUTURES_DEFAULT_LEVERAGE")
+    futures_max_leverage: int = Field(default=10, alias="FUTURES_MAX_LEVERAGE")
+    futures_min_leverage: int = Field(default=1, alias="FUTURES_MIN_LEVERAGE")
+    futures_margin_type: str = Field(default="isolated", alias="FUTURES_MARGIN_TYPE", description="isolated | crossed")
+    circuit_breaker_pct: float = Field(default=0.03, alias="CIRCUIT_BREAKER_PCT", description="Day loss % to trigger emergency close. 0.03=3% for spot, use 0.08+ for leveraged futures")
+
     kucoin_api_key: Optional[str] = Field(default=None, alias="KUCOIN_API_KEY")
     kucoin_api_secret: Optional[str] = Field(default=None, alias="KUCOIN_API_SECRET")
     kucoin_passphrase: Optional[str] = Field(default=None, alias="KUCOIN_PASSPHRASE")

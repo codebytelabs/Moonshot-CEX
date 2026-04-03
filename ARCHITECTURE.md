@@ -1,9 +1,9 @@
 # Moonshot-CEX Trading Bot Architecture
 
-**Version:** 2.0  
-**Last Updated:** March 18, 2026  
-**Exchange:** Gate.io (Demo/Live modes supported)  
-**Asset Class:** Cryptocurrency spot trading (CEX)
+**Version:** 3.3  
+**Last Updated:** April 3, 2026  
+**Exchanges:** Binance Futures (primary), Gate.io, KuCoin  
+**Asset Class:** USDT-M Perpetual Futures + Spot (CEX)
 
 ---
 
@@ -25,16 +25,19 @@
 
 ## System Overview
 
-Moonshot-CEX is a **fully autonomous multi-agent trading system** designed for cryptocurrency spot trading on centralized exchanges. The system operates in a continuous cycle, scanning markets, analyzing opportunities, filtering signals through Bayesian inference, managing risk, executing trades, and monitoring positions.
+Moonshot-CEX is a **fully autonomous multi-agent trading system** for cryptocurrency perpetual futures and spot trading on centralized exchanges. The system operates in a continuous 30-second cycle: scanning 548+ markets, analyzing opportunities, filtering signals through Bayesian inference, computing dynamic leverage, sizing positions via regime-aware Half-Kelly, executing trades, and managing the full position lifecycle.
 
 ### Key Characteristics
 
 - **Fully Autonomous**: Operates 24/7 without human intervention once started
-- **Multi-Agent Architecture**: Specialized agents handle distinct responsibilities
-- **Adaptive Strategy**: Regime-aware parameters adjust to market conditions
-- **Professional Execution**: Limit-first order placement with intelligent repricing
-- **Comprehensive Risk Management**: Position sizing, exposure limits, stop losses, trailing stops
-- **Real-time Monitoring**: WebSocket-based dashboard with live updates
+- **Multi-Agent Architecture**: 11 specialized agents handle distinct responsibilities
+- **Dynamic Leverage**: 3x–10x per-trade leverage computed from signal confidence, regime, volume, streak, and funding rate
+- **Regime-Dynamic Sizing**: BigBrother supervisor adjusts max positions (3–8), per-position caps (8–18%), and size multipliers per market regime
+- **Adaptive Strategy**: All parameters adapt in real-time based on detected regime (bull / sideways / bear / choppy)
+- **Professional Execution**: Market entries, limit-first exits, algo stop orders via Binance Futures API
+- **Comprehensive Risk Management**: Conviction-aware Kelly sizing, regime-dynamic caps, drawdown circuit breakers
+- **Self-Tuning**: Bayesian priors update online; QuantMutator adjusts entry thresholds from rolling performance
+- **Real-time Monitoring**: Next.js dashboard with live NAV chart, position panel, regime indicator + WebSocket push
 
 ### Operational Modes
 
@@ -47,58 +50,59 @@ Moonshot-CEX is a **fully autonomous multi-agent trading system** designed for c
 ## Architecture Diagram
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         FRONTEND LAYER                          │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐         │
-│  │  Dashboard   │  │  TinyOffice  │  │   Metrics    │         │
-│  │ (Next.js)    │  │   (Chat)     │  │ (Prometheus) │         │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘         │
-│         │                  │                  │                  │
-│         └──────────────────┼──────────────────┘                  │
-│                            │                                     │
-└────────────────────────────┼─────────────────────────────────────┘
-                             │ WebSocket/HTTP
-┌────────────────────────────┼─────────────────────────────────────┐
-│                         BACKEND LAYER                            │
-│                    (FastAPI + AsyncIO)                           │
-│                            │                                     │
-│  ┌─────────────────────────┴──────────────────────────┐         │
-│  │              TRADING CYCLE ORCHESTRATOR             │         │
-│  │         (15-second continuous loop)                 │         │
-│  └─────────────────────────┬──────────────────────────┘         │
-│                            │                                     │
-│  ┌─────────────────────────┴──────────────────────────┐         │
-│  │                  AGENT PIPELINE                     │         │
-│  │                                                     │         │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐         │         │
-│  │  │ Watcher  │→ │ Analyzer │→ │ Context  │         │         │
-│  │  │  Agent   │  │  Agent   │  │  Agent   │         │         │
-│  │  └──────────┘  └──────────┘  └──────────┘         │         │
-│  │       ↓              ↓              ↓              │         │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐         │         │
-│  │  │ Bayesian │→ │   Risk   │→ │Execution │         │         │
-│  │  │  Filter  │  │ Manager  │  │   Core   │         │         │
-│  │  └──────────┘  └──────────┘  └──────────┘         │         │
-│  │       ↓              ↓              ↓              │         │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐         │         │
-│  │  │Position  │  │BigBrother│  │  Quant   │         │         │
-│  │  │ Manager  │  │Supervisor│  │ Mutator  │         │         │
-│  │  └──────────┘  └──────────┘  └──────────┘         │         │
-│  │                                                     │         │
-│  └─────────────────────────────────────────────────────┘         │
-│                            │                                     │
-└────────────────────────────┼─────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                         FRONTEND LAYER                                │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐               │
+│  │  Dashboard   │  │  TinyOffice  │  │   Metrics    │               │
+│  │ (Next.js 15) │  │  (AI Chat)   │  │ (Prometheus) │               │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘               │
+│         └──────────────────┼──────────────────┘                      │
+│                            │                                         │
+└────────────────────────────┼─────────────────────────────────────────┘
+                             │ WebSocket / REST
+┌────────────────────────────┼─────────────────────────────────────────┐
+│                         BACKEND LAYER                                │
+│                    (FastAPI + AsyncIO)                               │
+│                            │                                         │
+│  ┌─────────────────────────┴───────────────────────────────┐        │
+│  │              TRADING CYCLE ORCHESTRATOR (30s)            │        │
+│  └─────────────────────────┬───────────────────────────────┘        │
+│                            │                                         │
+│  ┌─────────────────────────┴───────────────────────────────┐        │
+│  │                  AGENT PIPELINE                          │        │
+│  │                                                          │        │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐              │        │
+│  │  │ Watcher  │→ │ Analyzer │→ │ Context  │              │        │
+│  │  │ (548+)   │  │(multi-TF)│  │  (LLM)   │              │        │
+│  │  └──────────┘  └──────────┘  └──────────┘              │        │
+│  │       ↓              ↓              ↓                   │        │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐              │        │
+│  │  │ Bayesian │→ │ Leverage │→ │   Risk   │              │        │
+│  │  │  Engine  │  │  Engine  │  │ Manager  │              │        │
+│  │  └──────────┘  │ (3x-10x) │  └──────────┘              │        │
+│  │       ↓        └──────────┘       ↓                     │        │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐              │        │
+│  │  │Execution │→ │Position  │→ │BigBrother│              │        │
+│  │  │  Core    │  │ Manager  │  │Supervisor│              │        │
+│  │  └──────────┘  └──────────┘  └──────────┘              │        │
+│  │       ↓              ↓              ↓                   │        │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐              │        │
+│  │  │  Alerts  │  │  Quant   │  │ Perf     │              │        │
+│  │  │ (Discord)│  │ Mutator  │  │ Tracker  │              │        │
+│  │  └──────────┘  └──────────┘  └──────────┘              │        │
+│  └─────────────────────────────────────────────────────────┘        │
+│                            │                                         │
+└────────────────────────────┼─────────────────────────────────────────┘
                              │
-┌────────────────────────────┼─────────────────────────────────────┐
-│                      DATA & EXCHANGE LAYER                       │
-│                            │                                     │
-│  ┌──────────┐  ┌──────────┴───────┐  ┌──────────┐              │
-│  │ MongoDB  │  │  Exchange (CCXT) │  │  Redis   │              │
-│  │  (Trades │  │   Gate.io API    │  │ (Cache)  │              │
-│  │   & DB)  │  │                  │  │          │              │
-│  └──────────┘  └──────────────────┘  └──────────┘              │
-│                                                                  │
-└──────────────────────────────────────────────────────────────────┘
+┌────────────────────────────┼─────────────────────────────────────────┐
+│                      DATA & EXCHANGE LAYER                           │
+│                            │                                         │
+│  ┌──────────┐  ┌──────────┴───────────┐  ┌──────────┐  ┌────────┐  │
+│  │ MongoDB  │  │ Binance Futures CCXT │  │  Redis   │  │OpenRtr │  │
+│  │ trades,  │  │  USDT-M Perpetuals   │  │  OHLCV   │  │  LLM   │  │
+│  │ history  │  │  + Algo Orders API   │  │  cache   │  │ API    │  │
+│  └──────────┘  └──────────────────────┘  └──────────┘  └────────┘  │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -110,24 +114,24 @@ Moonshot-CEX is a **fully autonomous multi-agent trading system** designed for c
 **Purpose**: Market scanner that identifies potential trading opportunities
 
 **Responsibilities**:
-- Scans configured trading pairs (default: 36 pairs)
+- Scans 548+ USDT perpetual futures pairs
 - Fetches OHLCV data from Redis cache or exchange API
-- Calculates initial technical indicators (RSI, volume ratio, price change)
-- Scores candidates based on momentum, volume, and volatility
+- Calculates 1h price return from 5m candles (up to 35pts — primary momentum signal)
+- Scores candidates based on momentum, volume spike (capped 40pts), and 24h trend (25pts)
 - Filters out low-quality candidates early
+- Regime-aware short-token quota (bear/choppy: top_n//3, bull/sideways: top_n//4)
 
 **Output**: List of candidate symbols with preliminary scores
 
 **Key Metrics**:
-- Scan frequency: Every 15 seconds
-- Pairs monitored: 36 (configurable)
+- Scan frequency: Every 30 seconds
+- Pairs monitored: 548+ (all Binance USDT-M perpetuals)
 - Cache hit rate: ~95% (Redis OHLCV caching)
 
 **Configuration**:
 ```env
-WATCHER_MIN_SCORE=20.0
-WATCHER_MIN_VOL_5M=300.0
-WATCHER_TOP_N_AUDIT=8
+WATCHER_MIN_VOLUME_24H_USD=500000
+ANALYZER_TOP_N=12
 ```
 
 ---
@@ -164,11 +168,15 @@ WATCHER_TOP_N_AUDIT=8
 - Support/resistance levels
 - Volume profile
 
+**Momentum Fast-Track**: Setups with >2% 1h return bypass EMA/MACD gates entirely.
+
+**Timeframe Weights**: 5m: 15%, 15m: 30%, 1h: 35%, 4h: 20%
+
 **Configuration**:
 ```env
-ANALYZER_MIN_SCORE=15.0
-TIER1_R_MULTIPLE=2.0
-TIER2_R_MULTIPLE=5.0
+ANALYZER_TOP_N=12
+TIER1_R_MULTIPLE=1.5
+TIER2_R_MULTIPLE=3.0
 ```
 
 ---
@@ -186,35 +194,33 @@ TIER2_R_MULTIPLE=5.0
 
 **Output**: Enriched setups with context metadata
 
-**Status**: Currently disabled (neutral context used as baseline)
-
 **Configuration**:
 ```env
-CONTEXT_ENABLED=false
-CONTEXT_MODEL=perplexity/sonar-pro-search
+OPENROUTER_API_KEY=...
+OPENROUTER_MODEL=google/gemini-2.5-flash-lite-preview-09-2025
 ```
 
 ---
 
-### 4. Bayesian Filter
+### 4. Bayesian Decision Engine
 
-**Purpose**: Probabilistic decision-making using Bayesian inference
+**Purpose**: Probabilistic decision-making using calibrated Bayesian inference
 
 **Responsibilities**:
-- Applies prior probabilities based on setup type
+- Applies prior probabilities based on setup type (updated online after each closed trade)
 - Calculates likelihoods from TA score, context, volume, and R/R ratio
-- Computes posterior probability for each setup
-- Filters setups below confidence threshold
-- Adapts priors based on historical win rates
+- Computes posterior probability using correct Bayes' theorem
+- Filters setups below regime-aware confidence threshold
+- Win → prior increases; loss → prior decreases (online learning)
 
-**Output**: Approved setups with posterior probabilities
+**Output**: Approved setups with posterior probabilities (used as confidence input to LeverageEngine)
 
 **Decision Formula**:
 ```
 posterior = (prior × ta_likelihood × ctx_likelihood × vol_likelihood × rr_factor) / normalization
 ```
 
-**Priors by Setup Type**:
+**Priors by Setup Type** (initial, adapt online):
 - Breakout: 0.62
 - Momentum: 0.58
 - Pullback: 0.55
@@ -224,8 +230,9 @@ posterior = (prior × ta_likelihood × ctx_likelihood × vol_likelihood × rr_fa
 
 **Configuration**:
 ```env
-BAYESIAN_THRESHOLD=0.22
-BAYESIAN_MODE=normal
+BAYESIAN_THRESHOLD_NORMAL=0.45
+BAYESIAN_THRESHOLD_VOLATILE=0.47
+BAYESIAN_THRESHOLD_SAFETY=0.58
 ```
 
 ---

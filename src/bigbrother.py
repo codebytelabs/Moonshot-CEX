@@ -48,12 +48,15 @@ REGIME_SCALE = {
 # trend-fighting — no need for a blanket capital lockdown.
 # Bull/sideways → full throttle with good TA confirmation.
 REGIME_CAPITAL = {
-    "bull":     {"max_exposure_pct": 0.90, "size_mult": 1.00},
-    "sideways": {"max_exposure_pct": 0.82, "size_mult": 0.92},
-    # BEAR: allow relative-strength longs + short tokens. Bayesian 0.52 + EMA50 gate.
-    "bear":     {"max_exposure_pct": 0.55, "size_mult": 0.65},
-    # CHOPPY: allow breakout longs + short tokens. Highest Bayesian bar (0.55).
-    "choppy":   {"max_exposure_pct": 0.42, "size_mult": 0.55},
+    # max_single_pct: per-position margin as % of equity (dynamic, replaces static .env cap)
+    # Bull: aggressive — 18% per position × 8 slots = up to 144% margin (leveraged)
+    "bull":     {"max_exposure_pct": 0.90, "size_mult": 1.00, "max_single_pct": 0.18},
+    # Sideways: base — 15% per position × 6 slots = up to 90% margin
+    "sideways": {"max_exposure_pct": 0.82, "size_mult": 0.92, "max_single_pct": 0.15},
+    # Bear: cautious — 10% per position × 4 slots = up to 40% margin
+    "bear":     {"max_exposure_pct": 0.55, "size_mult": 0.65, "max_single_pct": 0.10},
+    # Choppy: minimal — 8% per position × 3 slots = up to 24% margin
+    "choppy":   {"max_exposure_pct": 0.42, "size_mult": 0.55, "max_single_pct": 0.08},
 }
 
 # ── Per-regime setup allowlist ─────────────────────────────────────────────────
@@ -85,10 +88,10 @@ CHOPPY_MIN_TA_SCORE = 50.0
 
 # ── Per-regime max concurrent positions ───────────────────────────────────────
 REGIME_MAX_POSITIONS = {
-    "bull":     5,
-    "sideways": 5,
+    "bull":     10,
+    "sideways": 8,
     # BEAR/CHOPPY: fewer, higher-conviction entries only
-    "bear":     3,
+    "bear":     4,
     "choppy":   3,
 }
 
@@ -287,7 +290,8 @@ class BigBrotherAgent:
         return {
             "max_exposure_pct": cap["max_exposure_pct"],
             "size_mult": cap["size_mult"],
-            "max_positions": REGIME_MAX_POSITIONS.get(regime, 5),
+            "max_single_pct": cap.get("max_single_pct", 0.15),
+            "max_positions": REGIME_MAX_POSITIONS.get(regime, 6),
         }
 
     def _detect_regime(self, btc_ticker: Optional[dict], closed_trades: list[dict]) -> str:

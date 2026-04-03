@@ -18,6 +18,7 @@ interface Props {
 }
 
 const EXCHANGE_NOISE = new Set(["exchange_sell", "exchange_fill", "exchange_buy"]);
+const DUST_REASONS = new Set(["stop_loss_dust", "trailing_stop_dust", "closed_dust", "closed_on_restart", "closed_cb_cleanup"]);
 
 function getReasonBadge(reason: string, win: boolean) {
   const r = reason.toLowerCase();
@@ -46,7 +47,10 @@ function getReasonBadge(reason: string, win: boolean) {
 export default function TradeLog({ trades }: Props) {
   const raw = trades as Trade[];
   // Filter out exchange sync noise — show only actual bot-initiated closes
-  const tradeList = raw.filter((t) => !EXCHANGE_NOISE.has((t.close_reason ?? "").toLowerCase()));
+  const tradeList = raw.filter((t) => {
+    const reason = (t.close_reason ?? "").toLowerCase();
+    return !EXCHANGE_NOISE.has(reason) && !DUST_REASONS.has(reason);
+  });
 
   return (
     <div className="h-full panel flex flex-col overflow-hidden">

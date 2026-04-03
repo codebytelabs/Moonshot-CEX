@@ -19,6 +19,7 @@ Usage:
 
 import asyncio
 import argparse
+import math
 import sys
 import os
 
@@ -31,6 +32,23 @@ load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 from loguru import logger
 from src.config import get_settings
 from src.exchange_ccxt import ExchangeConnector
+
+
+def _topup_qty_ceil(exchange: "ExchangeConnector", symbol: str, topup_usd: float, price: float) -> float:
+    """Compute top-up quantity using ceiling rounding so the buy notional always
+    meets the exchange minimum after precision truncation."""
+    raw_qty = topup_usd / price
+    try:
+        market = exchange.exchange.markets.get(symbol, {})
+        precision = (market.get("precision") or {}).get("amount")
+        if precision is not None:
+            step = 10 ** (-int(precision)) if isinstance(precision, int) else float(precision)
+            qty = math.ceil(raw_qty / step) * step
+            dp = max(0, round(-math.log10(step))) if step < 1 else 0
+            return round(qty, dp)
+    except Exception:
+        pass
+    return exchange.cost_to_amount(symbol, topup_usd, price)
 
 
 # Stablecoins and wrapped assets that should never be sold as "dust"
@@ -195,7 +213,7 @@ async def run(dust_threshold: float, min_notional: float, min_value: float, exec
         if needs_topup:
             # How much USD to buy to bring it to min_notional
             topup_usd = min_notional - usd_value + 0.10  # +$0.10 buffer for precision
-            topup_qty = exchange.cost_to_amount(symbol, topup_usd, price)
+            topup_qty = _topup_qty_ceil(exchange, symbol, topup_usd, price)
             sell_qty  = exchange.amount_to_precision(symbol, free + topup_qty)
             topup_cost += topup_usd
 
@@ -233,13 +251,41 @@ async def run(dust_threshold: float, min_notional: float, min_value: float, exec
         price    = item["price"]
 
         try:
-            # Step 1: top-up if needed
-            if item["needs_topup"] and topup_qty > 0:
-                logger.info(f"  [{asset}] Buying {topup_qty:.6f} to meet min notional...")
-                await exchange.create_market_buy(symbol, topup_qty, price)
-                await asyncio.sleep(0.5)  # brief pause for order settlement
+            # Step 1: re-fetch live balance to get accurate pre-buy qty and decide top-up
+            try:
+                pre = await exchange.fetch_balance()
+                live_free = float((pre.get(asset) or {}).get("free") or 0.0)
+                live_usd  = live_free * price
+            except Exception:
+                live_free = item["free"]
+                live_usd  = item["usd_value"]
 
-            # Step 2: sell all
+            # Recompute remaining top-up gap from live balance
+            remaining_gap = max(0.0, min_notional - live_usd)
+
+            if item["needs_topup"] and remaining_gap >= 2.0:
+                # Gap is large enough to place a valid buy order
+                actual_topup_usd = remaining_gap + 0.10
+                actual_topup_qty = _topup_qty_ceil(exchange, symbol, actual_topup_usd, price)
+                logger.info(f"  [{asset}] Buying {actual_topup_qty:.6f} to meet min notional (gap=${remaining_gap:.2f})...")
+                await exchange.create_market_buy(symbol, actual_topup_qty, price)
+                await asyncio.sleep(1.5)  # wait for order to settle into free balance
+            elif item["needs_topup"] and remaining_gap < 2.0:
+                logger.info(f"  [{asset}] Gap=${remaining_gap:.2f} too small to buy, selling existing balance directly...")
+
+            # Step 2: re-fetch actual free balance after any buy
+            try:
+                fresh = await exchange.fetch_balance()
+                actual_free = float((fresh.get(asset) or {}).get("free") or 0.0)
+                if actual_free > 0:
+                    sell_qty = exchange.amount_to_precision(symbol, actual_free)
+                else:
+                    logger.warning(f"  [{asset}] Zero free balance, skipping")
+                    continue
+            except Exception as fe:
+                logger.warning(f"  [{asset}] Balance fetch failed ({fe}), using pre-computed qty")
+
+            # Step 3: sell all
             logger.info(f"  [{asset}] Selling {sell_qty:.6f} at market...")
             await exchange.create_market_sell(symbol, sell_qty)
             logger.info(f"  [{asset}] ✓ Swept ~${item['usd_value']:.2f}")

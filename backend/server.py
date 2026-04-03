@@ -971,11 +971,74 @@ async def _run_cycle():
             regime_max_exposure_pct=_regime_max_exposure,
         )
         if not can_open:
-            trace["steps"].append(f"risk_block:{symbol}:{gate_reason}")
-            logger.info(f"[Swarm] {symbol} blocked: {gate_reason}")
-            # Rejected trade journal — async fire-and-forget, never blocks the cycle
-            asyncio.create_task(_save_rejected_setup_to_db(setup, gate_reason, "risk_gate"))
-            continue
+            # ── Position rotation: replace worst performer with better opportunity ──
+            # When max_positions is the blocker and a strong signal appears,
+            # close the worst-performing losing position to make room.
+            _rotated = False
+            if "max_positions" in gate_reason and _setup_rank_score >= 40.0:
+                try:
+                    _worst_pos = None
+                    _worst_pnl = float("inf")
+                    _worst_price = 0.0
+                    for _p in list(_position_manager._positions.values()):
+                        if _p.status != "open" or _p.setup_type in ("synced_holding", "exchange_holding"):
+                            continue
+                        if _p.hold_time_hours() * 60 < 5.0:
+                            continue
+                        try:
+                            _wp = await _execution.get_current_price(_p.symbol)
+                            if _wp <= 0:
+                                continue
+                            _wpnl = _p.current_pnl_pct(_wp)
+                            if _wpnl < _worst_pnl:
+                                _worst_pnl = _wpnl
+                                _worst_pos = _p
+                                _worst_price = _wp
+                        except Exception:
+                            continue
+
+                    if _worst_pos and _worst_pnl <= -1.5:
+                        logger.info(
+                            f"[ROTATION] Closing {_worst_pos.symbol} "
+                            f"(PnL={_worst_pnl:+.2f}% hold={_worst_pos.hold_time_hours():.1f}h) "
+                            f"→ making room for {symbol} (rank={_setup_rank_score:.1f})"
+                        )
+                        _rot_result = await _position_manager._execute_exit(
+                            _worst_pos, _worst_price, "rotated_out", _worst_pos.amount
+                        )
+                        if _rot_result and _rot_result.get("pnl_usd") is not None:
+                            _rot_pnl = float(_rot_result["pnl_usd"])
+                            _rot_pnl_pct = float(_rot_result.get("pnl_pct", 0))
+                            _risk_manager.record_trade(_rot_pnl, _rot_pnl_pct, 0)
+                            STATE["total_pnl_usd"] += _rot_pnl
+                            STATE["day_pnl_usd"] += _rot_pnl
+                            await _save_trade_to_db(_rot_result)
+                            if _db is not None:
+                                try:
+                                    await _db.positions.update_one(
+                                        {"id": _rot_result.get("id")},
+                                        {"$set": {"status": "closed", "close_reason": "rotated_out"}},
+                                    )
+                                except Exception:
+                                    pass
+                            _bayesian.update_prior(_rot_result.get("setup_type", "neutral"), _rot_pnl > 0)
+                            if _alerts:
+                                await _alerts.send(
+                                    f"🔄 ROTATED OUT {_worst_pos.symbol} (PnL=${_rot_pnl:+.2f} {_rot_pnl_pct:+.1f}%)\n"
+                                    f"Replaced by: {symbol} (rank={_setup_rank_score:.1f})",
+                                    priority="medium",
+                                )
+                            open_syms.discard(_worst_pos.symbol)
+                            _rotated = True
+                            trace["steps"].append(f"rotation:{_worst_pos.symbol}→{symbol}")
+                except Exception as _rot_err:
+                    logger.warning(f"[ROTATION] Failed for {symbol}: {_rot_err}")
+
+            if not _rotated:
+                trace["steps"].append(f"risk_block:{symbol}:{gate_reason}")
+                logger.info(f"[Swarm] {symbol} blocked: {gate_reason}")
+                asyncio.create_task(_save_rejected_setup_to_db(setup, gate_reason, "risk_gate"))
+                continue
 
         # Cash sufficiency check for new entries
         if _uses_exchange_account_state() and size_usd < _MIN_POSITION_USD:

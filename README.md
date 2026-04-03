@@ -1,7 +1,7 @@
 # Moonshot-CEX
 
 > **Fully autonomous multi-agent crypto trading system for centralized exchanges.**  
-> Runs 24/7 on Gate.io, Binance, and KuCoin — paper, demo, or live.
+> Runs 24/7 on Binance Futures, Gate.io, and KuCoin — paper, demo, or live.
 
 ![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.111+-green?logo=fastapi)
@@ -16,15 +16,16 @@
 
 1. [What It Does](#what-it-does)
 2. [Architecture](#architecture)
-3. [Quick Start](#quick-start)
-4. [Configuration](#configuration)
-5. [Trading Modes](#trading-modes)
-6. [API Reference](#api-reference)
-7. [Project Structure](#project-structure)
-8. [Observability](#observability)
-9. [Tests](#tests)
-10. [Safety](#safety)
-11. [Changelog](#changelog)
+3. [Key Systems](#key-systems)
+4. [Quick Start](#quick-start)
+5. [Configuration](#configuration)
+6. [Trading Modes](#trading-modes)
+7. [API Reference](#api-reference)
+8. [Project Structure](#project-structure)
+9. [Observability](#observability)
+10. [Tests](#tests)
+11. [Safety](#safety)
+12. [Changelog](#changelog)
 
 ---
 
@@ -32,60 +33,140 @@
 
 Moonshot-CEX is a **production-grade autonomous trading swarm** that:
 
-- Scans 150+ USDT pairs every 30 seconds for emerging momentum
+- Scans **548+ USDT perpetual futures pairs** every 30 seconds for emerging momentum
 - Runs deep multi-timeframe TA (5m / 15m / 1h / 4h) on top candidates
-- Filters entries through a calibrated Bayesian probabilistic decision engine
-- Sizes positions using **conviction-aware, liquidity-gated Half-Kelly** — high-confidence trades on liquid coins get up to 1.45× capital; borderline trades on illiquid coins as low as 0.26×
-- Manages the full position lifecycle: tiered exits at 2R + 5R, trailing stop, pyramid adds, momentum-loss cuts, and time-based exits
-- Adapts thresholds and exit parameters in real-time based on detected market regime (bull / sideways / bear)
-- Learns online — Bayesian priors update after every closed trade
+- Filters entries through a **calibrated Bayesian probabilistic decision engine** with online prior updates
+- Computes **dynamic leverage (3x–10x)** per trade based on signal confidence, regime, volume, win streak, and funding rate
+- Sizes positions using **regime-dynamic, conviction-aware Half-Kelly** — 15% of wallet per position in sideways, 18% in bull, 10% in bear, 8% in choppy
+- Manages the full position lifecycle: **trailing stops, tiered partial exits (1.5R / 3R), pyramid adds, and time-based exits**
+- Detects market regime in real-time (bull / sideways / bear / choppy) and adapts **all parameters**: sizing, leverage, max positions, stop distances, exit timing
+- **Self-tunes** — Bayesian priors update after every closed trade; QuantMutator adjusts entry thresholds based on rolling performance
+
+### Supported Exchanges & Modes
+
+| Exchange | Spot | Futures (USDT-M) | Demo/Testnet |
+|----------|------|-------------------|--------------|
+| **Binance** | ✅ | ✅ (primary) | ✅ |
+| **Gate.io** | ✅ | ✅ | ✅ |
+| **KuCoin** | ✅ | — | ✅ |
 
 ---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                     MOONSHOT-CEX  v3.0                           │
-│                                                                  │
-│  ┌───────────────┐    ┌────────────────────────────────────────┐ │
-│  │  TinyOffice   │    │          FastAPI Backend                │ │
-│  │  (Chat UI)   │◄──►│          (server.py)                   │ │
-│  └───────────────┘    │  ┌──────────────┐  ┌───────────────┐  │ │
-│                       │  │  SwarmLoop   │  │  REST + WS    │  │ │
-│  ┌───────────────┐    │  │  30s cycle   │  │  API          │  │ │
-│  │  Dashboard    │◄──►│  └──────────────┘  └───────────────┘  │ │
-│  │  (Next.js)   │    │                                        │ │
-│  └───────────────┘    │     AGENT PIPELINE                     │ │
-│                       │  Watcher → Analyzer → ContextAgent     │ │
-│                       │     ↓                                   │ │
-│                       │  BayesianEngine → RiskManager          │ │
-│                       │     ↓                                   │ │
-│                       │  ExecutionCore → PositionManager        │ │
-│                       │     ↓                                   │ │
-│                       │  QuantMutator ← BigBrother → Alerts    │ │
-│                       └────────────────────────────────────────┘ │
-│                                                                  │
-│  ┌──────────┐  ┌──────────┐  ┌──────────────┐  ┌────────────┐  │
-│  │ MongoDB  │  │  Redis   │  │  CCXT/Gate   │  │ OpenRouter │  │
-│  │  state   │  │  cache   │  │  exchange    │  │    LLM     │  │
-│  └──────────┘  └──────────┘  └──────────────┘  └────────────┘  │
-└──────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                      MOONSHOT-CEX  v3.3                               │
+│                                                                      │
+│  ┌───────────────┐    ┌──────────────────────────────────────────┐   │
+│  │  TinyOffice   │    │           FastAPI Backend                 │   │
+│  │  (AI Chat)    │◄──►│           (server.py)                    │   │
+│  └───────────────┘    │  ┌──────────────┐  ┌─────────────────┐   │   │
+│                       │  │  SwarmLoop   │  │  REST + WS API  │   │   │
+│  ┌───────────────┐    │  │  30s cycle   │  │  20+ endpoints  │   │   │
+│  │  Dashboard    │◄──►│  └──────────────┘  └─────────────────┘   │   │
+│  │  (Next.js)    │    │                                          │   │
+│  └───────────────┘    │     AGENT PIPELINE (per cycle)           │   │
+│                       │                                          │   │
+│                       │  1. Watcher ──► 2. Analyzer ──► 3. Context│  │
+│                       │       ↓                                   │   │
+│                       │  4. Bayesian ──► 5. LeverageEngine        │   │
+│                       │       ↓                                   │   │
+│                       │  6. RiskManager ──► 7. ExecutionCore      │   │
+│                       │       ↓                                   │   │
+│                       │  8. PositionManager (tick all open)       │   │
+│                       │       ↓                                   │   │
+│                       │  9. BigBrother ──► 10. QuantMutator       │   │
+│                       │       ↓                                   │   │
+│                       │  11. Alerts ──► 12. WebSocket broadcast   │   │
+│                       └──────────────────────────────────────────┘   │
+│                                                                      │
+│  ┌──────────┐  ┌──────────┐  ┌───────────────┐  ┌────────────┐     │
+│  │ MongoDB  │  │  Redis   │  │ Binance CCXT  │  │ OpenRouter │     │
+│  │ trades   │  │  cache   │  │ Futures API   │  │   LLM      │     │
+│  └──────────┘  └──────────┘  └───────────────┘  └────────────┘     │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Agent Roles
 
 | Agent | File | Role |
 |---|---|---|
-| **WatcherAgent** | `src/watcher.py` | Scans all pairs, ranks by volume + momentum score |
-| **AnalyzerAgent** | `src/analyzer.py` | 5-setup multi-TF TA — RSI, MACD, EMA, ATR, OBV |
-| **ContextAgent** | `src/context_agent.py` | LLM-powered sentiment, catalyst + risk enrichment |
-| **BayesianEngine** | `src/bayesian_engine.py` | Calibrated posterior probability → enter/skip/reject |
-| **ExecutionCore** | `src/execution_core.py` | CCXT order placement, limit-first exits, retries |
-| **PositionManager** | `src/position_manager.py` | Full lifecycle: tiered exits, trailing, pyramid, time |
-| **RiskManager** | `src/risk_manager.py` | Conviction-aware Kelly sizing, drawdown circuit breakers |
-| **QuantMutator** | `src/quant_mutator.py` | Self-tunes Bayesian threshold based on win rate + PnL |
-| **BigBrother** | `src/bigbrother.py` | Regime detector + supervisor — mode management + alerts |
+| **WatcherAgent** | `src/watcher.py` | Scans 548+ pairs, ranks by 1h return + volume + momentum score |
+| **AnalyzerAgent** | `src/analyzer.py` | Multi-TF TA (5m/15m/1h/4h) — RSI, MACD, EMA, ATR, OBV; momentum fast-track |
+| **ContextAgent** | `src/context_agent.py` | LLM-powered sentiment, catalyst + risk enrichment via OpenRouter |
+| **BayesianEngine** | `src/bayesian_engine.py` | Calibrated posterior probability → enter/skip/reject; online prior updates |
+| **LeverageEngine** | `src/leverage_engine.py` | Dynamic leverage 3x–10x based on confidence, regime, volume, streak, funding |
+| **ExecutionCore** | `src/execution_core.py` | CCXT order placement, market entries, limit-first exits, algo stop orders |
+| **PositionManager** | `src/position_manager.py` | Full lifecycle: trailing stops, tiered exits, pyramid adds, time exits |
+| **RiskManager** | `src/risk_manager.py` | Conviction-aware Kelly sizing, regime-dynamic caps, drawdown circuit breakers |
+| **QuantMutator** | `src/quant_mutator.py` | Self-tunes Bayesian threshold + min TA score based on rolling win rate + PnL |
+| **BigBrother** | `src/bigbrother.py` | Regime detector + supervisor — capital deployment, mode management, alerts |
+| **Alerts** | `src/alerts.py` | Discord / Telegram trade notifications and regime change alerts |
+
+---
+
+## Key Systems
+
+### Dynamic Leverage Engine
+
+Every trade gets **individually computed leverage** (3x–10x) based on five weighted factors:
+
+| Factor | Weight | What It Measures |
+|--------|--------|------------------|
+| **Signal Confidence** | 50% | Bayesian posterior × TA score (non-linear power curve) |
+| **Market Regime** | 20% | Bull (1.0) → Sideways (0.55) → Bear (0.25) → Choppy (0.20) |
+| **24h Volume** | 10% | Liquidity proxy — higher volume = safer to lever up |
+| **Win Streak / Drawdown** | 10% | Hot hand → more; drawdown >5% → aggressively reduce |
+| **Funding Rate** | 10% | Expensive funding against direction → reduce leverage |
+
+Account tier safety caps prevent excessive leverage on smaller accounts:
+- **< $2K**: max 5x | **< $10K**: max 8x | **≥ $10K**: full 10x
+
+### Regime-Dynamic Position Sizing
+
+BigBrother detects the market regime every cycle and adjusts **all capital parameters**:
+
+| Regime | Max Per Position | Max Positions | Size Multiplier | Capital Deployed |
+|--------|-----------------|---------------|-----------------|------------------|
+| **Bull** | 18% of equity | 8 | 1.05× | 95% |
+| **Sideways** | 15% of equity | 6 | 0.92× | 82% |
+| **Bear** | 10% of equity | 4 | 0.65× | 55% |
+| **Choppy** | 8% of equity | 3 | 0.50× | 42% |
+
+Position sizing pipeline:
+1. **Half-Kelly base** with conviction, liquidity, and TA multipliers
+2. **Regime size multiplier** scales the base
+3. **Margin cap** = equity × regime `max_single_pct` → notional = margin × leverage
+4. **Cash guard** ensures margin doesn't exceed 92% of available balance
+
+### Exit System
+
+Simplified, battle-tested exit stack (priority order):
+
+| Exit Type | Trigger | Action |
+|-----------|---------|--------|
+| **Stop Loss** | PnL ≤ −3.5% | Full close (market sell) |
+| **Trailing Stop** | Activates at +1.0%, trails 1.0% below peak | Full close (market sell) |
+| **Momentum Faded** | Peak ≥ 3%, gave back 60%+, PnL < 0.5% | Full close |
+| **Time Exit** | Hold > 3h AND PnL ≤ 0% | Full close (losers only) |
+| **Time Exit Max** | Hold > 6h | Full close (hard ceiling) |
+| **Tier 1** | R-multiple ≥ 1.5 | Partial exit (30%) |
+| **Tier 2** | R-multiple ≥ 3.0 | Partial exit (25%) |
+
+All stop/trailing exits use **market sell** for guaranteed fills. Regime scaling adjusts distances (bull: wider, bear: tighter).
+
+### Bayesian Decision Engine
+
+Every candidate setup is scored through Bayes' theorem:
+
+```
+posterior = (prior × ta_likelihood × context_likelihood × volume_likelihood × rr_factor) / normalization
+```
+
+- **Priors** update online after each closed trade (win → prior increases, loss → decreases)
+- **Thresholds** are regime-aware: normal=0.45, volatile=0.47, safety=0.58
+- **QuantMutator** adjusts thresholds dynamically based on rolling performance (bounded 0.40–0.58)
 
 ---
 
@@ -103,7 +184,7 @@ Moonshot-CEX is a **production-grade autonomous trading swarm** that:
 ### Setup
 
 ```bash
-git clone <repo>
+git clone https://github.com/codebytelabs/Moonshot-CEX.git
 cd Moonshot-CEX
 
 # Python backend
@@ -118,13 +199,13 @@ cd tinyclaw/tinyoffice && npm install && cd ../..
 
 # Configure
 cp .env.example .env
-# → Fill in: GATEIO_API_KEY, GATEIO_API_SECRET, OPENROUTER_API_KEY
+# → Fill in: BINANCE_API_KEY, BINANCE_API_SECRET, OPENROUTER_API_KEY
 ```
 
 ### Run
 
 ```bash
-./start_all.sh
+./start_all.sh        # starts backend + frontend + TinyOffice
 ```
 
 | Service | URL |
@@ -135,7 +216,8 @@ cp .env.example .env
 | Metrics | http://localhost:8000/metrics |
 
 ```bash
-./stop_all.sh       # graceful shutdown
+./stop_all.sh         # graceful shutdown (positions stay open)
+./restart_all.sh      # stop + start
 ```
 
 ### Docker (alternative)
@@ -148,53 +230,52 @@ docker compose up -d
 
 ## Configuration
 
-All parameters live in `.env`. The most important sections:
+All parameters live in `.env`. Key sections below — see `.env.example` for all ~120 parameters with inline docs.
 
 ### Exchange
 ```env
-EXCHANGE_NAME=gateio           # gateio | binance | kucoin
-EXCHANGE_MODE=paper            # paper | demo | live
-GATEIO_API_KEY=...
-GATEIO_API_SECRET=...
+EXCHANGE_NAME=binance          # binance | gateio | kucoin
+EXCHANGE_MODE=demo             # paper | demo | live
+BINANCE_API_KEY=...
+BINANCE_API_SECRET=...
 ```
 
-> ⚠️ `INITIAL_EQUITY_USD` is **deprecated** — equity is always fetched live from the exchange at startup. The system refuses to trade until a valid equity value is confirmed.
+> ⚠️ Equity is always fetched live from the exchange at startup. The system refuses to trade until a valid equity value is confirmed from the futures wallet.
 
 ### Risk & Sizing
 ```env
-MAX_POSITIONS=5
-MAX_PORTFOLIO_EXPOSURE_PCT=0.85   # 85% max deployed
-MAX_SINGLE_EXPOSURE_PCT=0.15      # 15% per position (hard cap)
-MAX_RISK_PER_TRADE_PCT=0.10       # 10% risk per trade
-MAX_DRAWDOWN_PCT=0.10
-DAILY_LOSS_LIMIT_PCT=0.03
-CONSECUTIVE_LOSS_THRESHOLD=3
+MAX_POSITIONS=8                    # absolute ceiling (regime overrides lower)
+MAX_PORTFOLIO_EXPOSURE_PCT=0.90    # 90% max deployed
+MAX_SINGLE_EXPOSURE_PCT=0.20       # 20% absolute ceiling (regime caps: 8-18%)
+MAX_RISK_PER_TRADE_PCT=0.08        # 8% risk per trade
+MAX_DRAWDOWN_PCT=0.25              # 25% drawdown halt
+DAILY_LOSS_LIMIT_PCT=0.05          # 5% daily loss limit
+CONSECUTIVE_LOSS_THRESHOLD=5       # pause after 5 consecutive losses
 ```
 
 ### Exit Rules
 ```env
-STOP_LOSS_PCT=-18.0
-TRAILING_STOP_ACTIVATE_PCT=15.0
-TRAILING_STOP_DISTANCE_PCT=8.0
-TAKE_PROFIT_TIER1_R=2.0         # exit 25% at 2R
-TAKE_PROFIT_TIER2_R=5.0         # exit 25% at 5R
-TIME_EXIT_HOURS=24.0
+STOP_LOSS_PCT=-3.5                 # -3.5% hard stop
+TRAILING_STOP_ACTIVATE_PCT=1.0     # trailing activates at +1%
+TRAILING_STOP_DISTANCE_PCT=1.0     # trails 1% below peak
+TAKE_PROFIT_TIER1_R=1.5            # exit 30% at 1.5R
+TAKE_PROFIT_TIER2_R=3.0            # exit 25% at 3.0R
+TIME_EXIT_HOURS=3.0                # close losers after 3h
+SYMBOL_COOLDOWN_MINUTES=120        # 2h cooldown after closing a symbol
 ```
 
 ### Bayesian Thresholds
 ```env
-BAYESIAN_THRESHOLD_NORMAL=0.65
-BAYESIAN_THRESHOLD_VOLATILE=0.75
-BAYESIAN_THRESHOLD_SAFETY=0.85
+BAYESIAN_THRESHOLD_NORMAL=0.45
+BAYESIAN_THRESHOLD_VOLATILE=0.47
+BAYESIAN_THRESHOLD_SAFETY=0.58
 ```
 
 ### LLM (Context Agent)
 ```env
 OPENROUTER_API_KEY=...
-OPENROUTER_MODEL=perplexity/sonar-pro
+OPENROUTER_MODEL=google/gemini-2.5-flash-lite-preview-09-2025
 ```
-
-See `.env.example` for all ~100 parameters with inline descriptions.
 
 ---
 
@@ -203,7 +284,7 @@ See `.env.example` for all ~100 parameters with inline descriptions.
 | Mode | Description |
 |---|---|
 | `paper` | Simulated fills — zero exchange interaction, zero risk |
-| `demo` | Real orders on exchange testnet (Gate.io demo / Binance testnet) |
+| `demo` | Real orders on exchange testnet (Binance Futures testnet / Gate.io demo) |
 | `live` | Full production trading with real capital |
 
 **Always validate with `paper` → `demo` before going `live`.**
@@ -226,10 +307,10 @@ See `.env.example` for all ~100 parameters with inline descriptions.
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/api/portfolio` | Live equity, PnL, open positions |
-| `GET` | `/api/positions` | Open positions (exchange-sourced) |
+| `GET` | `/api/portfolio` | Live equity, PnL, open positions with leverage + margin |
+| `GET` | `/api/positions` | Open positions (exchange-sourced, includes unrealized PnL) |
 | `GET` | `/api/trades` | FIFO-computed realized PnL history |
-| `GET` | `/api/performance` | Rolling 7-day metrics |
+| `GET` | `/api/performance` | Rolling 7-day metrics (win rate, expectancy, Sharpe) |
 
 ### Agents & Feed
 
@@ -237,14 +318,14 @@ See `.env.example` for all ~100 parameters with inline descriptions.
 |---|---|---|
 | `GET` | `/api/agents` | Per-agent health + metrics |
 | `GET` | `/api/feed` | Recent decisions + signals feed |
-| `GET` | `/api/regime` | Current detected regime |
+| `GET` | `/api/regime` | Current detected regime + parameters |
 
 ### Settings
 
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/api/settings` | Current config snapshot |
-| `PATCH` | `/api/settings` | Hot-update strategy params |
+| `PATCH` | `/api/settings` | Hot-update strategy params (no restart needed) |
 
 ### Real-Time
 
@@ -260,53 +341,67 @@ Interactive docs: **http://localhost:8000/docs**
 
 ```
 Moonshot-CEX/
-├── src/                    # Core agent modules (Python 3.11)
-│   ├── config.py           # Pydantic settings — all env vars
-│   ├── exchange_ccxt.py    # CCXT async exchange connector
-│   ├── watcher.py          # Market scanner
-│   ├── analyzer.py         # Multi-TF technical analysis
-│   ├── context_agent.py    # LLM sentiment enrichment
-│   ├── bayesian_engine.py  # Probabilistic decision engine
-│   ├── execution_core.py   # Order placement + limit-first exits
-│   ├── position_manager.py # Position lifecycle management
-│   ├── risk_manager.py     # Kelly sizing + circuit breakers
-│   ├── quant_mutator.py    # Adaptive threshold self-tuning
-│   ├── bigbrother.py       # Regime detection + supervisor
-│   ├── alerts.py           # Discord / Telegram notifications
-│   ├── metrics.py          # Prometheus metric definitions
-│   ├── redis_client.py     # Redis cache wrapper
-│   └── logger.py           # Loguru configuration
+├── src/                        # Core agent modules
+│   ├── config.py               # Pydantic settings — all env vars
+│   ├── exchange_ccxt.py        # CCXT async exchange connector (spot + futures)
+│   ├── watcher.py              # Market scanner (548+ pairs)
+│   ├── analyzer.py             # Multi-TF technical analysis + momentum fast-track
+│   ├── context_agent.py        # LLM sentiment enrichment (OpenRouter)
+│   ├── bayesian_engine.py      # Bayesian decision engine with online prior updates
+│   ├── leverage_engine.py      # Dynamic leverage computation (3x-10x)
+│   ├── execution_core.py       # Order placement — market entries, limit-first exits
+│   ├── position_manager.py     # Position lifecycle — trailing, tiers, pyramid, time
+│   ├── risk_manager.py         # Kelly sizing + regime-dynamic caps + circuit breakers
+│   ├── quant_mutator.py        # Adaptive threshold self-tuning
+│   ├── bigbrother.py           # Regime detection + capital deployment supervisor
+│   ├── strategy_manager.py     # Strategy routing and management
+│   ├── performance_tracker.py  # Rolling performance metrics
+│   ├── alerts.py               # Discord / Telegram notifications
+│   ├── metrics.py              # Prometheus metric definitions
+│   ├── redis_client.py         # Redis cache wrapper
+│   └── logger.py               # Loguru structured logging
 ├── backend/
-│   └── server.py           # FastAPI orchestrator + all endpoints
-├── frontend/               # Next.js 15 dashboard (port 3001)
-├── tinyclaw/               # TinyOffice AI chat (port 3000)
-├── tests/                  # Pytest test suite
+│   └── server.py               # FastAPI orchestrator — 12-step cycle + 20+ endpoints
+├── frontend/                   # Next.js 15 dashboard (port 3001)
+│   └── src/
+│       ├── app/                # Pages: dashboard, positions, agents, settings, chat
+│       └── components/         # NavChart, PositionsPanel, RegimePanel, TradeLog, etc.
+├── tinyclaw/                   # TinyOffice AI chat interface (port 3000)
+├── scripts/                    # Utility scripts (backtest, dust cleaner, close positions)
+├── tests/                      # Pytest test suite (unit + integration + futures e2e)
 ├── docker-compose.yml
 ├── requirements.txt
 ├── .env.example
-├── start_all.sh
-├── stop_all.sh
+├── start_all.sh / stop_all.sh / restart_all.sh
 ├── README.md
-├── PRODUCT.md
-├── TECHNICAL.md
-└── ARCHITECTURE.md
+├── ARCHITECTURE.md             # Detailed system architecture
+├── PRODUCT.md                  # Product specification
+├── TECHNICAL.md                # Technical deep-dive
+└── CHANGELOG.md                # Full version history
 ```
 
 ---
 
 ## Observability
 
-| Layer | Tool | URL |
+| Layer | Tool | Details |
 |---|---|---|
-| Metrics | Prometheus | http://localhost:8000/metrics |
-| API Docs | OpenAPI/Swagger | http://localhost:8000/docs |
-| Logs | Loguru → file | `logs/backend.log`, `logs/frontend.log` |
-| DB | MongoDB | `positions`, `trades`, `agent_events` collections |
-| Cache | Redis | OHLCV, ticker, context caches |
-| Alerts | Discord / Telegram | Configured via `.env` |
+| **Metrics** | Prometheus | http://localhost:8000/metrics |
+| **API Docs** | OpenAPI/Swagger | http://localhost:8000/docs |
+| **Logs** | Loguru → file | `logs/backend.log` — structured, rotated, with leverage + sizing traces |
+| **Database** | MongoDB | `positions`, `trades`, `agent_events`, `equity_history` collections |
+| **Cache** | Redis | OHLCV, ticker, context caches (5-min TTL, ~95% hit rate) |
+| **Alerts** | Discord / Telegram | Trade open/close, regime changes, circuit breaker trips |
+| **Dashboard** | Next.js | Live NAV chart, positions panel, agent status, regime indicator |
 
 **Key Prometheus metrics:**  
 `account_equity` · `active_positions` · `current_drawdown` · `win_rate` · `decisions_made_total{outcome}` · `signals_generated_total{agent}` · `cycle_duration_seconds`
+
+**Key log traces (per trade):**
+```
+[LevEngine] lev=8x | conf=0.77 reg=0.55 vol=1.00 streak=0.50 fund=0.90 composite=0.735
+[Sizing] CHR/USDT:USDT FINAL notional=$5969 margin=$853 (lev=7x cap=15% regime=sideways)
+```
 
 ---
 
@@ -318,82 +413,72 @@ pytest tests/ -v
 
 # With coverage
 pytest tests/ --cov=src --cov-report=term-missing
+
+# Futures-specific tests
+pytest tests/test_futures_e2e.py tests/test_futures_integration.py -v
 ```
 
 | Test File | Coverage |
 |---|---|
-| `tests/test_risk_manager.py` | Conviction sizing, circuit breakers, Kelly |
-| `tests/test_bayesian_engine.py` | Posterior calculation, prior updates |
-| `tests/test_position_manager.py` | Stop loss, tier exits, close all |
+| `tests/test_risk_manager.py` | Conviction sizing, Kelly, circuit breakers, regime caps |
+| `tests/test_bayesian_engine.py` | Posterior calculation, prior updates, threshold gating |
+| `tests/test_position_manager.py` | Stop loss, trailing, tier exits, time exits, pyramid |
 | `tests/test_api.py` | FastAPI endpoint integration |
+| `tests/test_futures_e2e.py` | End-to-end futures order flow |
+| `tests/test_futures_integration.py` | Futures wallet, leverage, margin verification |
+| `tests/test_stop_loss_order.py` | Algo stop order placement via Binance API |
 
 ---
 
 ## Safety
 
-- **Never run live without paper + demo testing first**
-- API keys need **Spot Trading** only — disable withdrawals
-- All secrets in `.env` — never commit to git (`.gitignore` enforced)
-- Emergency stop via dashboard button or `POST /api/swarm/emergency-stop`
-- Hard circuit breakers: daily loss limit, max drawdown, consecutive loss pause
+- **Never run live without paper → demo validation first**
+- API keys: enable **Futures Trading** only — **disable withdrawals**
+- All secrets in `.env` — never committed (`.gitignore` enforced)
+- Emergency stop: dashboard button or `POST /api/swarm/emergency-stop`
+- **Circuit breakers**: daily loss limit (5%), max drawdown (25%), consecutive loss pause (5 losses → 20 min)
+- **Account tier safety**: leverage capped by equity size (< $2K → max 5x, < $10K → max 8x)
 - Exchange equity fetched and verified before any trade is allowed
+- Futures positions recovered from exchange on restart (no orphaned positions)
+- Market sell for all stop-loss and trailing-stop exits (guaranteed fills)
 
 ---
 
 ## Changelog
 
-> Full version history with detailed bug fixes, strategy changes, and configuration overhauls:  
-> **[→ See CHANGELOG.md](./CHANGELOG.md)**
+> Full version history: **[→ CHANGELOG.md](./CHANGELOG.md)**
 
----
+### v3.3 — April 2026 (Current) — Dynamic Leverage & Regime-Dynamic Sizing
 
-### v3.2 — March 23, 2026 (Current) — Profitability Overhaul
+- **Dynamic Leverage Engine** (`src/leverage_engine.py`): 3x–10x per-trade leverage based on signal confidence (50%), regime (20%), volume (10%), win streak (10%), funding rate (10%); non-linear power curve amplifies quality differences; account tier safety caps
+- **Regime-dynamic position sizing**: BigBrother sets per-regime `max_single_pct` (bull=18%, sideways=15%, bear=10%, choppy=8%) and max positions (8/6/4/3); server.py uses regime caps instead of static config
+- **Bayesian posterior as confidence input** to leverage engine (was static 0.65 fallback)
+- **Per-trade sizing + leverage logs**: `[Sizing] FINAL notional=$ margin=$ (lev=Xx cap=X% regime=X)`
+- Updated `.env` defaults: `MAX_POSITIONS=8`, `MAX_SINGLE_EXPOSURE_PCT=0.20` (absolute ceiling)
 
-**Mission:** Stop the bleeding. Root cause analysis identified 10+ systematic issues. All fixed.
+### v3.2 — March 2026 — Profitability Overhaul
 
-**Bug Fixes**
-- `is_aggressive` flag permanently `False` in all regimes (read `max_exposure_pct` from wrong dict) — fixed to use explicit regime name check
-- Bayesian threshold **inverted** in `.env`: `VOLATILE=0.38` (easier than normal `0.45`) — now `0.52` (stricter)
-- `momentum_recheck_interval_minutes` never wired from config to `PositionManager` — always defaulted to 5 min regardless of config
-- `MAX_DRAWDOWN_PCT` duplicated in `.env` (25.0 + 0.35) — first value effectively disabled drawdown protection
-- `MAX_DAILY_LOSS_USD=5.0` — $5/day cap halting the bot after one normal fill; removed
-- `.env` overriding all `config.py` threshold fixes silently
-
-**Strategy Changes**
-- Bear/choppy: **dual-side trading** — `breakout`/`momentum` longs + short tokens simultaneously (was: short tokens only, capital starved to 15-20%)
-- Capital raised: bear `20% → 55%`, choppy `15% → 42%`, sideways `75% → 82%`
-- **4h EMA50 trend gate**: long entries blocked if token is below its own 4h EMA50 (per-token relative-strength filter)
-- **Minimum 2% stop distance**: ATR stops below 2% widened — prevents noise stop-outs on sub-1% stops
-- Exit timing extended for bull/sideways: `no_traction` 15min/-0.5% → 30min/-2.0%; `momentum_stall` 30min/-1.0% → 45min/-2.5%
-- Watcher short-token quota: regime-aware (`top_n//3` in bear/choppy vs `top_n//4` in bull/sideways)
-- `analyzer_top_n`: `5 → 12` — pipeline needs more candidates to fill 6-10 positions after EMA50 filtering
-- `CONSECUTIVE_LOSS_PAUSE_MINUTES`: `3 → 15`
-
----
+- Root cause analysis of 10+ systematic bugs; all fixed
+- Simplified exit system: removed 7 underperforming momentum exits; trailing stop lowered to +1% activate / 1% trail
+- Time exit only kills losers (profitable positions hold until trailing stop or tier exit)
+- Quant Mutator threshold floors raised to prevent over-trading
+- Bear/choppy dual-side trading; 4h EMA50 trend gate; momentum fast-track in analyzer
 
 ### v3.1 — March 2026 — Capital Deployment Overhaul
 
-- Kelly sizing floor fixed: fallback used `max_risk_per_trade` (tiny) not `max_single_exposure` (20%)
-- `detect_account_tier()` now called on every sizing computation (was stale from init)
-- Min order floor: `$10 → $50`
-- `MAX_PORTFOLIO_EXPOSURE_PCT: 0.85 → 0.95`, `MAX_SINGLE_EXPOSURE_PCT: 0.15 → 0.25`
+- Kelly sizing floor fix; account tier detection per-computation; min order $50
+- Exposure limits updated for regime-aware deployment
 
----
+### v3.0 — March 2026 — Exchange-First Architecture
 
-### v3.0 — March 2026
-
-- Exchange-first data architecture; FIFO realized PnL; conviction/liquidity/TA multipliers in sizing
-- Bayesian engine: correct Bayes theorem replaces `× 6.5` normalisation
-- Frontend NAV Chart with Session/1H/6H/1D/7D intervals
-
----
+- Exchange-first data; FIFO realized PnL; conviction/liquidity/TA multipliers in sizing
+- Correct Bayesian inference replaces heuristic normalization
+- Next.js dashboard with NAV chart (Session/1H/6H/1D/7D)
 
 ### v2.0 — March 2026
 
-- Exchange holdings get stop loss + trailing stop + time exit; limit-first exit execution; symbol cooldowns
-
----
+- Exchange holdings protection (stop loss + trailing + time exit); limit-first exits; symbol cooldowns
 
 ### v1.0 — Initial Release
 
-- Multi-agent swarm, Paper/demo/live modes, Gate.io/Binance/KuCoin, Next.js dashboard, MongoDB + Redis
+- Multi-agent swarm; paper/demo/live modes; Gate.io/Binance/KuCoin; Next.js dashboard; MongoDB + Redis
