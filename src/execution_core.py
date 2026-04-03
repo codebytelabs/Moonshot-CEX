@@ -606,9 +606,20 @@ class FuturesExecutionCore(ExecutionCore):
                 }
 
             except SubMinimumAmountError:
-                logger.warning(f"[FuturesExec] {symbol}: order size rejected by exchange (dust/max qty) — not retrying")
+                logger.warning(f"[FuturesExec] {symbol}: order size below exchange minimum — not retrying")
                 raise
             except Exception as e:
+                _err_str = str(e)
+                # ── Max quantity exceeded (-4005): halve amount and retry ──
+                # _clamp_amount should prevent this, but Binance testnet may
+                # not expose maxQty in market data.  Halving is a safe fallback.
+                if "-4005" in _err_str or "max quantity" in _err_str.lower():
+                    amount = amount / 2
+                    logger.warning(
+                        f"[FuturesExec] {symbol}: max qty exceeded, "
+                        f"halving to {amount:.2f} tokens (attempt {attempt+1})"
+                    )
+                    continue  # retry immediately with smaller amount
                 logger.warning(f"[FuturesExec] Entry attempt {attempt+1} failed for {symbol}: {e}")
                 errors_total.labels(component="futures_execution", error_type="order_failed").inc()
                 if attempt < self.max_retries - 1:
