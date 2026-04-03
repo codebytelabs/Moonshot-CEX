@@ -1770,9 +1770,38 @@ async def _recover_positions_from_db():
             active_positions.set(len(_position_manager._positions))
             logger.info(f"[Recovery] ✅ Restored {recovered} open position(s) from DB")
 
-            # Place exchange-side SL orders for recovered futures positions
+            # Place exchange-side SL orders for recovered futures positions.
+            # First cancel ALL existing algo orders for these symbols to prevent
+            # duplicates (old orders from previous session that weren't cleaned up).
             if _is_futures_recovery:
+                try:
+                    open_algo_orders = await _futures_exchange.exchange.request(
+                        "openAlgoOrders", "fapiPrivate", "GET", params={}
+                    )
+                    orders_list = open_algo_orders if isinstance(open_algo_orders, list) else open_algo_orders.get("orders", [])
+                    # Build set of recovered symbols in raw Binance format
+                    recovered_raw = set()
+                    for pos in _position_manager._positions.values():
+                        raw = pos.symbol.replace("/", "").replace(":USDT", "")
+                        recovered_raw.add(raw)
+                    _cancelled_old = 0
+                    for order in orders_list:
+                        if order.get("symbol", "") in recovered_raw:
+                            try:
+                                await _futures_exchange.exchange.request(
+                                    "algoOrder", "fapiPrivate", "DELETE",
+                                    params={"algoId": str(order["algoId"])}
+                                )
+                                _cancelled_old += 1
+                            except Exception:
+                                pass
+                    if _cancelled_old > 0:
+                        logger.info(f"[Recovery] Cancelled {_cancelled_old} stale algo orders before re-placing")
+                except Exception as sweep_err:
+                    logger.debug(f"[Recovery] Pre-sweep of algo orders failed: {sweep_err}")
+
                 for pos in _position_manager._positions.values():
+                    pos.exchange_sl_order_id = None  # cleared — old orders just cancelled
                     try:
                         await _position_manager._place_exchange_sl(pos)
                     except Exception as sl_err:

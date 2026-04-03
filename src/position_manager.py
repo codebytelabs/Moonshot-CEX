@@ -196,24 +196,48 @@ class PositionManager:
         return getattr(self.execution, "futures_exchange", None)
 
     async def _place_exchange_sl(self, pos: Position) -> None:
-        """Place a STOP_MARKET order on the exchange for this position."""
+        """Place a STOP_MARKET order on the exchange for this position.
+
+        Uses trailing_stop when available (tighter than original SL) so that
+        trailing progress is preserved across restarts. Cancels any existing
+        exchange SL first to prevent duplicate orders.
+        """
         fc = self._get_futures_exchange()
         if fc is None or not hasattr(fc, "place_stop_loss_order"):
             return  # spot mode — no exchange SL
         if pos.stop_loss <= 0:
             return
+
+        # Cancel existing exchange SL to prevent duplicates on restart/recovery
+        if pos.exchange_sl_order_id:
+            try:
+                await fc.cancel_stop_loss_order(pos.symbol, pos.exchange_sl_order_id)
+                logger.info(f"[PM] Cancelled old exchange SL before re-placing: {pos.symbol} algoId={pos.exchange_sl_order_id}")
+            except Exception:
+                pass  # old order may already be gone
+
+        # Use trailing_stop if it's set and tighter than original SL
+        # This preserves trailing progress across restarts
+        effective_stop = pos.stop_loss
+        if pos.trailing_stop is not None:
+            if pos.side == "long" and pos.trailing_stop > pos.stop_loss:
+                effective_stop = pos.trailing_stop
+            elif pos.side == "short" and pos.trailing_stop < pos.stop_loss:
+                effective_stop = pos.trailing_stop
+
         try:
             order = await fc.place_stop_loss_order(
                 symbol=pos.symbol,
                 side=pos.side,
                 amount=pos.amount,
-                stop_price=pos.stop_loss,
+                stop_price=effective_stop,
             )
             if order:
                 pos.exchange_sl_order_id = order.get("id")
+                _label = "trailing" if effective_stop != pos.stop_loss else "entry SL"
                 logger.info(
                     f"[PM] Exchange SL placed: {pos.symbol} {pos.side} "
-                    f"stop={pos.stop_loss:.6f} order_id={pos.exchange_sl_order_id}"
+                    f"stop={effective_stop:.6f} ({_label}) order_id={pos.exchange_sl_order_id}"
                 )
         except Exception as e:
             logger.warning(f"[PM] Failed to place exchange SL for {pos.symbol}: {e}")
@@ -1053,6 +1077,10 @@ class PositionManager:
                         f"new_entry={pos.entry_price:.6f} new_sl={pos.stop_loss:.6f} "
                         f"pyramid={pos.pyramid_count}/2"
                     )
+                    # Update exchange SL to reflect new amount and SL price.
+                    # Without this, old stop has stale amount → partial protection.
+                    _eff_stop = pos.trailing_stop if (pos.trailing_stop and pos.trailing_stop > pos.stop_loss) else pos.stop_loss
+                    await self._update_exchange_sl(pos, _eff_stop)
                 return "scaled_up"
             except Exception as e:
                 logger.error(f"[PM] Scale-up failed for {pos.symbol}: {e}")
