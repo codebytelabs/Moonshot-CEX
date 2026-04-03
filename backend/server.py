@@ -505,12 +505,14 @@ async def _run_cycle():
     equity = STATE.get("current_equity", 0)
     _today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if cycle <= _CB_GRACE_CYCLES:
-        # Anchor ONCE at cycle 1 — before positions inflate equity with unrealized PnL.
+        # Anchor at cycle 1 ONLY — before positions inflate equity with unrealized PnL.
         # Do NOT re-anchor on later grace cycles (that's what caused the $5,353 phantom).
-        if equity > 0 and "_cb_day_start_equity" not in STATE:
+        # Use cycle == 1 (not "key not in STATE") because STATE initializes the key to 0.0.
+        if cycle == 1 and equity > 0:
             STATE["_cb_day_start_equity"] = equity
             STATE["_cb_day_date"] = _today_str
             STATE["_circuit_breaker_tripped"] = False
+            logger.info(f"[CIRCUIT BREAKER] Anchored start equity ${equity:.2f}")
         if cycle == _CB_GRACE_CYCLES:
             _cb_anchor = STATE.get("_cb_day_start_equity", equity)
             logger.info(f"[CIRCUIT BREAKER] Armed after {_CB_GRACE_CYCLES} cycles — start equity ${_cb_anchor:.2f} threshold={_CB_THRESHOLD:.0%}")
