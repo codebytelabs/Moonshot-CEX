@@ -445,6 +445,39 @@ class WatcherAgent:
             trend_pts = 0.0  # flat/negative already pre-filtered for longs
         score += trend_pts
         score_breakdown["trend_24h"] = trend_pts
+
+        # ── ANTI-CHASE: pullback from recent high penalty ────────────────
+        # If price has already peaked and is pulling back, the pump is OVER.
+        # Check: high of last 12 5m candles (= 1 hour) vs current close.
+        # >2% pullback = distribution underway → heavy penalty.
+        # This prevents entering DUSDT-style pump-and-dump tops.
+        if len(candles_np) >= 12:
+            recent_highs = candles_np[-12:, 2].astype(float)  # column 2 = high
+            recent_high = float(np.max(recent_highs))
+            if recent_high > 0 and closes[-1] > 0:
+                pullback_pct = (recent_high - closes[-1]) / recent_high * 100.0
+                if pullback_pct >= 5.0:
+                    chase_penalty = -35.0
+                elif pullback_pct >= 3.0:
+                    chase_penalty = -25.0
+                elif pullback_pct >= 2.0:
+                    chase_penalty = -15.0
+                elif pullback_pct >= 1.0:
+                    chase_penalty = -8.0
+                else:
+                    chase_penalty = 0.0
+                score += chase_penalty
+                score_breakdown["anti_chase"] = chase_penalty
+
+        # ── ANTI-CHASE: bearish candle sequence penalty ──────────────────
+        # If last 3 of 4 candles are RED, momentum has flipped bearish.
+        # Don't enter long into active selling pressure.
+        if len(closes) >= 5 and not inverted:
+            red_count = sum(1 for i in range(-4, 0) if closes[i] < closes[i - 1])
+            if red_count >= 3:
+                red_penalty = -12.0
+                score += red_penalty
+                score_breakdown["bearish_candles"] = red_penalty
         price = ticker.get("last") or 0.0
         vol_usd = candidate["vol_usd"]
         setup_type = "momentum_short" if inverted else "momentum"

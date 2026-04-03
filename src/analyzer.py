@@ -125,21 +125,62 @@ class AnalyzerAgent:
                     )
                     return None
 
-        # ── Momentum fast-track: >2% 1h return bypasses EMA/MACD gates ────────
-        # When price is ACTUALLY pumping, lagging TA indicators (EMA cross, MACD)
-        # haven't confirmed yet. The price pump IS the signal — don't let slow
-        # indicators block the best momentum entries (SOL +5%, BTC +3%, etc.).
+        # ── ANTI-CHASE: hard pullback-from-high gate ──────────────────────────
+        # If price has already peaked and pulled back >3% from recent high,
+        # the pump is OVER — do NOT enter regardless of other signals.
+        # This is the #1 fix for DUSDT/PROMPTUSDT "bought the top" entries.
         _closes_5m = data_5m[:, 4]
+        _highs_5m = data_5m[:, 2]
+        if direction == "long" and len(_highs_5m) >= 12:
+            _recent_high = float(np.max(_highs_5m[-12:]))
+            _current = float(_closes_5m[-1])
+            if _recent_high > 0:
+                _pullback_pct = (_recent_high - _current) / _recent_high * 100.0
+                if _pullback_pct >= 3.0:
+                    logger.info(
+                        f"[Analyzer] {symbol} BLOCKED: price {_current:.6f} is {_pullback_pct:.1f}% "
+                        f"below 1h high {_recent_high:.6f} — pump already topped"
+                    )
+                    return None
+
+        # ── Momentum fast-track: >2% 1h return bypasses EMA/MACD gates ────────
+        # When price is ACTUALLY pumping NOW, lagging indicators haven't confirmed.
+        # But fast-track must verify the move is STILL ACTIVE — not a completed pump.
+        # Exhaustion checks prevent entering dying pumps (DUSDT/PROMPTUSDT pattern).
         _fast_track = False
         _return_1h = 0.0
         if len(_closes_5m) >= 13:
             _return_1h = (_closes_5m[-1] - _closes_5m[-13]) / _closes_5m[-13] * 100.0
             if _return_1h >= 2.0:
-                _fast_track = True
-                logger.info(
-                    f"[Analyzer] {symbol} FAST-TRACK: 1h return +{_return_1h:.1f}% — "
-                    f"bypassing EMA/MACD gates"
-                )
+                # Exhaustion check 1: price must be within 1.5% of recent 1h high
+                # If it's already pulled back more, the move is dying
+                _ft_high = float(np.max(_highs_5m[-12:])) if len(_highs_5m) >= 12 else _closes_5m[-1]
+                _ft_pullback = (_ft_high - _closes_5m[-1]) / _ft_high * 100.0 if _ft_high > 0 else 0
+                _ft_near_high = _ft_pullback < 1.5
+
+                # Exhaustion check 2: last 2 of 3 candles must be green
+                # If candles are red, selling pressure has started — move is over
+                _ft_green_count = 0
+                if len(_closes_5m) >= 4:
+                    _ft_green_count = sum(1 for i in range(-3, 0) if _closes_5m[i] > _closes_5m[i - 1])
+                _ft_candles_ok = _ft_green_count >= 2
+
+                # Exhaustion check 3: 5m RSI should not be plummeting from overbought
+                _ft_rsi = _compute_rsi(_closes_5m, 14) if len(_closes_5m) >= 15 else 50.0
+                _ft_rsi_ok = _ft_rsi < 78 or _ft_rsi > 55  # allow momentum zone, block if crashing
+
+                if _ft_near_high and _ft_candles_ok:
+                    _fast_track = True
+                    logger.info(
+                        f"[Analyzer] {symbol} FAST-TRACK: 1h return +{_return_1h:.1f}% "
+                        f"pullback={_ft_pullback:.1f}% green={_ft_green_count}/3 RSI={_ft_rsi:.0f} — approved"
+                    )
+                else:
+                    logger.info(
+                        f"[Analyzer] {symbol} FAST-TRACK DENIED: 1h return +{_return_1h:.1f}% "
+                        f"but pullback={_ft_pullback:.1f}% green={_ft_green_count}/3 RSI={_ft_rsi:.0f} — "
+                        f"pump exhausting, applying normal gates"
+                    )
 
         # ── EMA alignment: 1h OR 15m EMA9 > EMA21 ────────────────────────────
         # Momentum tokens breaking out on 15m may not yet show 1h EMA9>EMA21 (lagging).
@@ -159,20 +200,31 @@ class AnalyzerAgent:
                 logger.debug(f"[Analyzer] {symbol} filtered: neither 1h nor 15m EMA9>EMA21")
                 return None
 
-        # ── RSI gate: 40-92, allows full momentum zone including peak ──────────
-        # RSI 70-90 = PEAK MOMENTUM ZONE. SOL pumping 5% sits at RSI 85+.
-        # Old 82 cap REJECTED the best momentum trades. Only block true parabolic
-        # blowoffs (>92) where mean reversion is almost certain.
+        # ── RSI gate: 40-80, block overbought entries ─────────────────────────
+        # RSI 70-80 = strong momentum (still OK to enter).
+        # RSI >80 = overbought — entering here is chasing completed moves.
+        # Old 92 cap was way too permissive — allowed entries into parabolic tops.
+        # Fast-track can push to 85 (genuine early breakouts can spike RSI fast).
         if direction == "long" and "1h" in tf_data:
             _c1h_rsi = tf_data["1h"][:, 4]
             if len(_c1h_rsi) >= 14:
                 rsi_1h = _compute_rsi(_c1h_rsi, 14)
-                if rsi_1h > 92:
-                    logger.debug(f"[Analyzer] {symbol} filtered: 1h RSI {rsi_1h:.1f} > 92 (parabolic blowoff)")
+                _rsi_cap = 85.0 if _fast_track else 80.0
+                if rsi_1h > _rsi_cap:
+                    logger.info(f"[Analyzer] {symbol} filtered: 1h RSI {rsi_1h:.1f} > {_rsi_cap:.0f} (overbought)")
                     return None
                 if rsi_1h < 40 and not _fast_track:
                     logger.debug(f"[Analyzer] {symbol} filtered: 1h RSI {rsi_1h:.1f} < 40 (no momentum)")
                     return None
+                # Check for declining RSI from overbought: distribution signal
+                if len(_c1h_rsi) >= 16 and not _fast_track:
+                    _rsi_prev = _compute_rsi(_c1h_rsi[:-2], 14)
+                    if _rsi_prev > 75 and rsi_1h < _rsi_prev - 3:
+                        logger.info(
+                            f"[Analyzer] {symbol} filtered: 1h RSI declining from overbought "
+                            f"({_rsi_prev:.1f} → {rsi_1h:.1f}) — distribution"
+                        )
+                        return None
 
         # ── MACD confirmation: hist > 0 OR rising ─────────────────────────────
         # hist > 0 = confirmed momentum. hist rising (crossing from below) = momentum STARTING.
