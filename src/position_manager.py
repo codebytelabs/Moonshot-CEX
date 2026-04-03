@@ -27,6 +27,7 @@ class Position:
         decision: dict = None,
         entry_fill: dict = None,
         side: str = "long",
+        leverage: int = 1,
     ):
         self.id = str(uuid.uuid4())[:8]
         self.symbol = symbol
@@ -40,6 +41,7 @@ class Position:
         self.decision = decision or {}
         self.entry_fill = entry_fill or {}
         self.side = side
+        self.leverage = leverage
 
         self.status = "open"
         self.highest_price = entry_price
@@ -49,12 +51,36 @@ class Position:
         self.tier2_done = False
         self.pyramid_count = 0
 
+        # Dynamic TP trailing: store original distances so TPs can ratchet
+        self._initial_tp1_dist = abs(take_profit_1 - entry_price)
+        self._initial_tp2_dist = abs(take_profit_2 - entry_price)
+
         self.realized_pnl_usd = 0.0
         self.total_fees_usd = entry_fill.get("fee_usd", 0.0) if entry_fill else 0.0
 
         self.opened_at = int(time.time())
         self.closed_at: Optional[int] = None
         self.close_reason: Optional[str] = None
+
+        # Futures: compute margin and liquidation price
+        self.margin_usd = amount_usd / leverage if leverage > 1 else amount_usd
+        self.liquidation_price = self._compute_liquidation_price()
+
+        # Exchange-side stop-loss order ID (STOP_MARKET on Binance)
+        # Protects position even when bot is down
+        self.exchange_sl_order_id: Optional[str] = None
+
+    def _compute_liquidation_price(self) -> float:
+        """Estimate liquidation price for isolated margin futures position."""
+        if self.leverage <= 1:
+            return 0.0  # spot — no liquidation
+        # Simplified: liq happens when loss = margin (minus maintenance margin ~0.4%)
+        maint_margin_rate = 0.004
+        margin_ratio = 1.0 / self.leverage
+        if self.side == "long":
+            return self.entry_price * (1 - margin_ratio + maint_margin_rate)
+        else:  # short
+            return self.entry_price * (1 + margin_ratio - maint_margin_rate)
 
     def current_pnl_pct(self, current_price: float) -> float:
         if self.entry_price <= 0:
@@ -109,6 +135,10 @@ class Position:
             "hold_time_hours": round(self.hold_time_hours(), 2),
             "posterior": self.decision.get("posterior", 0.0),
             "side": self.side,
+            "leverage": getattr(self, "leverage", 1),
+            "margin_usd": round(getattr(self, "margin_usd", self.amount_usd), 4),
+            "liquidation_price": round(getattr(self, "liquidation_price", 0.0), 6),
+            "exchange_sl_order_id": getattr(self, "exchange_sl_order_id", None),
         }
 
 
@@ -156,6 +186,69 @@ class PositionManager:
         self._symbol_entry_times: dict[str, list[float]] = {}
         # Track consecutive exit failures per position — ghost-close after 3
         self._exit_failure_count: dict[str, int] = {}
+
+    # ── Exchange-side stop-loss management ─────────────────────────────────
+    # Places STOP_MARKET orders on Binance so positions are protected even
+    # when bot is crashed/restarting. Software SL still fires first normally.
+
+    def _get_futures_exchange(self):
+        """Get FuturesExchangeConnector from execution core (if in futures mode)."""
+        return getattr(self.execution, "futures_exchange", None)
+
+    async def _place_exchange_sl(self, pos: Position) -> None:
+        """Place a STOP_MARKET order on the exchange for this position."""
+        fc = self._get_futures_exchange()
+        if fc is None or not hasattr(fc, "place_stop_loss_order"):
+            return  # spot mode — no exchange SL
+        if pos.stop_loss <= 0:
+            return
+        try:
+            order = await fc.place_stop_loss_order(
+                symbol=pos.symbol,
+                side=pos.side,
+                amount=pos.amount,
+                stop_price=pos.stop_loss,
+            )
+            if order:
+                pos.exchange_sl_order_id = order.get("id")
+                logger.info(
+                    f"[PM] Exchange SL placed: {pos.symbol} {pos.side} "
+                    f"stop={pos.stop_loss:.6f} order_id={pos.exchange_sl_order_id}"
+                )
+        except Exception as e:
+            logger.warning(f"[PM] Failed to place exchange SL for {pos.symbol}: {e}")
+
+    async def _cancel_exchange_sl(self, pos: Position) -> None:
+        """Cancel the exchange-side SL order (called when closing position)."""
+        fc = self._get_futures_exchange()
+        if fc is None or not pos.exchange_sl_order_id:
+            return
+        try:
+            await fc.cancel_stop_loss_order(pos.symbol, pos.exchange_sl_order_id)
+            pos.exchange_sl_order_id = None
+        except Exception as e:
+            logger.debug(f"[PM] Could not cancel exchange SL for {pos.symbol}: {e}")
+
+    async def _update_exchange_sl(self, pos: Position, new_stop_price: float) -> None:
+        """Update exchange SL to a new (tighter) price — cancel old, place new."""
+        fc = self._get_futures_exchange()
+        if fc is None or not hasattr(fc, "update_stop_loss_order"):
+            return
+        if new_stop_price <= 0:
+            return
+        try:
+            old_id = pos.exchange_sl_order_id or ""
+            order = await fc.update_stop_loss_order(
+                symbol=pos.symbol,
+                old_order_id=old_id,
+                side=pos.side,
+                amount=pos.amount,
+                new_stop_price=new_stop_price,
+            )
+            if order:
+                pos.exchange_sl_order_id = order.get("id")
+        except Exception as e:
+            logger.debug(f"[PM] Could not update exchange SL for {pos.symbol}: {e}")
 
     def is_symbol_on_cooldown(self, symbol: str) -> bool:
         """True if this symbol was recently stopped out and is still cooling down."""
@@ -214,6 +307,13 @@ class PositionManager:
             pos.closed_at = None
             pos.close_reason = None
             pos.side = doc.get("side", "long")
+            pos.exchange_sl_order_id = doc.get("exchange_sl_order_id")
+            pos.leverage = int(doc.get("leverage", 1))
+            pos.margin_usd = float(doc.get("margin_usd", pos.amount_usd))
+            pos.liquidation_price = float(doc.get("liquidation_price", 0.0))
+            # Dynamic TP trailing: restore initial distances
+            pos._initial_tp1_dist = abs(pos.take_profit_1 - pos.entry_price)
+            pos._initial_tp2_dist = abs(pos.take_profit_2 - pos.entry_price)
             return pos
         except Exception as e:
             logger.warning(f"[PM] restore_position_from_dict failed: {e} | doc={doc.get('symbol', '?')}")
@@ -230,24 +330,42 @@ class PositionManager:
         symbol = setup["symbol"]
         entry_zone = setup.get("entry_zone", {})
         price = float(setup.get("price", 0.0))
-        stop_loss = float(entry_zone.get("stop_loss", price * 0.94))  # fallback: 6% below entry
+        direction = setup.get("direction", "long")
+        leverage = int(setup.get("leverage", 1))
+
+        if direction == "long":
+            stop_loss = float(entry_zone.get("stop_loss", price * 0.94))  # fallback: 6% below entry
+        else:
+            stop_loss = float(entry_zone.get("stop_loss", price * 1.06))  # short: 6% above entry
 
         if price <= 0:
             logger.warning(f"[PM] Skipping {symbol}: invalid price {price}")
             return None
 
-        risk_per_unit = price - stop_loss
-        take_profit_1 = price + tier1_r * risk_per_unit
-        take_profit_2 = price + tier2_r * risk_per_unit
+        if direction == "long":
+            risk_per_unit = price - stop_loss
+            take_profit_1 = price + tier1_r * risk_per_unit
+            take_profit_2 = price + tier2_r * risk_per_unit
+        else:
+            risk_per_unit = stop_loss - price
+            take_profit_1 = price - tier1_r * risk_per_unit
+            take_profit_2 = price - tier2_r * risk_per_unit
+
+        entry_side = "buy" if direction == "long" else "sell"
 
         try:
-            fill = await self.execution.enter_position(
+            # Build kwargs — FuturesExecutionCore accepts leverage/direction
+            entry_kwargs = dict(
                 symbol=symbol,
-                side="buy",
+                side=entry_side,
                 amount_usd=amount_usd,
                 price=price,
                 setup_type=setup.get("setup_type", "unknown"),
             )
+            if leverage > 1:
+                entry_kwargs["leverage"] = leverage
+                entry_kwargs["direction"] = direction
+            fill = await self.execution.enter_position(**entry_kwargs)
         except Exception as e:
             logger.error(f"[PM] Entry failed for {symbol}: {e}")
             return None
@@ -266,16 +384,22 @@ class PositionManager:
             setup_type=setup.get("setup_type", "unknown"),
             decision=setup.get("decision", {}),
             entry_fill=fill,
-            side="long", # Only long supported for now
+            side=direction,
+            leverage=leverage,
         )
         self._positions[pos.id] = pos
         self._record_entry(symbol)
         active_positions.set(len(self._positions))
         logger.info(
-            f"[PM] OPENED {symbol} {pos.side} id={pos.id} "
+            f"[PM] OPENED {symbol} {pos.side} {leverage}x id={pos.id} "
             f"entry={fill_price:.6f} sl={stop_loss:.6f} "
             f"tp1={take_profit_1:.6f} amount=${fill['amount_usd']:.2f}"
+            f"{' liq=' + f'{pos.liquidation_price:.6f}' if pos.liquidation_price > 0 else ''}"
         )
+
+        # Place exchange-side stop-loss order (futures only)
+        await self._place_exchange_sl(pos)
+
         return pos
 
     async def pyramid_add(self, pos: Position, current_price: float, add_usd: float) -> bool:
@@ -411,6 +535,43 @@ class PositionManager:
         if current_price < pos.lowest_price:
             pos.lowest_price = current_price
 
+        # ── Dynamic TP trailing — ratchet TPs as price makes new highs ────────
+        # Static TPs (set at entry) miss profit on strong runners: a token that
+        # runs +8% still had TP1 at +2.5%, taking profits way too early on the
+        # pullback. Dynamic TPs trail behind highest_price so partial exits
+        # capture more of the actual move.
+        _tp1_dist = getattr(pos, '_initial_tp1_dist', abs(pos.take_profit_1 - pos.entry_price))
+        _tp2_dist = getattr(pos, '_initial_tp2_dist', abs(pos.take_profit_2 - pos.entry_price))
+
+        if pos.side == "long" and pos.highest_price > pos.entry_price:
+            _excess = pos.highest_price - pos.entry_price
+            # TP1: once price has covered 60% of original TP1 distance, start trailing
+            # Trails at highest_price minus 50% of original TP1 distance (buffer zone)
+            if _excess > _tp1_dist * 0.6 and not pos.tier1_done:
+                new_tp1 = pos.highest_price - _tp1_dist * 0.5
+                if new_tp1 > pos.take_profit_1:
+                    logger.debug(f"[PM] {symbol} TP1 ratchet: {pos.take_profit_1:.6f} → {new_tp1:.6f}")
+                    pos.take_profit_1 = new_tp1
+            # TP2: once price has covered 60% of original TP2 distance, start trailing
+            if _excess > _tp2_dist * 0.6 and not pos.tier2_done:
+                new_tp2 = pos.highest_price - _tp2_dist * 0.5
+                if new_tp2 > pos.take_profit_2:
+                    logger.debug(f"[PM] {symbol} TP2 ratchet: {pos.take_profit_2:.6f} → {new_tp2:.6f}")
+                    pos.take_profit_2 = new_tp2
+
+        elif pos.side == "short" and pos.lowest_price < pos.entry_price:
+            _excess = pos.entry_price - pos.lowest_price
+            if _excess > _tp1_dist * 0.6 and not pos.tier1_done:
+                new_tp1 = pos.lowest_price + _tp1_dist * 0.5
+                if new_tp1 < pos.take_profit_1:
+                    logger.debug(f"[PM] {symbol} TP1 ratchet (short): {pos.take_profit_1:.6f} → {new_tp1:.6f}")
+                    pos.take_profit_1 = new_tp1
+            if _excess > _tp2_dist * 0.6 and not pos.tier2_done:
+                new_tp2 = pos.lowest_price + _tp2_dist * 0.5
+                if new_tp2 < pos.take_profit_2:
+                    logger.debug(f"[PM] {symbol} TP2 ratchet (short): {pos.take_profit_2:.6f} → {new_tp2:.6f}")
+                    pos.take_profit_2 = new_tp2
+
         sl_pct = regime_params.get("stop_loss_pct", self.stop_loss_pct) if regime_params else self.stop_loss_pct
         trail_activate = regime_params.get("trailing_activate_pct", self.trailing_activate_pct) if regime_params else self.trailing_activate_pct
         trail_dist = regime_params.get("trailing_distance_pct", self.trailing_distance_pct) if regime_params else self.trailing_distance_pct
@@ -435,9 +596,20 @@ class PositionManager:
 
         # Trailing stop management
         if pnl_pct >= trail_activate:
-            trail_price = pos.highest_price * (1 - trail_dist / 100.0)
-            if pos.trailing_stop is None or trail_price > pos.trailing_stop:
-                pos.trailing_stop = trail_price
+            _old_trail = pos.trailing_stop
+            if pos.side == "short":
+                # Short: trail ABOVE lowest price — if price rises past this, exit
+                trail_price = pos.lowest_price * (1 + trail_dist / 100.0)
+                if pos.trailing_stop is None or trail_price < pos.trailing_stop:
+                    pos.trailing_stop = trail_price
+            else:
+                # Long: trail BELOW highest price — if price drops past this, exit
+                trail_price = pos.highest_price * (1 - trail_dist / 100.0)
+                if pos.trailing_stop is None or trail_price > pos.trailing_stop:
+                    pos.trailing_stop = trail_price
+            # Update exchange-side SL to follow the trailing stop
+            if pos.trailing_stop != _old_trail and pos.trailing_stop is not None:
+                await self._update_exchange_sl(pos, pos.trailing_stop)
 
         # ── Exit checks ──────────────────────────────────────────────────
 
@@ -478,20 +650,32 @@ class PositionManager:
         if hold_h >= effective_time_exit_hours * 2:
             return await self._execute_exit(pos, current_price, "time_exit_max", pos.amount)
 
-        # Tier 1 (partial exit at 2R)
-        if not pos.tier1_done and r_multiple >= 2.0:
+        # Tier 1 — partial exit when price hits dynamic TP1 (or R ≥ 2 as fallback)
+        # With dynamic TP trailing, TP1 ratchets up as price makes new highs,
+        # so the partial exit fires at a higher price on strong runners.
+        _tp1_hit = (pos.side == "long" and current_price >= pos.take_profit_1) or \
+                   (pos.side == "short" and current_price <= pos.take_profit_1)
+        if not pos.tier1_done and (_tp1_hit or r_multiple >= 2.0):
             tier1_amount = pos.amount * self.tier1_exit_pct
             result = await self._execute_partial_exit(pos, current_price, "tier1", tier1_amount)
             pos.tier1_done = True
             # Tighten trailing stop after T1
             if pos.trailing_stop:
-                tighter = pos.highest_price * (1 - (trail_dist * 0.75) / 100.0)
-                pos.trailing_stop = max(pos.trailing_stop, tighter)
+                if pos.side == "short":
+                    tighter = pos.lowest_price * (1 + (trail_dist * 0.75) / 100.0)
+                    pos.trailing_stop = min(pos.trailing_stop, tighter)
+                else:
+                    tighter = pos.highest_price * (1 - (trail_dist * 0.75) / 100.0)
+                    pos.trailing_stop = max(pos.trailing_stop, tighter)
+                # Update exchange SL to match tightened trail
+                await self._update_exchange_sl(pos, pos.trailing_stop)
             if result:
                 return result
 
-        # Tier 2 (partial exit at 5R)
-        if pos.tier1_done and not pos.tier2_done and r_multiple >= 5.0:
+        # Tier 2 — partial exit when price hits dynamic TP2 (or R ≥ 5 as fallback)
+        _tp2_hit = (pos.side == "long" and current_price >= pos.take_profit_2) or \
+                   (pos.side == "short" and current_price <= pos.take_profit_2)
+        if pos.tier1_done and not pos.tier2_done and (_tp2_hit or r_multiple >= 5.0):
             tier2_amount = pos.amount * self.tier2_exit_pct
             result = await self._execute_partial_exit(pos, current_price, "tier2", tier2_amount)
             pos.tier2_done = True
@@ -514,7 +698,7 @@ class PositionManager:
             return None
         self._positions_being_exited.add(pos.id)
         try:
-            fill = await self.execution.exit_position(pos.symbol, amount, price, reason)
+            fill = await self.execution.exit_position(pos.symbol, amount, price, reason, direction=pos.side)
             filled_amount = float(fill.get("filled_amount") or 0.0)  # type: ignore[arg-type]
             if filled_amount < amount * 0.999:
                 if pos.side == "short":
@@ -555,6 +739,9 @@ class PositionManager:
             pos.status = "closed"
             pos.closed_at = int(time.time())
             pos.close_reason = reason
+
+            # Cancel exchange-side SL order (no longer needed)
+            await self._cancel_exchange_sl(pos)
 
             pnl_usd = pos.realized_pnl_usd  # cumulative: tier1 + tier2 + final tranche
             if pos.side == "short":
@@ -613,6 +800,7 @@ class PositionManager:
                 f"amount {dust_err.amount:.8f} below minimum {dust_err.min_amount:.8f}. "
                 f"Closing as dust. Realized PnL so far: ${pos.realized_pnl_usd:.2f}"
             )
+            await self._cancel_exchange_sl(pos)
             pos.status = "closed"
             pos.closed_at = int(time.time())
             pos.close_reason = f"{reason}_dust"
@@ -643,6 +831,7 @@ class PositionManager:
                     f"{count} consecutive exit failures — closing as unsellable. "
                     f"Last error: {e}"
                 )
+                await self._cancel_exchange_sl(pos)
                 pos.status = "closed"
                 pos.closed_at = int(time.time())
                 pos.close_reason = f"{reason}_force_ghost"
@@ -668,8 +857,11 @@ class PositionManager:
     async def _execute_partial_exit(self, pos: Position, price: float, reason: str, amount: float) -> Optional[dict]:
         """Execute a partial position exit (tier exit)."""
         try:
-            fill = await self.execution.exit_position(pos.symbol, amount, price, reason)
-            partial_pnl = (fill["filled_price"] - pos.entry_price) * fill["filled_amount"]
+            fill = await self.execution.exit_position(pos.symbol, amount, price, reason, direction=pos.side)
+            if pos.side == "short":
+                partial_pnl = (pos.entry_price - fill["filled_price"]) * fill["filled_amount"]
+            else:
+                partial_pnl = (fill["filled_price"] - pos.entry_price) * fill["filled_amount"]
             pos.realized_pnl_usd += partial_pnl
             pos.amount -= fill["filled_amount"]
             pos.amount_usd = pos.amount * pos.entry_price
@@ -709,9 +901,11 @@ class PositionManager:
         return sum(p.amount_usd for p in self._positions.values() if p.status == "open")
 
     def get_bot_exposure_usd(self) -> float:
-        """Exposure from bot-initiated trades only (excludes synced/exchange holdings)."""
+        """Exposure from bot-initiated trades only (excludes synced/exchange holdings).
+        For futures positions, returns MARGIN (not notional) since leverage amplifies
+        notional but the actual capital at risk is margin = notional / leverage."""
         return sum(
-            p.amount_usd for p in self._positions.values()
+            p.margin_usd for p in self._positions.values()
             if p.status == "open" and p.setup_type not in ("synced_holding", "exchange_holding")
         )
 
@@ -806,12 +1000,18 @@ class PositionManager:
 
             # Need to buy more — buy only the delta
             try:
+                # Pass leverage/direction for futures mode (FuturesExecutionCore)
+                extra_kwargs = {}
+                if hasattr(pos, "leverage") and pos.leverage > 1:
+                    extra_kwargs["leverage"] = pos.leverage
+                    extra_kwargs["direction"] = pos.side or "long"
                 fill = await self.execution.enter_position(
                     symbol=pos.symbol,
-                    side="buy",
+                    side="buy" if pos.side != "short" else "sell",
                     amount_usd=delta_usd,
                     price=current_price,
                     setup_type="scale_up",
+                    **extra_kwargs,
                 )
                 filled_amount = float(fill.get("filled_amount", 0.0))
                 if filled_amount > 0:

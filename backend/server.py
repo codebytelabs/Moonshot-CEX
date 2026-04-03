@@ -1082,7 +1082,15 @@ async def _run_cycle():
     STATE["last_cycle_at"] = int(time.time())
     await _broadcast_ws()
 
-    # ── Step 10: Periodic orphan algo order + position sync (every 10 cycles) ──
+    # ── Step 10: Position health monitor (every 5 cycles) ────────────────────
+    # Re-evaluate whether open positions still have momentum. If TA signals
+    # have reversed, tighten trailing stops to protect gains. This prevents
+    # holding positions whose original setup thesis is no longer valid.
+    _HEALTH_CHECK_INTERVAL = 5
+    if cycle % _HEALTH_CHECK_INTERVAL == 0 and _position_manager.open_count > 0:
+        await _check_position_health()
+
+    # ── Step 11: Periodic orphan algo order + position sync (every 10 cycles) ──
     # Exchange data is golden — clean up any algo stop orders that don't match
     # real exchange positions, and ghost-close bot-tracked positions that the
     # exchange no longer has (e.g. exchange-side SL triggered).
@@ -1103,6 +1111,148 @@ async def _tick_positions() -> list[dict]:
     regime_params["regime"] = STATE.get("regime", "sideways")  # explicit name for is_aggressive check
     exits = await _position_manager.update_all(regime_params=regime_params)
     return [e for e in exits if e is not None]
+
+
+async def _check_position_health():
+    """Re-evaluate open positions for continued momentum validity.
+
+    Runs every N cycles. For each position, fetches fresh 5m candles and checks:
+      - EMA9 vs EMA21 alignment (trend still valid?)
+      - RSI direction (momentum fading?)
+      - MACD histogram (acceleration still positive?)
+
+    Health scoring:
+      1.0 = strong momentum (all signals aligned)
+      0.5 = neutral (mixed signals — hold but watch)
+      0.0 = reversed (momentum gone — tighten trailing stop)
+
+    Actions based on health:
+      health >= 0.6: no action (thesis intact)
+      health 0.3-0.6: tighten trailing stop to 75% of normal distance
+      health < 0.3: set trailing stop at current price minus 0.5% (lock gains fast)
+    """
+    import numpy as np
+    from src.watcher import _ema, _compute_rsi, _compute_macd_hist
+
+    positions = list(_position_manager._positions.values())
+    if not positions:
+        return
+
+    for pos in positions:
+        if pos.status != "open":
+            continue
+        # Skip synced/exchange holdings — not our trade thesis
+        if pos.setup_type in ("synced_holding", "exchange_holding"):
+            continue
+        # Only check positions older than 10 minutes (let new ones breathe)
+        if pos.hold_time_hours() < 0.17:
+            continue
+
+        try:
+            candles = await _watcher._fetch_ohlcv_cached(pos.symbol, "5m", 60)
+            if not candles or len(candles) < 30:
+                continue
+
+            closes = np.array([c[4] for c in candles], dtype=float)
+            current_price = closes[-1]
+
+            # ── EMA alignment check ──
+            ema9 = _ema(closes, 9)
+            ema21 = _ema(closes, 21)
+            ema_gap_pct = (ema9 - ema21) / ema21 * 100 if ema21 > 0 else 0.0
+
+            # ── RSI check ──
+            rsi = _compute_rsi(closes, 14)
+
+            # ── MACD histogram check ──
+            macd_hist = _compute_macd_hist(closes)
+
+            # ── Compute health score ──
+            health = 0.0
+
+            if pos.side == "long":
+                # EMA: bullish alignment = good for longs
+                if ema_gap_pct > 0.3:
+                    health += 0.4
+                elif ema_gap_pct > -0.1:
+                    health += 0.2
+                # RSI: 40-70 is healthy for longs, < 35 is weak
+                if 40 <= rsi <= 70:
+                    health += 0.3
+                elif rsi > 70:
+                    health += 0.2  # overbought but still momentum
+                elif rsi > 35:
+                    health += 0.1
+                # MACD: positive histogram = momentum increasing
+                if macd_hist > 0:
+                    health += 0.3
+                elif macd_hist > -0.0001:
+                    health += 0.1
+            else:  # short
+                # Inverted: bearish EMA = good for shorts
+                if ema_gap_pct < -0.3:
+                    health += 0.4
+                elif ema_gap_pct < 0.1:
+                    health += 0.2
+                if 30 <= rsi <= 55:
+                    health += 0.3
+                elif rsi < 30:
+                    health += 0.2
+                elif rsi < 60:
+                    health += 0.1
+                if macd_hist < 0:
+                    health += 0.3
+                elif macd_hist < 0.0001:
+                    health += 0.1
+
+            pnl_pct = pos.current_pnl_pct(current_price)
+
+            # ── Take action based on health ──
+            if health < 0.3 and pnl_pct > 0.3:
+                # Momentum reversed but we're green — lock gains with tight trail
+                if pos.side == "long":
+                    tight_trail = current_price * 0.995  # 0.5% below current
+                    if pos.trailing_stop is None or tight_trail > pos.trailing_stop:
+                        logger.info(
+                            f"[HealthCheck] {pos.symbol} WEAK health={health:.2f} "
+                            f"(EMA={ema_gap_pct:+.2f}% RSI={rsi:.0f} MACD={'+'if macd_hist>0 else ''}{macd_hist:.6f}) "
+                            f"pnl={pnl_pct:+.1f}% → tightening trail to {tight_trail:.6f}"
+                        )
+                        pos.trailing_stop = tight_trail
+                        await _position_manager._update_exchange_sl(pos, tight_trail)
+                else:
+                    tight_trail = current_price * 1.005
+                    if pos.trailing_stop is None or tight_trail < pos.trailing_stop:
+                        logger.info(
+                            f"[HealthCheck] {pos.symbol} WEAK health={health:.2f} "
+                            f"(EMA={ema_gap_pct:+.2f}% RSI={rsi:.0f}) "
+                            f"pnl={pnl_pct:+.1f}% → tightening trail to {tight_trail:.6f}"
+                        )
+                        pos.trailing_stop = tight_trail
+                        await _position_manager._update_exchange_sl(pos, tight_trail)
+
+            elif health < 0.3 and pnl_pct <= 0.3:
+                # Momentum reversed AND we're red/flat — log warning, let SL handle it
+                logger.info(
+                    f"[HealthCheck] {pos.symbol} WEAK health={health:.2f} pnl={pnl_pct:+.1f}% "
+                    f"(EMA={ema_gap_pct:+.2f}% RSI={rsi:.0f} MACD={'+'if macd_hist>0 else ''}{macd_hist:.6f}) "
+                    f"— SL will protect"
+                )
+
+            elif health >= 0.6:
+                logger.debug(
+                    f"[HealthCheck] {pos.symbol} HEALTHY health={health:.2f} pnl={pnl_pct:+.1f}% "
+                    f"EMA={ema_gap_pct:+.2f}% RSI={rsi:.0f}"
+                )
+
+            else:
+                logger.debug(
+                    f"[HealthCheck] {pos.symbol} NEUTRAL health={health:.2f} pnl={pnl_pct:+.1f}%"
+                )
+
+        except Exception as e:
+            logger.debug(f"[HealthCheck] {pos.symbol} check failed: {e}")
+            continue
 
 
 async def _sweep_orphan_algo_orders_and_positions():
