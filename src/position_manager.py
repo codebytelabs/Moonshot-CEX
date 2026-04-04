@@ -410,6 +410,9 @@ class PositionManager:
 
         fill_price = fill["filled_price"]
         fill_amount = fill["filled_amount"]
+        # Use actual leverage from fill (may differ from requested if
+        # set_leverage fell back on -4028 for limited-bracket symbols)
+        actual_leverage = int(fill.get("leverage", leverage))
 
         pos = Position(
             symbol=symbol,
@@ -423,13 +426,13 @@ class PositionManager:
             decision=setup.get("decision", {}),
             entry_fill=fill,
             side=direction,
-            leverage=leverage,
+            leverage=actual_leverage,
         )
         self._positions[pos.id] = pos
         self._record_entry(symbol)
         active_positions.set(len(self._positions))
         logger.info(
-            f"[PM] OPENED {symbol} {pos.side} {leverage}x id={pos.id} "
+            f"[PM] OPENED {symbol} {pos.side} {actual_leverage}x id={pos.id} "
             f"entry={fill_price:.6f} sl={stop_loss:.6f} "
             f"tp1={take_profit_1:.6f} amount=${fill['amount_usd']:.2f}"
             f"{' liq=' + f'{pos.liquidation_price:.6f}' if pos.liquidation_price > 0 else ''}"
@@ -503,30 +506,70 @@ class PositionManager:
                 exits.append(result)
         return exits
 
-    async def sweep_vulnerable_positions(self) -> list[Optional[dict]]:
-        """
-        Called when regime suddenly shifts to bear or choppy.
-        Sweeps through existing bot positions and aggressively closes those 
-        that aren't solidly in profit (e.g. < 0.5% profit).
+    async def tighten_stops_for_regime(self, regime_params: dict, close_threshold_pct: float = -2.0) -> list[Optional[dict]]:
+        """Smart regime downgrade protection — tighten stops + close deep losers.
+
+        Called when regime degrades (e.g. bull→choppy).  Unlike the old
+        sweep_vulnerable_positions which nuked everything < 0.5%, this:
+          1. Tightens stop-loss on ALL positions to the new (tighter) regime params
+          2. Updates exchange-side SL orders to match
+          3. Only force-closes positions that are deeply underwater (< close_threshold_pct)
+
+        Returns list of exit results for force-closed positions.
         """
         exits = []
+        sl_pct = abs(regime_params.get("stop_loss_pct", self.stop_loss_pct)) / 100.0
+
         for pos_id, pos in list(self._positions.items()):
+            if pos.status != "open":
+                continue
             if pos.id in self._positions_being_exited:
                 continue
             if pos.setup_type in ("synced_holding", "exchange_holding"):
-                continue # Leave manual holdings alone
-            
+                continue
+
             try:
                 current_price = await self.execution.get_current_price(pos.symbol)
                 if current_price <= 0:
                     continue
+
                 pnl_pct = pos.current_pnl_pct(current_price)
-                if pnl_pct < 0.5:
-                    logger.warning(f"[PM] Regime shift sweep: closing {pos.symbol} (PnL {pnl_pct:.2f}%) to protect capital")
-                    result = await self._execute_exit(pos, current_price, "regime_shift_sweep", pos.amount)
-                    exits.append(result)
+
+                # Force-close deeply underwater positions — they're just bleeding
+                if pnl_pct < close_threshold_pct:
+                    logger.warning(
+                        f"[PM] REGIME PROTECT: closing {pos.symbol} "
+                        f"(PnL {pnl_pct:+.2f}% < {close_threshold_pct}%) to stop bleeding"
+                    )
+                    result = await self._execute_exit(pos, current_price, "regime_downgrade_close", pos.amount)
+                    if result:
+                        exits.append(result)
+                    continue
+
+                # Tighten stop-loss to new regime params
+                new_sl = pos.entry_price * (1 - sl_pct) if pos.side == "long" else pos.entry_price * (1 + sl_pct)
+                old_sl = pos.stop_loss
+
+                if pos.side == "long" and new_sl > old_sl:
+                    pos.stop_loss = new_sl
+                    logger.info(
+                        f"[PM] REGIME TIGHTEN: {pos.symbol} SL {old_sl:.6f} → {new_sl:.6f} "
+                        f"(pnl={pnl_pct:+.2f}%)"
+                    )
+                    effective_stop = pos.trailing_stop if (pos.trailing_stop and pos.trailing_stop > new_sl) else new_sl
+                    await self._update_exchange_sl(pos, effective_stop)
+                elif pos.side == "short" and (old_sl <= 0 or new_sl < old_sl):
+                    pos.stop_loss = new_sl
+                    logger.info(
+                        f"[PM] REGIME TIGHTEN: {pos.symbol} SL {old_sl:.6f} → {new_sl:.6f} "
+                        f"(pnl={pnl_pct:+.2f}%)"
+                    )
+                    effective_stop = pos.trailing_stop if (pos.trailing_stop and pos.trailing_stop < new_sl) else new_sl
+                    await self._update_exchange_sl(pos, effective_stop)
+
             except Exception as e:
-                logger.debug(f"[PM] Sweep error for {pos.symbol}: {e}")
+                logger.error(f"[PM] Regime protect error for {pos.symbol}: {e}")
+
         return exits
 
     def _momentum_exit_reason(self, pos: Position, current_price: float, pnl_pct: float, regime_params: Optional[dict]) -> Optional[str]:
@@ -537,13 +580,26 @@ class PositionManager:
           - trailing_stop: 100% win rate, only profitable exit
           - momentum_died_20m: 100% win rate (most patient = most profitable)
 
-        New design: ONLY exit on momentum_faded (gave back huge peak).
-        Everything else is handled by: stop_loss → trailing_stop → time_exit.
-        The old 7+ momentum exits were killing winners before trailing could activate.
+        New design:
+          1. early_thesis_invalid: after 5 min, if position NEVER went positive
+             and is losing >1%, the momentum thesis was never validated.
+             Different from old exits: those killed positions that HAD peaked.
+             This only kills positions where upside NEVER materialized.
+          2. momentum_faded: had a significant peak but gave most of it back.
+        Everything else: stop_loss → trailing_stop → time_exit.
         """
         hold_minutes = pos.hold_time_hours() * 60.0
         peak_pnl_pct = pos.current_pnl_pct(pos.highest_price if pos.side == "long" else pos.lowest_price)
         giveback_pct = peak_pnl_pct - pnl_pct
+
+        # Early thesis invalid: position entered on momentum but it NEVER materialized.
+        # After 5 min: losing >1% AND peak was <0.3% (never went meaningfully green).
+        # This is NOT the same as old no_traction exits that killed at -2% blanket:
+        #   - Old: killed at -2% regardless of peak → destroyed winners that dipped first
+        #   - New: only kills if peak < 0.3% — if it ever went +1% then the thesis had legs
+        # 5 min threshold lets normal entry noise settle (spread, order fill, first candle).
+        if hold_minutes >= 5.0 and pnl_pct < -1.0 and peak_pnl_pct < 0.3:
+            return "early_thesis_invalid"
 
         # Momentum faded: had a significant peak (+3%+) but gave back 70%+ of gains.
         # This is the ONE justified momentum exit — don't let a +5% winner turn into -2% loser.
@@ -757,7 +813,7 @@ class PositionManager:
                 # partial fills had NO cooldown → new position opened same cycle →
                 # remaining GREW (TRX: 49→76 tokens over 8 cycles).
                 r = reason.lower()
-                if any(x in r for x in ("stop", "momentum", "time_exit", "regime", "hard_loss", "no_traction", "emergency", "faded", "stall")):
+                if any(x in r for x in ("stop", "momentum", "time_exit", "regime", "hard_loss", "no_traction", "emergency", "faded", "stall", "thesis")):
                     cooldown_m = self.symbol_cooldown_minutes * (1.5 if "stop" in r else 1.0)
                     cooldown_until = time.time() + cooldown_m * 60
                     self._symbol_cooldowns[pos.symbol] = cooldown_until
@@ -811,7 +867,7 @@ class PositionManager:
                 cooldown_m = self.symbol_cooldown_minutes * 1.5   # 45 min
             elif any(x in r for x in ("no_traction", "time_exit")):
                 cooldown_m = self.symbol_cooldown_minutes          # 30 min
-            elif any(x in r for x in ("faded", "died", "stall")):
+            elif any(x in r for x in ("faded", "died", "stall", "thesis")):
                 cooldown_m = self.symbol_cooldown_minutes * 0.67   # 20 min
             elif "trailing" in r:
                 cooldown_m = max(8.0, self.symbol_cooldown_minutes * 0.33)  # 10 min
@@ -1025,6 +1081,31 @@ class PositionManager:
                     f"pyramid_count={pos.pyramid_count} at max (2) — no more adds"
                 )
                 return "hold"
+
+            # Block scale-up if total position would exceed exchange max_qty.
+            # This prevents accumulated positions from breaking SL placement and exits.
+            fc = self._get_futures_exchange()
+            if fc is not None:
+                market = fc.exchange.markets.get(pos.symbol)
+                if market:
+                    max_qty = market.get("limits", {}).get("amount", {}).get("max")
+                    if not max_qty:
+                        for f in (market.get("info", {}).get("filters") or []):
+                            if f.get("filterType") in ("MARKET_LOT_SIZE", "LOT_SIZE"):
+                                _mq = float(f.get("maxQty", 0))
+                                if _mq > 0:
+                                    max_qty = _mq
+                                    break
+                    if max_qty:
+                        delta_amount = delta_usd / current_price if current_price > 0 else 0
+                        new_total = pos.amount + delta_amount
+                        if new_total > max_qty * 0.90:
+                            logger.warning(
+                                f"[PM] SCALE BLOCKED {pos.symbol}: "
+                                f"new total {new_total:.2f} would exceed 90% of max_qty {max_qty:.2f} "
+                                f"— preventing accumulation that breaks SL/exits"
+                            )
+                            return "hold"
 
             # Safety: block scale-up if price is at or near the stop_loss level.
             # Buying here would trigger an immediate stop_loss exit next tick.

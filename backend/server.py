@@ -70,6 +70,7 @@ STATE: dict = {
     "recent_events": [],
     "start_time": 0.0,
     "equity_history": [],
+    "confirmed_issues": [],
 }
 
 _ws_clients: list[WebSocket] = []
@@ -1152,6 +1153,22 @@ async def _run_cycle():
                 except Exception:
                     pass
             _bayesian.update_prior(exit_result.get("setup_type", "neutral"), pnl > 0)
+            # Feed losing trades into BigBrother learning log for self-improvement
+            if pnl < 0 and _bigbrother:
+                _bigbrother.log_losing_trade({
+                    "symbol": exit_result.get("symbol", "?"),
+                    "side": exit_result.get("side", "long"),
+                    "setup_type": exit_result.get("setup_type", "unknown"),
+                    "entry_price": float(exit_result.get("entry_price", 0)),
+                    "exit_price": float(exit_result.get("exit_price", 0)),
+                    "pnl_pct": pnl_pct,
+                    "pnl_usd": pnl,
+                    "hold_minutes": hold_h * 60,
+                    "close_reason": exit_result.get("close_reason", "unknown"),
+                    "regime": STATE.get("regime", "sideways"),
+                    "mode": STATE.get("bigbrother_mode", "normal"),
+                    "decision": exit_result.get("decision", {}),
+                })
             if _alerts:
                 emoji = "🟢" if pnl > 0 else "🔴"
                 await _alerts.send(
@@ -1198,15 +1215,28 @@ async def _run_cycle():
     STATE["recent_events"].extend(bb_result.get("events", []))
     STATE["recent_events"] = STATE["recent_events"][-50:]
 
-    # ── Regime sweep DISABLED ─────────────────────────────────────────────
-    # The sweep was nuking ALL positions on every bear↔choppy oscillation.
-    # Bug: both bear and choppy increment _bear_cycle_count, so transitions
-    # between them (bear→choppy→bear) always had count >= 2 and always fired.
-    # Result: massive losses from force-selling during normal volatility.
-    # Positions now exit via their own stop losses, trailing stops, and
-    # momentum exits. The BTC trend gate blocks NEW entries when appropriate.
+    # ── Smart regime downgrade protection ─────────────────────────────────
+    # Old sweep was disabled because it nuked ALL positions on bear↔choppy
+    # oscillation.  New approach: detect genuine DOWNGRADES only, then
+    # tighten stops (not blanket close).  Deep losers (< -2%) get closed.
+    _REGIME_SEVERITY = {"bull": 3, "sideways": 2, "bear": 1, "choppy": 0}
     if old_regime != STATE["regime"]:
-        logger.info(f"[Swarm] Regime changed: {old_regime} → {STATE['regime']} (no sweep — positions manage their own exits)")
+        old_sev = _REGIME_SEVERITY.get(old_regime, 2)
+        new_sev = _REGIME_SEVERITY.get(STATE["regime"], 2)
+        if new_sev < old_sev and _position_manager.open_count > 0:
+            logger.warning(
+                f"[Swarm] Regime DOWNGRADE: {old_regime}({old_sev}) → {STATE['regime']}({new_sev}) "
+                f"— tightening stops on {_position_manager.open_count} positions"
+            )
+            regime_protect_exits = await _position_manager.tighten_stops_for_regime(
+                regime_params=STATE["regime_params"],
+                close_threshold_pct=-2.0,
+            )
+            for rpe in regime_protect_exits:
+                if rpe:
+                    await _record_trade(rpe)
+        else:
+            logger.info(f"[Swarm] Regime changed: {old_regime} → {STATE['regime']}")
 
     if bb_result["mode"] == "paused":
         STATE["paused"] = True
@@ -1244,8 +1274,12 @@ async def _run_cycle():
                 closed_trades=closed_history,
                 current_equity=equity,
                 position_manager=_position_manager,
+                exchange=_exchange,
+                db=_db,
             )
             STATE["supervisor_report"] = _sv_report
+            # Surface confirmed issues to STATE for dashboard
+            STATE["confirmed_issues"] = _bigbrother.confirmed_issues
         except Exception as _sv_err:
             logger.warning(f"[Supervisor] Loop error: {_sv_err}")
 
@@ -1482,22 +1516,52 @@ async def _sweep_orphan_algo_orders_and_positions():
                 if pos.status != "open":
                     continue
                 if pos.symbol not in exchange_symbols:
+                    # Position doesn't exist on exchange — just remove from bot
+                    # tracking.  Do NOT try _execute_exit (sends a sell order to
+                    # Binance which fails with -2022 ReduceOnly rejected, racks up
+                    # exit-failure counts, and blocks ALL new entries).
                     logger.warning(
-                        f"[OrphanSweep] Bot tracks {pos.symbol} but exchange has NO position → ghost-closing"
+                        f"[OrphanSweep] Bot tracks {pos.symbol} but exchange has NO position "
+                        f"→ removing from tracking (no exchange order needed)"
                     )
                     try:
                         current_price = await _position_manager.execution.get_current_price(pos.symbol)
                         if current_price <= 0:
                             current_price = pos.entry_price
-                        result = await _position_manager._execute_exit(
-                            pos, current_price, "ghost_close_sync", pos.amount
-                        )
-                        if result and _db is not None:
-                            await _save_trade_to_db(result)
+                        if pos.side == "short":
+                            pnl_usd = (pos.entry_price - current_price) * pos.amount
+                            pnl_pct = (pos.entry_price - current_price) / pos.entry_price * 100.0
+                        else:
+                            pnl_usd = (current_price - pos.entry_price) * pos.amount
+                            pnl_pct = (current_price - pos.entry_price) / pos.entry_price * 100.0
+                        pos.status = "closed"
+                        pos.closed_at = int(time.time())
+                        pos.close_reason = "ghost_close_sync"
+                        # Clear any exit failure count so has_failed_exits unblocks
+                        _position_manager._exit_failure_count.pop(pos.id, None)
+                        closed = {
+                            "symbol": pos.symbol, "side": pos.side,
+                            "entry_price": pos.entry_price, "exit_price": current_price,
+                            "pnl_usd": pnl_usd, "pnl_pct": pnl_pct,
+                            "close_reason": "ghost_close_sync",
+                            "hold_hours": pos.hold_time_hours(),
+                            "amount_usd": pos.amount_usd,
+                        }
+                        _position_manager._closed_history.append(closed)
+                        if len(_position_manager._closed_history) > 200:
+                            _position_manager._closed_history = _position_manager._closed_history[-200:]
+                        del _position_manager._positions[pos_id]
+                        active_positions.set(len(_position_manager._positions))
+                        if _db is not None:
+                            await _save_trade_to_db(closed)
                             await _db.positions.update_one(
                                 {"id": pos.id},
                                 {"$set": {"status": "closed", "close_reason": "ghost_close_sync"}},
                             )
+                        logger.info(
+                            f"[OrphanSweep] Removed {pos.symbol} from tracking: "
+                            f"pnl=${pnl_usd:.2f} ({pnl_pct:+.1f}%)"
+                        )
                     except Exception as ge:
                         logger.debug(f"[OrphanSweep] Ghost-close error for {pos.symbol}: {ge}")
 
@@ -2628,6 +2692,7 @@ async def _build_ws_payload() -> dict:
         "recent_events": STATE.get("recent_events", [])[-10:],
         "risk_health": _risk_manager.check_portfolio_health(STATE["current_equity"]) if _risk_manager else {},
         "recent_trades": _position_manager.get_closed_history(10) if _position_manager else [],
+        "confirmed_issues": STATE.get("confirmed_issues", []),
     }
 
 
@@ -3258,6 +3323,34 @@ async def get_regime():
         "mode": STATE.get("bigbrother_mode", "normal"),
         "params": STATE.get("regime_params", {}),
     }
+
+
+# ── Self-Improvement Endpoints ──────────────────────────────────────────────
+@app.get("/api/issues")
+async def get_issues():
+    """Return confirmed issues detected by the self-improvement pattern detector."""
+    issues = []
+    if _bigbrother:
+        issues = _bigbrother.confirmed_issues
+    return {"issues": issues, "count": len(issues)}
+
+
+@app.post("/api/issues/{issue_id}/dismiss")
+async def dismiss_issue(issue_id: str):
+    """Dismiss a confirmed issue from the dashboard."""
+    if not _bigbrother:
+        return {"ok": False, "error": "BigBrother not initialized"}
+    dismissed = _bigbrother.dismiss_issue(issue_id)
+    return {"ok": dismissed, "issue_id": issue_id}
+
+
+@app.get("/api/learning-log")
+async def get_learning_log():
+    """Return recent learning log entries from the self-improvement system."""
+    log = []
+    if _bigbrother:
+        log = _bigbrother.learning_log
+    return {"entries": log, "count": len(log)}
 
 
 # ── Settings ─────────────────────────────────────────────────────────────────

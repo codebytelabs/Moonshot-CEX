@@ -386,23 +386,42 @@ class FuturesExchangeConnector(ExchangeConnector):
 
     # ── Futures-specific: Leverage & Margin ────────────────────────────────
 
-    async def set_leverage(self, symbol: str, leverage: int) -> bool:
-        """Set leverage for a symbol. Returns True on success."""
+    async def set_leverage(self, symbol: str, leverage: int) -> int:
+        """Set leverage for a symbol. Returns actual leverage set (0 on total failure).
+
+        On -4028 ("Leverage X is not valid"), steps down through lower values
+        until a valid one is found. Some symbols (e.g. KITE) only support
+        limited leverage brackets on Binance testnet.
+        """
         if self._leverage_cache.get(symbol) == leverage:
             logger.debug(f"[Futures] Leverage {symbol} already {leverage}x (cached), skipping")
-            return True
-        try:
-            await self._retry(
-                self.exchange.set_leverage, leverage, symbol,
-                endpoint="set_leverage",
-            )
-            self._leverage_cache[symbol] = leverage
-            logger.info(f"[Futures] Set leverage {symbol} → {leverage}x")
-            return True
-        except Exception as e:
-            # Some symbols may not support the requested leverage
-            logger.warning(f"[Futures] Failed to set leverage {symbol} {leverage}x: {e}")
-            return False
+            return leverage
+
+        _candidates = [leverage] + [l for l in (5, 4, 3, 2, 1) if l < leverage]
+        for _lev in _candidates:
+            try:
+                await self._retry(
+                    self.exchange.set_leverage, _lev, symbol,
+                    endpoint="set_leverage",
+                )
+                self._leverage_cache[symbol] = _lev
+                if _lev != leverage:
+                    logger.warning(
+                        f"[Futures] Set leverage {symbol} → {_lev}x "
+                        f"(requested {leverage}x not supported)"
+                    )
+                else:
+                    logger.info(f"[Futures] Set leverage {symbol} → {_lev}x")
+                return _lev
+            except Exception as e:
+                _err = str(e)
+                if "-4028" in _err or "not valid" in _err.lower():
+                    logger.debug(f"[Futures] Leverage {_lev}x not valid for {symbol}, trying lower")
+                    continue
+                logger.warning(f"[Futures] Failed to set leverage {symbol} {_lev}x: {e}")
+                return 0
+        logger.error(f"[Futures] No valid leverage found for {symbol} (tried {_candidates})")
+        return 0
 
     async def set_margin_type(self, symbol: str, margin_type: str = "ISOLATED") -> bool:
         """Set margin type (ISOLATED or CROSSED) for a symbol."""
@@ -415,18 +434,24 @@ class FuturesExchangeConnector(ExchangeConnector):
             logger.info(f"[Futures] Set margin {symbol} → {margin_type}")
             return True
         except ccxt_async.ExchangeError as e:
-            # "No need to change margin type" is OK — already set
-            if "no need to change" in str(e).lower() or "already" in str(e).lower():
+            _err = str(e).lower()
+            # "No need to change margin type" / "already" / -4067 "open orders exist"
+            # all mean margin mode is already set — safe to proceed.
+            if "no need to change" in _err or "already" in _err or "-4067" in _err:
                 logger.debug(f"[Futures] Margin already {margin_type} for {symbol}")
                 return True
             logger.warning(f"[Futures] Failed to set margin {symbol}: {e}")
             return False
 
-    async def prepare_symbol(self, symbol: str, leverage: int) -> bool:
-        """Set both margin type and leverage for a symbol before trading."""
+    async def prepare_symbol(self, symbol: str, leverage: int) -> int:
+        """Set margin type and leverage for a symbol before trading.
+
+        Returns actual leverage set (0 on failure).
+        """
         margin_ok = await self.set_margin_type(symbol, self._margin_type)
-        lev_ok = await self.set_leverage(symbol, leverage)
-        return margin_ok and lev_ok
+        if not margin_ok:
+            return 0
+        return await self.set_leverage(symbol, leverage)
 
     # ── Futures-specific: Positions & Funding ──────────────────────────────
 
@@ -509,7 +534,10 @@ class FuturesExchangeConnector(ExchangeConnector):
     async def open_long(self, symbol: str, amount: float, leverage: int = 0) -> dict:
         """Open a long futures position (market buy)."""
         if leverage > 0:
-            await self.prepare_symbol(symbol, leverage)
+            actual_lev = await self.prepare_symbol(symbol, leverage)
+            if actual_lev == 0:
+                raise Exception(f"Cannot set any valid leverage for {symbol}")
+            leverage = actual_lev
         amount = float(self._clamp_amount(symbol, amount))
         logger.info(f"[Futures] OPEN LONG {symbol} amount={amount:.6f} lev={leverage}x")
         return await self._retry(
@@ -519,6 +547,7 @@ class FuturesExchangeConnector(ExchangeConnector):
 
     async def close_long(self, symbol: str, amount: float) -> dict:
         """Close a long futures position (market sell with reduceOnly)."""
+        amount = float(self._clamp_amount(symbol, amount))
         logger.info(f"[Futures] CLOSE LONG {symbol} amount={amount:.6f}")
         return await self._retry(
             self.exchange.create_order, symbol, "market", "sell", amount,
@@ -529,7 +558,10 @@ class FuturesExchangeConnector(ExchangeConnector):
     async def open_short(self, symbol: str, amount: float, leverage: int = 0) -> dict:
         """Open a short futures position (market sell)."""
         if leverage > 0:
-            await self.prepare_symbol(symbol, leverage)
+            actual_lev = await self.prepare_symbol(symbol, leverage)
+            if actual_lev == 0:
+                raise Exception(f"Cannot set any valid leverage for {symbol}")
+            leverage = actual_lev
         amount = float(self._clamp_amount(symbol, amount))
         logger.info(f"[Futures] OPEN SHORT {symbol} amount={amount:.6f} lev={leverage}x")
         return await self._retry(
@@ -539,6 +571,7 @@ class FuturesExchangeConnector(ExchangeConnector):
 
     async def close_short(self, symbol: str, amount: float) -> dict:
         """Close a short futures position (market buy with reduceOnly)."""
+        amount = float(self._clamp_amount(symbol, amount))
         logger.info(f"[Futures] CLOSE SHORT {symbol} amount={amount:.6f}")
         return await self._retry(
             self.exchange.create_order, symbol, "market", "buy", amount,
@@ -592,7 +625,40 @@ class FuturesExchangeConnector(ExchangeConnector):
             )
             return {"id": algo_id, "algoId": algo_id, "status": resp.get("algoStatus")}
         except Exception as e:
-            logger.warning(f"[Futures] Failed to place SL order for {symbol}: {e}")
+            _err = str(e)
+            # If amount exceeds max qty, retry with clamped amount.
+            # Partial SL (covering max_qty) is far better than NO SL.
+            if "-4005" in _err or "max quantity" in _err.lower():
+                try:
+                    clamped = float(self._clamp_amount(symbol, amount))
+                    if 0 < clamped < amount:
+                        logger.warning(
+                            f"[Futures] SL order: amount {amount:.2f} > max qty for {symbol}, "
+                            f"retrying with clamped {clamped:.2f}"
+                        )
+                        market = self.exchange.market(symbol)
+                        market_id = market["id"]
+                        order_side = "SELL" if side == "long" else "BUY"
+                        resp = await self.exchange.request("algoOrder", "fapiPrivate", "POST", params={
+                            "symbol": market_id,
+                            "side": order_side,
+                            "type": "STOP_MARKET",
+                            "algoType": "CONDITIONAL",
+                            "quantity": str(self.exchange.amount_to_precision(symbol, clamped)),
+                            "triggerPrice": str(stop_price),
+                            "reduceOnly": "true",
+                            "workingType": "CONTRACT_PRICE",
+                        })
+                        algo_id = str(resp.get("algoId", ""))
+                        logger.info(
+                            f"[Futures] SL ORDER placed (clamped): {symbol} {order_side} {clamped} "
+                            f"@ stop={stop_price} → algoId={algo_id}"
+                        )
+                        return {"id": algo_id, "algoId": algo_id, "status": resp.get("algoStatus")}
+                except Exception as e2:
+                    logger.warning(f"[Futures] SL order retry also failed for {symbol}: {e2}")
+            else:
+                logger.warning(f"[Futures] Failed to place SL order for {symbol}: {e}")
             return None
 
     async def cancel_stop_loss_order(self, symbol: str, order_id: str) -> bool:

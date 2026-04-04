@@ -584,18 +584,22 @@ class FuturesExecutionCore(ExecutionCore):
                 fee_currency = fee.get("currency", "USDT")
                 fee_usd = fee_cost if fee_currency == "USDT" else fee_cost * fill_price
 
+                # Read actual leverage from cache (may differ from requested
+                # if set_leverage fell back on -4028)
+                _actual_lev = self.futures_exchange._leverage_cache.get(symbol, leverage)
+
                 trades_total.labels(side=direction, exchange=self.exchange.name).inc()
                 logger.info(
                     f"[FuturesExec] FILLED {direction.upper()} {symbol}: "
                     f"amount={filled_amount:.6f} @ {fill_price:.6f} "
-                    f"lev={leverage}x fee=${fee_usd:.4f}"
+                    f"lev={_actual_lev}x fee=${fee_usd:.4f}"
                 )
                 return {
                     "order_id": order["id"],
                     "symbol": symbol,
                     "side": "buy" if direction == "long" else "sell",
                     "direction": direction,
-                    "leverage": leverage,
+                    "leverage": _actual_lev,
                     "filled_price": fill_price,
                     "filled_amount": filled_amount,
                     "amount_usd": fill_price * filled_amount,
@@ -698,6 +702,19 @@ class FuturesExecutionCore(ExecutionCore):
             except SubMinimumAmountError:
                 raise
             except Exception as e:
+                _err_str = str(e)
+                # ── Max quantity exceeded (-4005): halve and close in chunks ──
+                # BAS/USDT had 1M tokens but Binance max was ~500K.
+                # Without this, exit fails 5× and position gets ghost-closed.
+                if "-4005" in _err_str or "max quantity" in _err_str.lower():
+                    amount_adj = amount_adj / 2
+                    raw_adj2 = self.exchange.amount_to_precision(symbol, amount_adj)
+                    amount_adj = float(raw_adj2) if raw_adj2 is not None else amount_adj
+                    logger.warning(
+                        f"[FuturesExec] {symbol} exit: max qty exceeded, "
+                        f"halving to {amount_adj:.2f} tokens (attempt {attempt+1})"
+                    )
+                    continue  # retry immediately with smaller amount
                 logger.warning(f"[FuturesExec] Exit attempt {attempt+1} failed for {symbol} ({reason}): {e}")
                 errors_total.labels(component="futures_execution", error_type="close_failed").inc()
                 if attempt < self.max_retries - 1:
