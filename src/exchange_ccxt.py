@@ -511,24 +511,29 @@ class FuturesExchangeConnector(ExchangeConnector):
     def _clamp_amount(self, symbol: str, amount: float) -> float:
         """Clamp order amount to exchange max quantity limit for the symbol.
 
-        CCXT doesn't always parse maxQty into limits.amount.max for Binance
-        futures markets.  Fall back to reading the raw MARKET_LOT_SIZE /
-        LOT_SIZE filters from market['info']['filters'].
+        For market orders, MARKET_LOT_SIZE is the binding limit (often much
+        smaller than LOT_SIZE).  CCXT's limits.amount.max usually reflects
+        LOT_SIZE, so we read raw filters and take the MINIMUM of all maxQty
+        values to be safe.
         """
         market = self.exchange.markets.get(symbol)
         if market:
-            max_qty = market.get("limits", {}).get("amount", {}).get("max")
-            # Fallback: read raw Binance filters if CCXT didn't parse max
-            if not max_qty:
-                for f in (market.get("info", {}).get("filters") or []):
-                    if f.get("filterType") in ("MARKET_LOT_SIZE", "LOT_SIZE"):
-                        _mq = float(f.get("maxQty", 0))
-                        if _mq > 0:
-                            max_qty = _mq
-                            break
-            if max_qty and amount > max_qty:
-                logger.warning(f"[Futures] {symbol} amount {amount:.2f} exceeds max {max_qty:.2f}, clamping")
-                amount = float(max_qty) * 0.99  # 1% below max for safety
+            # Gather all available maxQty values — take the smallest
+            candidates = []
+            ccxt_max = market.get("limits", {}).get("amount", {}).get("max")
+            if ccxt_max and ccxt_max > 0:
+                candidates.append(float(ccxt_max))
+            for f in (market.get("info", {}).get("filters") or []):
+                ft = f.get("filterType", "")
+                if ft in ("MARKET_LOT_SIZE", "LOT_SIZE"):
+                    _mq = float(f.get("maxQty", 0))
+                    if _mq > 0:
+                        candidates.append(_mq)
+            if candidates:
+                max_qty = min(candidates)
+                if amount > max_qty:
+                    logger.warning(f"[Futures] {symbol} amount {amount:.2f} exceeds max {max_qty:.2f}, clamping")
+                    amount = float(max_qty) * 0.99  # 1% below max for safety
         return self.exchange.amount_to_precision(symbol, amount)
 
     async def open_long(self, symbol: str, amount: float, leverage: int = 0) -> dict:
