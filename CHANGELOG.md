@@ -5,6 +5,142 @@ Format: **version → date → category → what changed → why**.
 
 ---
 
+## v4.2 — April 4, 2026 — Stop the Bleeding: Regime Protection + Anti-Churn
+
+> **Mission:** Bot was bleeding from three root causes: (1) regime downgrade protection was never wired in, (2) stop-loss and exit orders failed on large positions due to Binance -4005 max quantity errors, (3) position rotation was killing positions at -1% in choppy/volatile markets causing destructive churn. This release fixes all three.
+
+---
+
+### ROOT CAUSE ANALYSIS
+
+```
+Recent 15 trades:
+  rotated_out:     5 trades, -$166 total  ← BIGGEST BLEEDER
+  stop_loss:       2 trades, -$224 total
+  trailing_stop:   3 trades, +$149 total  (working correctly)
+  early_thesis:    1 trade,  -$50 total
+  other:           4 trades, mixed
+
+Key finding: rotated_out was killing positions at just -1% PnL to make
+room for new signals that also lost. Pure churn in sideways/choppy market.
+```
+
+---
+
+### CRITICAL FIX 1: Smart Regime Downgrade Protection
+
+#### `tighten_stops_for_regime` replaces dead `sweep_vulnerable_positions`
+- **Files:** `src/position_manager.py` (lines 509-573), `backend/server.py` (lines 1218-1239)
+- **Bug:** `sweep_vulnerable_positions` existed in position_manager.py but was **NEVER CALLED** from server.py. A previous attempt at a regime sweep was disabled because it nuked ALL positions on bear↔choppy oscillation. Result: zero protection on regime downgrades.
+- **Fix:** New `tighten_stops_for_regime` method:
+  1. Tightens stop-loss on ALL open positions to the new (tighter) regime parameters
+  2. Updates exchange-side SL orders to match
+  3. Only force-closes positions deeply underwater (< -2.0% PnL)
+- **Regime severity ranking:** bull=3, sideways=2, bear=1, choppy=0
+- **Trigger:** Only on genuine DOWNGRADES (e.g., bull→choppy), not lateral shifts (bear↔choppy)
+- **Impact:** Positions now get tighter stops automatically when market conditions worsen, instead of running with wide bull-era stops in a choppy market.
+
+---
+
+### CRITICAL FIX 2: SL and Exit Order Clamping (-4005 Prevention)
+
+#### 2a. Stop-loss placement retry with clamped amount
+- **File:** `src/exchange_ccxt.py` (lines 625-660)
+- **Bug:** When a position accumulated beyond Binance's max order quantity (via scale-ups), `place_stop_loss_order` failed with -4005. The position then ran **without any stop-loss protection**.
+- **Fix:** On -4005 error, retry with `_clamp_amount` (capped to max_qty). Partial SL covering max_qty is far better than NO SL.
+
+#### 2b. `close_long` / `close_short` now clamp amounts
+- **File:** `src/exchange_ccxt.py` (lines 548-580)
+- **Bug:** Exit orders for large positions hit -4005 on first attempt, wasting retries.
+- **Fix:** Added `_clamp_amount` call at the start of `close_long` and `close_short`. Exits now succeed on first attempt.
+
+#### 2c. `_clamp_amount` uses MIN of all filters (not just LOT_SIZE)
+- **File:** `src/exchange_ccxt.py` (lines 511-537)
+- **Bug:** `_clamp_amount` read `limits.amount.max` from CCXT (= LOT_SIZE = 10M for ZETA) but ignored `MARKET_LOT_SIZE` (= 1M). For market orders, `MARKET_LOT_SIZE` is the binding limit.
+- **Fix:** Gather all maxQty values from CCXT limits + LOT_SIZE + MARKET_LOT_SIZE filters, take the MINIMUM.
+- **Result:** ZETA (20285 → 10000) and SWARMS (444687 → 200000) now clamped correctly on first attempt. No more -4005 retry cascades.
+
+#### 2d. Scale-up capped at 90% of max_qty
+- **File:** `src/position_manager.py` (lines 1085-1108)
+- **Bug:** Scale-ups could accumulate position size beyond max_qty, which then broke SL placement and exits.
+- **Fix:** Before scale-up, check if `new_total > max_qty * 0.90`. If so, block the scale-up.
+- **Impact:** Prevents the root cause of -4005 errors — positions never grow beyond what the exchange can handle.
+
+---
+
+### CRITICAL FIX 3: Position Rotation Churn Eliminated
+
+#### Rotation restricted to prevent destructive churn
+- **File:** `backend/server.py` (lines 1013-1049)
+- **Bug:** Position rotation closed the worst-performing position (≥ -1% PnL, ≥ 5 min hold) whenever a new signal with rank ≥ 35 appeared and max_positions was hit. In choppy/volatile markets, this created a destruction loop: sell losers at -1% → buy new signals → those also lose -1% → rotate again. **5 of 15 recent trades were rotated_out, totaling -$166.**
+- **Fix — 4 restrictions added:**
+
+| Guard | Old | New | Why |
+|-------|-----|-----|-----|
+| Regime block | (none) | Blocked in choppy, bear, volatile | Churn is most destructive in bad regimes |
+| Rank threshold | ≥ 35 | ≥ 45 | Higher bar for the incoming signal to justify killing a position |
+| PnL threshold | ≤ -1.0% | ≤ -2.5% | Positions at -1% often recover; only rotate deep losers |
+| Min hold time | ≥ 5 min | ≥ 15 min | Give new entries a fair chance before killing them |
+
+---
+
+### FIX 4: Regime Tracked in Trade Records
+
+#### Trade DB now includes regime + bigbrother_mode
+- **File:** `backend/server.py` (lines 1721-1722)
+- **Bug:** `_save_trade_to_db` didn't include the regime field. Frontend learning log showed "Regime 'unknown' has 22% win rate" — useless for analysis.
+- **Fix:** `doc.setdefault("regime", STATE.get("regime", "unknown"))` and `doc.setdefault("bigbrother_mode", ...)` added to `_save_trade_to_db`.
+- **Impact:** Learning logs now correctly track per-regime win rates.
+
+### FIX 5: BigBrother `log_losing_trade` pushed to VM
+- **File:** `src/bigbrother.py`
+- **Bug:** The `log_losing_trade` method existed locally but was never committed/pushed. Bot crashed with `'BigBrotherAgent' object has no attribute 'log_losing_trade'` on every losing trade exit.
+- **Fix:** Pushed the file with the method. Also includes self-improvement learning log infrastructure.
+
+---
+
+### CONFIGURATION CHANGES (v4.2)
+
+| Parameter | Old | New | File |
+|-----------|-----|-----|------|
+| Rotation regime block | (none) | choppy, bear, volatile blocked | `server.py` |
+| Rotation rank threshold | ≥ 35 | ≥ 45 | `server.py` |
+| Rotation PnL threshold | ≤ -1.0% | ≤ -2.5% | `server.py` |
+| Rotation min hold | ≥ 5 min | ≥ 15 min | `server.py` |
+| `_clamp_amount` filter source | LOT_SIZE only | min(LOT_SIZE, MARKET_LOT_SIZE) | `exchange_ccxt.py` |
+| Scale-up max_qty cap | (none) | 90% of max_qty | `position_manager.py` |
+| `close_long`/`close_short` clamping | (none) | `_clamp_amount` on entry | `exchange_ccxt.py` |
+| SL placement -4005 retry | (none) | Retry with clamped amount | `exchange_ccxt.py` |
+| Regime downgrade protection | Disabled / never called | `tighten_stops_for_regime` | `server.py` + `position_manager.py` |
+| Trade DB regime field | (none) | `regime` + `bigbrother_mode` | `server.py` |
+
+### FILES MODIFIED IN v4.2
+
+| File | Changes |
+|------|---------|
+| `src/position_manager.py` | `tighten_stops_for_regime` replaces `sweep_vulnerable_positions`, scale-up max_qty cap |
+| `src/exchange_ccxt.py` | `_clamp_amount` uses min(all filters), `close_long`/`close_short` clamp, SL -4005 retry |
+| `backend/server.py` | Regime downgrade wiring, rotation restrictions, regime in trade DB |
+| `src/bigbrother.py` | `log_losing_trade` + self-improvement learning log (was uncommitted) |
+
+---
+
+### DEFENSE LAYERS (updated v4.2)
+
+| Time | Check | What It Catches |
+|------|-------|-----------------|
+| Every tick | Exchange SL (STOP_MARKET, clamped) | Crash protection even if bot is down |
+| Every tick | Trailing stop (+1% activate, 1% distance) | Locks in profit on runners |
+| Every tick | Stop loss -3.5% | Hard downside floor |
+| On regime downgrade | `tighten_stops_for_regime` | **NEW:** Tightens all stops + closes deep losers (< -2%) |
+| 5 min | `early_thesis_invalid` | Momentum never materialized (pnl < -1%, peak < 0.3%) |
+| Every 2 min | BigBrother health monitor | RSI collapsed (< 40 declining) on losing position |
+| 30 min | `momentum_faded` | Had +3% peak but gave back 60%+ |
+| 3h | Time exit | Stale losers that never triggered anything |
+| 6h | Time exit max | Hard ceiling for all positions |
+
+---
+
 ## v4.1 — April 4, 2026 — Aggressive Trading + Defense Stack
 
 > **Mission:** Maximize capital deployment with aggressive entry settings while building a layered defense system that catches bad entries fast and lets winners run. Fix critical bugs that blocked entries and stuck positions.
