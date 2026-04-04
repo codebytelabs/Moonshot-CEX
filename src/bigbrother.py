@@ -163,6 +163,18 @@ class BigBrotherAgent:
         self._llm_macro_interval: int = 30    # query LLM every 30 cycles (≈7.5 min)
         self._last_equity: float = 0.0        # last known equity for status summary drawdown
 
+        # ── Supervisor loop state ────────────────────────────────────────────
+        self._sv_interval: int = 8          # run every 8 cycles (≈2 min at 15s/cycle)
+        self._sv_last_run: int = 0          # last cycle the supervisor ran
+        # Rolling agent stats (last 20 cycles for trend detection)
+        self._sv_agent_history: list[dict] = []   # [{watcher, analyzer, errors, ts}]
+        self._sv_exchange_errors: int = 0    # cumulative exchange errors since last SV run
+        self._sv_exchange_latency: list[float] = []  # recent API latencies
+        # Position PnL snapshots for stagnation detection
+        self._sv_pos_snapshots: dict[str, list[float]] = {}  # symbol → [pnl_pct history]
+        # Last supervisor report (exposed via get_status_summary)
+        self._sv_last_report: dict = {}
+
     async def supervise(
         self,
         current_equity: float,
@@ -547,7 +559,389 @@ class BigBrotherAgent:
             # LLM macro signal — visible in /api/swarm/status for observability
             "llm_macro_score": self._llm_macro_score,
             "llm_macro_label": self._llm_macro_label,
+            # Supervisor loop — last report summary
+            "supervisor_verdict": self._sv_last_report.get("verdict", "N/A"),
+            "supervisor_actions": len(self._sv_last_report.get("actions", [])),
+            "supervisor_last_cycle": self._sv_last_run,
         }
 
     def get_recent_events(self, n: int = 20) -> list[dict]:
         return self._events[-n:]
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SUPERVISOR LOOP — comprehensive health audit every ~2 minutes
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def record_agent_stats(
+        self,
+        watcher_candidates: int = 0,
+        analyzer_setups: int = 0,
+        cycle_errors: int = 0,
+        api_latency: float = 0.0,
+    ) -> None:
+        """Called every cycle from server.py to feed telemetry into the supervisor."""
+        self._sv_agent_history.append({
+            "watcher": watcher_candidates,
+            "analyzer": analyzer_setups,
+            "errors": cycle_errors,
+            "ts": time.time(),
+        })
+        # Keep last 30 cycles (~7.5 min of history)
+        if len(self._sv_agent_history) > 30:
+            self._sv_agent_history = self._sv_agent_history[-30:]
+        if cycle_errors > 0:
+            self._sv_exchange_errors += cycle_errors
+        if api_latency > 0:
+            self._sv_exchange_latency.append(api_latency)
+            if len(self._sv_exchange_latency) > 30:
+                self._sv_exchange_latency = self._sv_exchange_latency[-30:]
+
+    async def supervisor_loop(
+        self,
+        positions: list,
+        closed_trades: list,
+        current_equity: float,
+        position_manager=None,
+    ) -> dict:
+        """Comprehensive health audit — runs every ~2 minutes.
+
+        Checks:
+          1. Agent health (watcher/analyzer output + error rates)
+          2. Strategy performance (expectancy, win rate trend, bleeding)
+          3. Position validity (stagnant, thesis expired, holding too long)
+          4. Concentration risk (correlated positions)
+          5. Exchange health (API errors, latency)
+          6. Self-healing actions (tighten stops, alerts, mode shifts)
+
+        Returns dict with findings and actions taken.
+        """
+        self._sv_last_run = self._cycle_count
+        report = {
+            "cycle": self._cycle_count,
+            "ts": int(time.time()),
+            "checks": {},
+            "actions": [],
+            "alerts": [],
+        }
+
+        # ── 1. Agent Health ──────────────────────────────────────────────────
+        agent_health = self._check_agent_health()
+        report["checks"]["agent_health"] = agent_health
+        if agent_health["status"] == "degraded":
+            report["actions"].append(f"WARN: {agent_health['detail']}")
+            report["alerts"].append(agent_health["detail"])
+            self._record_event("supervisor_agent_degraded", agent_health["detail"])
+
+        # ── 2. Strategy Performance ──────────────────────────────────────────
+        strat_health = self._check_strategy_performance(closed_trades)
+        report["checks"]["strategy"] = strat_health
+        if strat_health["status"] == "bleeding":
+            report["actions"].append(f"WARN: {strat_health['detail']}")
+            report["alerts"].append(strat_health["detail"])
+            self._record_event("supervisor_strategy_bleeding", strat_health["detail"])
+
+        # ── 3. Position Validity ─────────────────────────────────────────────
+        pos_checks = self._check_position_validity(positions)
+        report["checks"]["positions"] = pos_checks
+        for pc in pos_checks.get("stagnant", []):
+            report["actions"].append(f"TIGHTEN: {pc['symbol']} stagnant {pc['detail']}")
+            self._record_event("supervisor_pos_stagnant", f"{pc['symbol']}: {pc['detail']}")
+        for pc in pos_checks.get("underwater_long", []):
+            report["actions"].append(f"WATCH: {pc['symbol']} underwater {pc['detail']}")
+
+        # Apply self-healing: tighten trailing stops on stagnant positions
+        if position_manager and pos_checks.get("stagnant"):
+            for pc in pos_checks["stagnant"]:
+                await self._heal_stagnant_position(pc["pos"], position_manager)
+
+        # ── 4. Concentration Risk ────────────────────────────────────────────
+        concentration = self._check_concentration_risk(positions)
+        report["checks"]["concentration"] = concentration
+        if concentration["status"] == "high":
+            report["actions"].append(f"WARN: {concentration['detail']}")
+            report["alerts"].append(concentration["detail"])
+            self._record_event("supervisor_concentration", concentration["detail"])
+
+        # ── 5. Exchange Health ───────────────────────────────────────────────
+        exchange_health = self._check_exchange_health()
+        report["checks"]["exchange"] = exchange_health
+        if exchange_health["status"] == "degraded":
+            report["actions"].append(f"WARN: {exchange_health['detail']}")
+            report["alerts"].append(exchange_health["detail"])
+            self._record_event("supervisor_exchange_degraded", exchange_health["detail"])
+
+        # ── 6. Overall Verdict ───────────────────────────────────────────────
+        critical_count = len(report["alerts"])
+        if critical_count >= 3:
+            report["verdict"] = "CRITICAL"
+        elif critical_count >= 1:
+            report["verdict"] = "WARNING"
+        else:
+            report["verdict"] = "HEALTHY"
+
+        # Log summary
+        action_count = len(report["actions"])
+        pos_count = len([p for p in positions if getattr(p, "status", "") == "open"])
+        logger.info(
+            f"[Supervisor] Cycle {self._cycle_count} | verdict={report['verdict']} "
+            f"positions={pos_count} actions={action_count} "
+            f"agents={'OK' if agent_health['status'] == 'healthy' else agent_health['status']} "
+            f"strategy={strat_health['status']} "
+            f"exchange={exchange_health['status']}"
+        )
+        if report["actions"]:
+            for act in report["actions"]:
+                logger.info(f"[Supervisor] → {act}")
+
+        # Send alert if critical
+        if self.alerts and critical_count > 0:
+            alert_text = "\n".join([f"• {a}" for a in report["alerts"]])
+            await self.alerts.send(
+                f"🔍 Supervisor ({report['verdict']}): {critical_count} issue(s)\n{alert_text}",
+                priority="high" if critical_count >= 3 else "medium",
+            )
+
+        self._sv_last_report = report
+        # Reset per-interval counters
+        self._sv_exchange_errors = 0
+        return report
+
+    # ── Supervisor check implementations ─────────────────────────────────────
+
+    def _check_agent_health(self) -> dict:
+        """Are watcher and analyzer producing output? Any error spikes?"""
+        history = self._sv_agent_history
+        if len(history) < 3:
+            return {"status": "healthy", "detail": "insufficient data"}
+
+        recent = history[-8:]  # last 8 cycles (≈2 min)
+        watcher_zeros = sum(1 for h in recent if h["watcher"] == 0)
+        analyzer_zeros = sum(1 for h in recent if h["analyzer"] == 0)
+        error_total = sum(h["errors"] for h in recent)
+        avg_watcher = sum(h["watcher"] for h in recent) / len(recent)
+        avg_analyzer = sum(h["analyzer"] for h in recent) / len(recent)
+
+        issues = []
+        # Watcher producing zero candidates for most cycles = something broken
+        if watcher_zeros >= 6:
+            issues.append(f"Watcher returned 0 candidates in {watcher_zeros}/{len(recent)} cycles")
+        # Analyzer producing zero setups consistently (could be legitimate in choppy)
+        # Only flag if watcher IS producing candidates but analyzer kills them all
+        if analyzer_zeros >= 7 and avg_watcher > 10:
+            issues.append(f"Analyzer produced 0 setups in {analyzer_zeros}/{len(recent)} cycles despite {avg_watcher:.0f} avg candidates")
+        # Error spike
+        if error_total >= 5:
+            issues.append(f"{error_total} errors in last {len(recent)} cycles")
+
+        if issues:
+            return {"status": "degraded", "detail": "; ".join(issues),
+                    "avg_watcher": round(avg_watcher, 1), "avg_analyzer": round(avg_analyzer, 1)}
+        return {"status": "healthy", "detail": "OK",
+                "avg_watcher": round(avg_watcher, 1), "avg_analyzer": round(avg_analyzer, 1)}
+
+    def _check_strategy_performance(self, closed_trades: list) -> dict:
+        """Is the bot making money? Detect bleeding before drawdown triggers."""
+        if len(closed_trades) < 5:
+            return {"status": "healthy", "detail": "insufficient trades", "expectancy": 0}
+
+        # Last 10 trades: rolling expectancy and win rate
+        recent = closed_trades[-10:]
+        wins = [t for t in recent if t.get("pnl_usd", 0) > 0]
+        losses = [t for t in recent if t.get("pnl_usd", 0) <= 0]
+        wr = len(wins) / len(recent) if recent else 0
+        total_pnl = sum(t.get("pnl_usd", 0) for t in recent)
+        expectancy = total_pnl / len(recent)
+        avg_win = sum(t.get("pnl_usd", 0) for t in wins) / len(wins) if wins else 0
+        avg_loss = sum(t.get("pnl_usd", 0) for t in losses) / len(losses) if losses else 0
+
+        # Last 5 trades: short-term trend
+        last5 = closed_trades[-5:]
+        last5_pnl = sum(t.get("pnl_usd", 0) for t in last5)
+        last5_wr = sum(1 for t in last5 if t.get("pnl_usd", 0) > 0) / len(last5) if last5 else 0
+
+        result = {
+            "win_rate_10": round(wr, 2),
+            "expectancy": round(expectancy, 2),
+            "avg_win": round(avg_win, 2),
+            "avg_loss": round(avg_loss, 2),
+            "last5_pnl": round(last5_pnl, 2),
+            "last5_wr": round(last5_wr, 2),
+        }
+
+        # Bleeding: negative expectancy AND last 5 trades also negative
+        if expectancy < -2.0 and last5_pnl < 0 and wr < 0.35:
+            result["status"] = "bleeding"
+            result["detail"] = (
+                f"Negative expectancy ${expectancy:.2f}/trade, "
+                f"WR={wr:.0%}, last 5 trades ${last5_pnl:+.2f}"
+            )
+        elif expectancy < 0 and wr < 0.40:
+            result["status"] = "weak"
+            result["detail"] = f"Expectancy ${expectancy:.2f}/trade, WR={wr:.0%}"
+        else:
+            result["status"] = "healthy"
+            result["detail"] = f"Expectancy ${expectancy:.2f}/trade, WR={wr:.0%}"
+        return result
+
+    def _check_position_validity(self, positions: list) -> dict:
+        """Are open positions still justified? Detect stagnation and zombies."""
+        result = {"stagnant": [], "underwater_long": [], "healthy": 0, "total": 0}
+        now = time.time()
+
+        for pos in positions:
+            if getattr(pos, "status", "") != "open":
+                continue
+            if getattr(pos, "setup_type", "") in ("synced_holding", "exchange_holding"):
+                continue
+            result["total"] += 1
+
+            hold_h = pos.hold_time_hours()
+            entry = pos.entry_price
+            highest = getattr(pos, "highest_price", entry)
+            current_pnl = pos.current_pnl_pct(highest)  # PnL at best point
+            # Use last known price approximation from highest/lowest tracking
+            # (actual price fetching happens in server.py, not here)
+            peak_pnl = pos.current_pnl_pct(highest) if pos.side == "long" else pos.current_pnl_pct(getattr(pos, "lowest_price", entry))
+
+            # Track PnL snapshots for stagnation detection
+            sym = pos.symbol
+            if sym not in self._sv_pos_snapshots:
+                self._sv_pos_snapshots[sym] = []
+            self._sv_pos_snapshots[sym].append(peak_pnl)
+            # Keep last 10 snapshots (≈20 min of supervisor checks)
+            if len(self._sv_pos_snapshots[sym]) > 10:
+                self._sv_pos_snapshots[sym] = self._sv_pos_snapshots[sym][-10:]
+
+            # ── Stagnant: held >45min, never exceeded +1.5%, peak PnL not growing ──
+            snaps = self._sv_pos_snapshots.get(sym, [])
+            if hold_h >= 0.75 and peak_pnl < 1.5 and len(snaps) >= 3:
+                # Check if peak PnL hasn't improved over last 3 supervisor runs (≈6 min)
+                pnl_range = max(snaps[-3:]) - min(snaps[-3:])
+                if pnl_range < 0.3:  # PnL hasn't moved >0.3% in 6 minutes
+                    result["stagnant"].append({
+                        "symbol": sym,
+                        "pos": pos,
+                        "hold_h": round(hold_h, 2),
+                        "peak_pnl": round(peak_pnl, 2),
+                        "detail": f"held {hold_h:.1f}h, peak {peak_pnl:+.1f}%, PnL flat for {len(snaps[-3:])} checks",
+                    })
+                    continue
+
+            # ── Underwater long: held >30min and consistently red ──
+            if hold_h >= 0.5 and peak_pnl < 0:
+                result["underwater_long"].append({
+                    "symbol": sym,
+                    "hold_h": round(hold_h, 2),
+                    "peak_pnl": round(peak_pnl, 2),
+                    "detail": f"held {hold_h:.1f}h, best PnL {peak_pnl:+.1f}% — never went green",
+                })
+                continue
+
+            result["healthy"] += 1
+
+        # Clean snapshots for closed positions
+        open_syms = {getattr(p, "symbol", "") for p in positions if getattr(p, "status", "") == "open"}
+        for sym in list(self._sv_pos_snapshots.keys()):
+            if sym not in open_syms:
+                del self._sv_pos_snapshots[sym]
+
+        return result
+
+    def _check_concentration_risk(self, positions: list) -> dict:
+        """Are positions too correlated? Detect sector concentration."""
+        open_pos = [p for p in positions if getattr(p, "status", "") == "open"
+                    and getattr(p, "setup_type", "") not in ("synced_holding", "exchange_holding")]
+        if len(open_pos) < 3:
+            return {"status": "healthy", "detail": "too few positions to assess", "count": len(open_pos)}
+
+        # Check: all positions same side (all long or all short)
+        sides = [getattr(p, "side", "long") for p in open_pos]
+        long_pct = sides.count("long") / len(sides)
+
+        # Check: PnL correlation — if ALL positions are red or ALL are green,
+        # they might be moving together (correlated with BTC)
+        pnl_signs = []
+        for p in open_pos:
+            highest = getattr(p, "highest_price", p.entry_price)
+            pnl = p.current_pnl_pct(highest) if p.side == "long" else p.current_pnl_pct(getattr(p, "lowest_price", p.entry_price))
+            pnl_signs.append(1 if pnl > 0 else -1)
+
+        all_same_sign = len(set(pnl_signs)) == 1 and len(pnl_signs) >= 3
+
+        issues = []
+        if long_pct == 1.0 and len(open_pos) >= 4:
+            issues.append(f"All {len(open_pos)} positions are LONG — no hedge")
+        if all_same_sign and pnl_signs[0] == -1:
+            issues.append(f"All {len(open_pos)} positions are RED — highly correlated downturn")
+
+        if issues:
+            return {"status": "high", "detail": "; ".join(issues), "count": len(open_pos),
+                    "long_pct": round(long_pct, 2)}
+        return {"status": "healthy", "detail": "OK", "count": len(open_pos),
+                "long_pct": round(long_pct, 2)}
+
+    def _check_exchange_health(self) -> dict:
+        """API error rate and latency check."""
+        error_count = self._sv_exchange_errors
+        latencies = self._sv_exchange_latency
+        avg_lat = sum(latencies) / len(latencies) if latencies else 0
+        max_lat = max(latencies) if latencies else 0
+
+        issues = []
+        if error_count >= 10:
+            issues.append(f"{error_count} API errors since last check")
+        elif error_count >= 5:
+            issues.append(f"{error_count} API errors (elevated)")
+        if avg_lat > 3.0:
+            issues.append(f"Avg API latency {avg_lat:.1f}s (slow)")
+        if max_lat > 10.0:
+            issues.append(f"Max API latency {max_lat:.1f}s (timeout risk)")
+
+        if issues:
+            return {"status": "degraded", "detail": "; ".join(issues),
+                    "error_count": error_count, "avg_latency": round(avg_lat, 2)}
+        return {"status": "healthy", "detail": "OK",
+                "error_count": error_count, "avg_latency": round(avg_lat, 2)}
+
+    async def _heal_stagnant_position(self, pos, position_manager) -> None:
+        """Self-healing: tighten trailing stop on stagnant positions.
+
+        If a position has been flat for multiple supervisor checks, set a tight
+        trailing stop to exit on the next small move rather than waiting for
+        the full time_exit to clean it up.
+        """
+        try:
+            current_price = await position_manager.execution.get_current_price(pos.symbol)
+            if current_price <= 0:
+                return
+
+            pnl_pct = pos.current_pnl_pct(current_price)
+
+            if pnl_pct > 0.3:
+                # Green but stagnant — set tight trail at current minus 0.8%
+                if pos.side == "long":
+                    tight = current_price * 0.992
+                    if pos.trailing_stop is None or tight > pos.trailing_stop:
+                        pos.trailing_stop = tight
+                        await position_manager._update_exchange_sl(pos, tight)
+                        logger.info(
+                            f"[Supervisor] {pos.symbol} stagnant+green → tight trail {tight:.6f} "
+                            f"(pnl={pnl_pct:+.1f}%)"
+                        )
+                else:
+                    tight = current_price * 1.008
+                    if pos.trailing_stop is None or tight < pos.trailing_stop:
+                        pos.trailing_stop = tight
+                        await position_manager._update_exchange_sl(pos, tight)
+                        logger.info(
+                            f"[Supervisor] {pos.symbol} stagnant+green → tight trail {tight:.6f} "
+                            f"(pnl={pnl_pct:+.1f}%)"
+                        )
+            # If red and stagnant — let stop_loss handle it, don't interfere
+        except Exception as e:
+            logger.debug(f"[Supervisor] Heal failed for {pos.symbol}: {e}")
+
+    @property
+    def supervisor_due(self) -> bool:
+        """True if supervisor_loop should run this cycle."""
+        return (self._cycle_count - self._sv_last_run) >= self._sv_interval

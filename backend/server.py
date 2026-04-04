@@ -549,9 +549,16 @@ async def _run_cycle():
     open_syms_pre = _position_manager.get_open_symbols()
 
     # Run legacy pipeline and strategy manager in parallel
+    # Telemetry counters for supervisor
+    _sv_watcher_count = 0
+    _sv_analyzer_count = 0
+    _sv_cycle_errors = 0
+
     async def _legacy_pipeline():
         """Legacy watcher → analyzer → context → bayesian pipeline."""
+        nonlocal _sv_watcher_count, _sv_analyzer_count, _sv_cycle_errors
         cands = await _watcher.scan(regime=current_regime)
+        _sv_watcher_count = len(cands) if cands else 0
         if not cands:
             return []
         await asyncio.sleep(1)
@@ -560,7 +567,9 @@ async def _run_cycle():
             setups = await _analyzer.analyze(cands, regime=current_regime)
         except Exception as exc:
             logger.error(f"[Cycle {cycle}] Analyzer error: {exc}")
+            _sv_cycle_errors += 1
             return []
+        _sv_analyzer_count = len(setups) if setups else 0
         if not setups:
             return []
         enriched = await _context.enrich(setups)
@@ -590,6 +599,17 @@ async def _run_cycle():
     # Handle exceptions from gather
     legacy_approved = legacy_result if isinstance(legacy_result, list) else []
     strategy_setups = strategy_result if isinstance(strategy_result, list) else []
+    if isinstance(legacy_result, Exception):
+        _sv_cycle_errors += 1
+    if isinstance(strategy_result, Exception):
+        _sv_cycle_errors += 1
+
+    # Feed telemetry to BigBrother supervisor
+    _bigbrother.record_agent_stats(
+        watcher_candidates=_sv_watcher_count,
+        analyzer_setups=_sv_analyzer_count,
+        cycle_errors=_sv_cycle_errors,
+    )
 
     # Track legacy pipeline stats
     candidates = STATE.get("last_watcher_candidates", [])
@@ -1192,6 +1212,23 @@ async def _run_cycle():
     _ORPHAN_SWEEP_INTERVAL = 10
     if cycle % _ORPHAN_SWEEP_INTERVAL == 0:
         await _sweep_orphan_algo_orders_and_positions()
+
+    # ── Step 12: BigBrother Supervisor Loop (every 8 cycles ≈ 2 min) ──────────
+    # Comprehensive health audit: agent output, strategy performance, position
+    # validity, concentration risk, exchange API health. Self-heals stagnant
+    # positions by tightening trailing stops.
+    if _bigbrother.supervisor_due:
+        try:
+            _sv_positions = list(_position_manager._positions.values())
+            _sv_report = await _bigbrother.supervisor_loop(
+                positions=_sv_positions,
+                closed_trades=closed_history,
+                current_equity=equity,
+                position_manager=_position_manager,
+            )
+            STATE["supervisor_report"] = _sv_report
+        except Exception as _sv_err:
+            logger.warning(f"[Supervisor] Loop error: {_sv_err}")
 
     logger.info(
         f"[Swarm] Cycle {cycle} complete | "
