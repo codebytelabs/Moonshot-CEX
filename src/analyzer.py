@@ -158,13 +158,14 @@ class AnalyzerAgent:
                 _ft_pullback = (_ft_high - _closes_5m[-1]) / _ft_high * 100.0 if _ft_high > 0 else 0
                 _ft_near_high = _ft_pullback < 2.5
 
-                # Exhaustion check 2: candle quality
-                # Near high (<1%): 1/3 green is enough (move is fresh, one doji is OK)
-                # Further out (1-2.5%): need 2/3 green (prove buyers are still here)
+                # Exhaustion check 2: candle quality — at least 2/3 green candles required
+                # green=1/3 means 2 of last 3 candles are red = topping pattern (GUA/SAHARA bug).
+                # Exception: very strong pumps (>=5% 1h) tolerate 1/3 green — move is so powerful
+                # one doji is acceptable.
                 _ft_green_count = 0
                 if len(_closes_5m) >= 4:
                     _ft_green_count = sum(1 for i in range(-3, 0) if _closes_5m[i] > _closes_5m[i - 1])
-                _ft_candles_ok = _ft_green_count >= 2 or (_ft_pullback < 1.0 and _ft_green_count >= 1)
+                _ft_candles_ok = _ft_green_count >= 2 or (_return_1h >= 5.0 and _ft_green_count >= 1)
 
                 # Exhaustion check 3: 5m RSI must be in momentum zone (>45)
                 # Pullback + candle checks are the REAL dying-pump protection.

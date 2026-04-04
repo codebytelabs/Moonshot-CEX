@@ -669,16 +669,15 @@ async def _run_cycle():
         f"merged={len(approved)} (ranked by posterior×ta_score)"
     )
 
-    if not approved:
+    _skip_entries = not approved
+    if _skip_entries:
         STATE["_cycle_trace"] = trace
-        await _tick_positions()
-        return
 
     # ── Funding Rate Awareness (futures only) ──────────────────────────────
     # Fetch funding rates for approved symbols and inject into setups.
     # Skip trades where funding is extreme and direction is unfavorable.
     _funding_rates: dict[str, float] = {}
-    if STATE.get("trading_mode", "spot") == "futures" and _futures_exchange:
+    if not _skip_entries and STATE.get("trading_mode", "spot") == "futures" and _futures_exchange:
         try:
             _approved_syms = [s["symbol"] for s in approved]
             _funding_rates = await _futures_exchange.fetch_funding_rates(_approved_syms)
@@ -713,8 +712,7 @@ async def _run_cycle():
 
     if not approved:
         STATE["_cycle_trace"] = trace
-        await _tick_positions()
-        return
+        _skip_entries = True
 
     # ── Step 5: Risk gates + entry ─────────────────────────────────────────
     equity = STATE["current_equity"]
@@ -727,7 +725,7 @@ async def _run_cycle():
     _MIN_POSITION_USD = 110.0 if STATE.get("trading_mode") == "futures" else 50.0
     available_cash_usd = equity  # paper fallback: treat full equity as available
     _is_futures_cycle = STATE.get("trading_mode") == "futures" and _futures_exchange
-    if _uses_exchange_account_state():
+    if not _skip_entries and _uses_exchange_account_state():
         try:
             if _is_futures_cycle:
                 _bal = await _futures_exchange.exchange.fetch_balance()
@@ -743,24 +741,22 @@ async def _run_cycle():
         except Exception as _e:
             logger.warning(f"[Cycle {cycle}] Could not fetch cash balance, using equity: {_e}")
 
-    if _uses_exchange_account_state() and available_cash_usd < _MIN_POSITION_USD:
+    if not _skip_entries and _uses_exchange_account_state() and available_cash_usd < _MIN_POSITION_USD:
         trace["steps"].append(f"skip_entries:cash_too_low:${available_cash_usd:.0f}")
         logger.warning(
             f"[Cycle {cycle}] Only ${available_cash_usd:.2f} USDT free — "
             f"skipping new entries until positions close and cash frees up."
         )
-        await _tick_positions()
-        return
+        _skip_entries = True
 
     # ── Phase 1C: Block entries if any position has failed exits ─────────
-    if _position_manager and _position_manager.has_failed_exits:
+    if not _skip_entries and _position_manager and _position_manager.has_failed_exits:
         trace["steps"].append("skip_entries:failed_exits_pending")
         logger.warning(
             f"[Cycle {cycle}] Blocked new entries — position(s) have failed exit attempts. "
             f"Waiting for ghost-close before deploying more capital."
         )
-        await _tick_positions()
-        return
+        _skip_entries = True
 
     # ── Pull regime capital params from BigBrother (set in Step 8 of previous cycle) ──
     _regime_capital = STATE.get("regime_capital", {})
@@ -778,15 +774,17 @@ async def _run_cycle():
     #   score=0.0 (crash) → full block | 0.5 → half size | 1.0 → full size | 1.2 → bull bonus
     # Short tokens (3S/5S/DOWN) are exempt — they profit from BTC falling.
     _btc_momentum = {"score": 0.7, "bullish": True}  # default: moderate
-    try:
-        _btc_momentum = await _watcher.btc_momentum_score()
-        STATE["btc_trend_bullish"] = _btc_momentum["bullish"]
-        STATE["btc_momentum_score"] = _btc_momentum["score"]
-    except Exception as _btc_err:
-        logger.warning(f"[Cycle {cycle}] BTC momentum check failed: {_btc_err}")
-    _btc_size_mult = min(max(_btc_momentum["score"], 0.0), 1.2)  # sizing multiplier
+    _btc_size_mult = 0.7
+    if not _skip_entries:
+        try:
+            _btc_momentum = await _watcher.btc_momentum_score()
+            STATE["btc_trend_bullish"] = _btc_momentum["bullish"]
+            STATE["btc_momentum_score"] = _btc_momentum["score"]
+        except Exception as _btc_err:
+            logger.warning(f"[Cycle {cycle}] BTC momentum check failed: {_btc_err}")
+        _btc_size_mult = min(max(_btc_momentum["score"], 0.0), 1.2)  # sizing multiplier
 
-    for _slot_rank, setup in enumerate(approved, 1):
+    for _slot_rank, setup in enumerate(approved if not _skip_entries else [], 1):
         symbol = setup["symbol"]
         _setup_rank_score = _rank_score(setup)
 
