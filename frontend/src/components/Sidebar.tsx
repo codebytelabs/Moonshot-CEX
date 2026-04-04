@@ -27,7 +27,7 @@ export default function Sidebar() {
 
   return (
     <aside
-      className={`h-full bg-[#0A0F0D] border-r border-cyan-900/20 flex flex-col transition-all duration-300 shrink-0 ${collapsed ? "w-14" : "w-48"}`}
+      className={`hidden md:flex h-full bg-[#0A0F0D] border-r border-cyan-900/20 flex-col transition-all duration-300 shrink-0 ${collapsed ? "w-14" : "w-48"}`}
     >
       <div className="px-3 py-4 border-b border-cyan-900/20 flex items-center gap-2">
         <Radio size={18} className="text-cyan-400 shrink-0 animate-pulse" />

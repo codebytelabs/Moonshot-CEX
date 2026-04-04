@@ -85,3 +85,20 @@ body {
   0% { transform: translateY(-100%); }
   100% { transform: translateY(100vh); }
 }
+
+.safe-area-bottom {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* Mobile: extra bottom padding so content isn't hidden behind bottom nav */
+@media (max-width: 767px) {
+  .mobile-pb {
+    padding-bottom: calc(3.5rem + env(safe-area-inset-bottom, 0px) + 0.5rem);
+  }
+}
+
+/* Smooth scroll on touch */
+.touch-scroll {
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
+}

@@ -13,6 +13,7 @@ interface Props {
   swarmStatus: Record<string, unknown> | null;
   agents: Record<string, unknown> | null;
   onAction: (action: "start" | "stop" | "emergency") => Promise<void>;
+  readOnly?: boolean;
 }
 
 const REGIME_COLORS: Record<string, string> = {
@@ -41,7 +42,7 @@ const AGENT_ICONS: Record<string, string> = {
   bigbrother:       "🤖",
 };
 
-export default function SideSummary({ swarmStatus, agents, onAction }: Props) {
+export default function SideSummary({ swarmStatus, agents, onAction, readOnly }: Props) {
   const [loading, setLoading] = useState(false);
 
   const regime     = (swarmStatus?.regime as string) ?? "sideways";
@@ -115,33 +116,35 @@ export default function SideSummary({ swarmStatus, agents, onAction }: Props) {
       </div>
 
       {/* ── Controls ────────────────────────────────── */}
-      <div className="px-2 pb-2 pt-1 shrink-0 flex gap-1">
-        {!active ? (
+      {!readOnly && (
+        <div className="px-2 pb-2 pt-1 shrink-0 flex gap-1">
+          {!active ? (
+            <button
+              onClick={() => handle("start")}
+              disabled={loading}
+              className="flex-1 flex items-center justify-center gap-1 py-1 bg-green-500/15 border border-green-500/30 rounded text-[9px] text-green-400 hover:bg-green-500/25 transition-colors disabled:opacity-50"
+            >
+              <Play size={8} /> GO
+            </button>
+          ) : (
+            <button
+              onClick={() => handle("stop")}
+              disabled={loading}
+              className="flex-1 flex items-center justify-center gap-1 py-1 bg-slate-500/10 border border-slate-500/20 rounded text-[9px] text-slate-400 hover:bg-slate-500/20 transition-colors disabled:opacity-50"
+            >
+              <Square size={8} /> STOP
+            </button>
+          )}
           <button
-            onClick={() => handle("start")}
+            onClick={() => handle("emergency")}
             disabled={loading}
-            className="flex-1 flex items-center justify-center gap-1 py-1 bg-green-500/15 border border-green-500/30 rounded text-[9px] text-green-400 hover:bg-green-500/25 transition-colors disabled:opacity-50"
+            title="Emergency Stop"
+            className="flex items-center justify-center px-2 py-1 bg-red-500/10 border border-red-500/30 rounded text-red-400 hover:bg-red-500/20 transition-colors disabled:opacity-50"
           >
-            <Play size={8} /> GO
+            <AlertTriangle size={8} />
           </button>
-        ) : (
-          <button
-            onClick={() => handle("stop")}
-            disabled={loading}
-            className="flex-1 flex items-center justify-center gap-1 py-1 bg-slate-500/10 border border-slate-500/20 rounded text-[9px] text-slate-400 hover:bg-slate-500/20 transition-colors disabled:opacity-50"
-          >
-            <Square size={8} /> STOP
-          </button>
-        )}
-        <button
-          onClick={() => handle("emergency")}
-          disabled={loading}
-          title="Emergency Stop"
-          className="flex items-center justify-center px-2 py-1 bg-red-500/10 border border-red-500/30 rounded text-red-400 hover:bg-red-500/20 transition-colors disabled:opacity-50"
-        >
-          <AlertTriangle size={8} />
-        </button>
-      </div>
+        </div>
+      )}
     </div>
   );
 }

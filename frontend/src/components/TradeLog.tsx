@@ -52,6 +52,8 @@ export default function TradeLog({ trades }: Props) {
     return !EXCHANGE_NOISE.has(reason) && !DUST_REASONS.has(reason);
   });
 
+  const sorted = tradeList.slice().sort((a, b) => (b.closed_at ?? 0) - (a.closed_at ?? 0));
+
   return (
     <div className="h-full panel flex flex-col overflow-hidden">
       <div className="px-3 pt-2.5 pb-1.5 border-b border-white/5 shrink-0 flex items-center justify-between">
@@ -66,53 +68,88 @@ export default function TradeLog({ trades }: Props) {
             <span className="text-[10px] mono mt-1">No completed trades yet</span>
           </div>
         ) : (
-          <table className="w-full text-[10px] mono">
-            <thead>
-              <tr className="border-b border-white/5">
-                {["Symbol", "Exit", "Entry", "Exit Px", "PnL", "%", "Setup", "Hold"].map((h) => (
-                  <th key={h} className="text-left px-2 py-1.5 text-slate-600 font-medium">{h}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {tradeList.slice().sort((a, b) => (b.closed_at ?? 0) - (a.closed_at ?? 0)).map((t, i) => {
+          <>
+            {/* ═══ MOBILE: Card layout ═══ */}
+            <div className="md:hidden space-y-1 p-2">
+              {sorted.map((t, i) => {
                 const pnl = t.pnl_usd ?? 0;
                 const pct = t.pnl_pct ?? 0;
                 const win = pnl >= 0;
                 const reason = t.close_reason ?? "exit";
                 const badge = getReasonBadge(reason, win);
                 return (
-                  <tr key={t.id ?? i} className="border-b border-white/3 hover:bg-white/2">
-                    <td className="px-2 py-1.5">
-                      <div className="flex items-center gap-1">
-                        <div className={`w-1 h-3 rounded-sm ${win ? "bg-green-400" : "bg-red-400"}`} />
-                        <span className="text-slate-300">{t.symbol?.replace("/USDT", "")}</span>
+                  <div key={t.id ?? i} className="panel-card px-2.5 py-2">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <div className={`w-1 h-4 rounded-sm ${win ? "bg-green-400" : "bg-red-400"}`} />
+                        <span className="text-[11px] font-bold text-slate-200 mono">{t.symbol?.replace("/USDT", "")}</span>
+                        <span className={`px-1.5 py-0.5 rounded text-[8px] font-bold border ${badge.cls}`}>
+                          {badge.label}
+                        </span>
                       </div>
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold border ${badge.cls}`}>
-                        {badge.label}
+                      <span className={`text-[11px] font-bold mono ${win ? "text-green-400" : "text-red-400"}`}>
+                        {pnl !== 0 ? (win ? "+" : "") + "$" + pnl.toFixed(2) : "—"}
+                        <span className="text-[9px] opacity-70 ml-0.5">{pnl !== 0 ? `${win ? "+" : ""}${pct.toFixed(1)}%` : ""}</span>
                       </span>
-                    </td>
-                    <td className="px-2 py-1.5 text-slate-500">
-                      {t.entry_price != null ? t.entry_price.toPrecision(5) : "—"}
-                    </td>
-                    <td className="px-2 py-1.5 text-slate-500">
-                      {t.exit_price != null ? t.exit_price.toPrecision(5) : "—"}
-                    </td>
-                    <td className={`px-2 py-1.5 font-semibold ${win ? "text-green-400" : pnl < 0 ? "text-red-400" : "text-slate-400"}`}>
-                      {pnl !== 0 ? (win ? "+" : "") + "$" + pnl.toFixed(2) : <span className="text-slate-600">—</span>}
-                    </td>
-                    <td className={`px-2 py-1.5 ${win ? "text-green-400" : pnl < 0 ? "text-red-400" : "text-slate-600"}`}>
-                      {pnl !== 0 ? (win ? "+" : "") + pct.toFixed(1) + "%" : <span className="text-slate-600">—</span>}
-                    </td>
-                    <td className="px-2 py-1.5 text-slate-500">{t.setup_type ?? "—"}</td>
-                    <td className="px-2 py-1.5 text-slate-600">{(t.hold_time_hours ?? 0).toFixed(1)}h</td>
-                  </tr>
+                    </div>
+                    <div className="flex items-center gap-3 mt-1 text-[9px] mono text-slate-500">
+                      <span>{t.setup_type ?? "—"}</span>
+                      <span>{(t.hold_time_hours ?? 0).toFixed(1)}h</span>
+                    </div>
+                  </div>
                 );
               })}
-            </tbody>
-          </table>
+            </div>
+
+            {/* ═══ DESKTOP: Table layout ═══ */}
+            <table className="hidden md:table w-full text-[10px] mono">
+              <thead>
+                <tr className="border-b border-white/5">
+                  {["Symbol", "Exit", "Entry", "Exit Px", "PnL", "%", "Setup", "Hold"].map((h) => (
+                    <th key={h} className="text-left px-2 py-1.5 text-slate-600 font-medium">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {sorted.map((t, i) => {
+                  const pnl = t.pnl_usd ?? 0;
+                  const pct = t.pnl_pct ?? 0;
+                  const win = pnl >= 0;
+                  const reason = t.close_reason ?? "exit";
+                  const badge = getReasonBadge(reason, win);
+                  return (
+                    <tr key={t.id ?? i} className="border-b border-white/3 hover:bg-white/2">
+                      <td className="px-2 py-1.5">
+                        <div className="flex items-center gap-1">
+                          <div className={`w-1 h-3 rounded-sm ${win ? "bg-green-400" : "bg-red-400"}`} />
+                          <span className="text-slate-300">{t.symbol?.replace("/USDT", "")}</span>
+                        </div>
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold border ${badge.cls}`}>
+                          {badge.label}
+                        </span>
+                      </td>
+                      <td className="px-2 py-1.5 text-slate-500">
+                        {t.entry_price != null ? t.entry_price.toPrecision(5) : "—"}
+                      </td>
+                      <td className="px-2 py-1.5 text-slate-500">
+                        {t.exit_price != null ? t.exit_price.toPrecision(5) : "—"}
+                      </td>
+                      <td className={`px-2 py-1.5 font-semibold ${win ? "text-green-400" : pnl < 0 ? "text-red-400" : "text-slate-400"}`}>
+                        {pnl !== 0 ? (win ? "+" : "") + "$" + pnl.toFixed(2) : <span className="text-slate-600">—</span>}
+                      </td>
+                      <td className={`px-2 py-1.5 ${win ? "text-green-400" : pnl < 0 ? "text-red-400" : "text-slate-600"}`}>
+                        {pnl !== 0 ? (win ? "+" : "") + pct.toFixed(1) + "%" : <span className="text-slate-600">—</span>}
+                      </td>
+                      <td className="px-2 py-1.5 text-slate-500">{t.setup_type ?? "—"}</td>
+                      <td className="px-2 py-1.5 text-slate-600">{(t.hold_time_hours ?? 0).toFixed(1)}h</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </>
         )}
       </div>
     </div>

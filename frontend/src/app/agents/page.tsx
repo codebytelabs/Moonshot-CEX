@@ -1,6 +1,7 @@
 "use client";
 import { useState, useEffect } from "react";
 import Sidebar from "@/components/Sidebar";
+import MobileNav from "@/components/MobileNav";
 import { apiFetch } from "@/lib/api";
 
 interface AgentDetail {
@@ -66,8 +67,8 @@ export default function AgentsPage() {
   return (
     <div className="flex h-screen bg-[#050505] overflow-hidden">
       <Sidebar />
-      <main className="flex-1 flex flex-col min-h-0 overflow-y-auto">
-        <header className="h-11 shrink-0 border-b border-cyan-900/20 bg-[#0A0F0D]/90 flex items-center px-4 gap-3">
+      <main className="flex-1 flex flex-col min-h-0 overflow-y-auto mobile-pb">
+        <header className="h-11 shrink-0 border-b border-cyan-900/20 bg-[#0A0F0D]/90 flex items-center px-3 md:px-4 gap-2 md:gap-3">
           <span className="text-xs font-bold tracking-[0.25em] uppercase neon-text-cyan mono">Agents</span>
           <span className="text-[10px] mono text-slate-600">
             {displayList.filter((a) => a.status === "ok" || a.status === "idle").length}/{displayList.length} healthy
@@ -124,6 +125,7 @@ export default function AgentsPage() {
           })}
         </div>
       </main>
+      <MobileNav />
     </div>
   );
 }

@@ -1,6 +1,7 @@
 "use client";
 import { useState, useEffect } from "react";
 import Sidebar from "@/components/Sidebar";
+import MobileNav from "@/components/MobileNav";
 import { Building2, RefreshCw, ExternalLink, AlertCircle, Loader2 } from "lucide-react";
 
 const TINYOFFICE_URL = "http://localhost:3000";
@@ -31,10 +32,10 @@ export default function OfficePage() {
     <div className="flex h-screen bg-[#050505] overflow-hidden">
       <Sidebar />
       <main className="flex-1 flex flex-col min-w-0 overflow-hidden">
-        <header className="h-11 shrink-0 border-b border-cyan-900/20 bg-[#0A0F0D]/90 backdrop-blur flex items-center px-4 gap-3">
+        <header className="h-11 shrink-0 border-b border-cyan-900/20 bg-[#0A0F0D]/90 backdrop-blur flex items-center px-3 md:px-4 gap-2 md:gap-3">
           <Building2 size={14} className="text-cyan-400" />
-          <span className="text-xs font-bold tracking-[0.25em] mono text-cyan-400">AGENT OFFICE</span>
-          <span className="text-[10px] mono text-slate-600">// TinyClaw framework</span>
+          <span className="text-[10px] md:text-xs font-bold tracking-[0.25em] mono text-cyan-400">OFFICE</span>
+          <span className="hidden sm:inline text-[10px] mono text-slate-600">// TinyClaw</span>
           <div className="ml-auto flex items-center gap-3">
             {connState === "online" && (
               <span className="flex items-center gap-1 text-[9px] mono text-green-400">
@@ -110,6 +111,7 @@ export default function OfficePage() {
           )}
         </div>
       </main>
+      <MobileNav />
     </div>
   );
 }
