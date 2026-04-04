@@ -212,7 +212,7 @@ class AnalyzerAgent:
                 _ft_green_count = 0
                 if len(_closes_5m) >= 4:
                     _ft_green_count = sum(1 for i in range(-3, 0) if _closes_5m[i] > _closes_5m[i - 1])
-                _ft_candles_ok = _ft_green_count >= 2 or (_return_1h >= 5.0 and _ft_green_count >= 1)
+                _ft_candles_ok = _ft_green_count >= 2 or (_return_1h >= 3.0 and _ft_green_count >= 1)
 
                 # Exhaustion check 3: 5m RSI must be in momentum zone (>45)
                 # Pullback + candle checks are the REAL dying-pump protection.
@@ -341,6 +341,73 @@ class AnalyzerAgent:
                     )
                     return None
 
+        # ── SHORT-TERM DIRECTION GATES ─────────────────────────────────────────
+        # These catch entries AGAINST active short-term price direction.
+        # KERNEL entered long while chart was clearly dumping — red candles, RSI declining.
+        # All skipped for fast-track (which has its own exhaustion checks).
+        if not _fast_track:
+            # Gate 1: 5m candle direction — are recent candles going our way?
+            # If 4+ of last 6 candles are against direction, momentum is wrong.
+            if len(_closes_5m) >= 7:
+                if direction == "long":
+                    _red_count = sum(1 for i in range(-6, 0) if _closes_5m[i] < _closes_5m[i - 1])
+                    if _red_count >= 4:
+                        logger.info(
+                            f"[Analyzer] {symbol} BLOCKED: {_red_count}/6 recent 5m candles are RED "
+                            f"— price actively falling, don't go long"
+                        )
+                        return None
+                elif direction == "short":
+                    _green_count = sum(1 for i in range(-6, 0) if _closes_5m[i] > _closes_5m[i - 1])
+                    if _green_count >= 4:
+                        logger.info(
+                            f"[Analyzer] {symbol} SHORT BLOCKED: {_green_count}/6 recent 5m candles are GREEN "
+                            f"— price actively rising, don't go short"
+                        )
+                        return None
+
+            # Gate 2: 15m RSI slope — is momentum fading on the 15m timeframe?
+            # RSI declining >5pts over last 3 bars = momentum is dying, not starting.
+            if "15m" in tf_data:
+                _c15m_rsi = tf_data["15m"][:, 4]
+                if len(_c15m_rsi) >= 18:
+                    _rsi_15m_now = _compute_rsi(_c15m_rsi, 14)
+                    _rsi_15m_prev = _compute_rsi(_c15m_rsi[:-3], 14)
+                    _rsi_15m_delta = _rsi_15m_now - _rsi_15m_prev
+                    if direction == "long" and _rsi_15m_delta <= -5.0:
+                        logger.info(
+                            f"[Analyzer] {symbol} BLOCKED: 15m RSI declining "
+                            f"({_rsi_15m_prev:.0f} → {_rsi_15m_now:.0f}, Δ={_rsi_15m_delta:+.0f}) "
+                            f"— momentum fading"
+                        )
+                        return None
+                    elif direction == "short" and _rsi_15m_delta >= 5.0:
+                        logger.info(
+                            f"[Analyzer] {symbol} SHORT BLOCKED: 15m RSI rising "
+                            f"({_rsi_15m_prev:.0f} → {_rsi_15m_now:.0f}, Δ={_rsi_15m_delta:+.0f}) "
+                            f"— bounce forming"
+                        )
+                        return None
+
+            # Gate 3: 5m RSI direction — block entries with significant RSI reversal
+            # Tightened from -15 to -10: catches sustained drops like KERNEL.
+            if len(_closes_5m) >= 21:
+                _rsi_5m_now = _compute_rsi(_closes_5m, 14)
+                _rsi_5m_prev = _compute_rsi(_closes_5m[:-6], 14)
+                _rsi_5m_delta = _rsi_5m_now - _rsi_5m_prev
+                if direction == "long" and _rsi_5m_delta <= -10.0:
+                    logger.info(
+                        f"[Analyzer] {symbol} BLOCKED: 5m RSI crashed "
+                        f"({_rsi_5m_prev:.0f} → {_rsi_5m_now:.0f}, Δ={_rsi_5m_delta:+.0f}) — momentum dead"
+                    )
+                    return None
+                elif direction == "short" and _rsi_5m_delta >= 10.0:
+                    logger.info(
+                        f"[Analyzer] {symbol} SHORT BLOCKED: 5m RSI surging "
+                        f"({_rsi_5m_prev:.0f} → {_rsi_5m_now:.0f}, Δ={_rsi_5m_delta:+.0f}) — strong bounce"
+                    )
+                    return None
+
         # Setup classification
         setup_type = self._classify_setup(tf_data, ta_scores)
         # Tokens that cleared all hard filter gates ARE showing momentum signals.
@@ -356,6 +423,12 @@ class AnalyzerAgent:
         entry_zone = self._compute_entry_zone(price, atr, support, resistance, setup_type)
         if entry_zone is None:
             return None
+
+        # Fast-track bonus: lagging TA indicators (EMA/MACD/OBV) haven't caught up
+        # with the rapid momentum move. The fast-track approval (2%+ return, near high,
+        # green candles, RSI in zone) IS the quality signal. +15 pts compensates for lag.
+        if _fast_track:
+            ta_score = min(100.0, ta_score + 15.0)
 
         # ML features
         features = self._extract_ml_features(tf_data, candidate)

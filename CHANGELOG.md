@@ -5,6 +5,367 @@ Format: **version → date → category → what changed → why**.
 
 ---
 
+## v4.1 — April 4, 2026 — Aggressive Trading + Defense Stack
+
+> **Mission:** Maximize capital deployment with aggressive entry settings while building a layered defense system that catches bad entries fast and lets winners run. Fix critical bugs that blocked entries and stuck positions.
+
+---
+
+### CRITICAL BUG FIXES
+
+#### 1. Orphan Sweep blocking ALL new entries (the "only 2 positions" bug)
+- **File:** `backend/server.py` (lines 1505-1553)
+- **Bug:** When the bot tracked positions (IN, VET, MASK) that no longer existed on the exchange, the orphan sweep tried to `_execute_exit` — sending a sell order to Binance for a position that didn't exist. Binance rejected with `-2022 ReduceOnly rejected`. This racked up `_exit_failure_count` for each position, setting `has_failed_exits = True`, which **blocked ALL new entries indefinitely**.
+- **Impact:** Bot had $3,698 cash, found 2-3 setups per cycle, but refused to open any. Ran with only 2 positions for 20+ cycles.
+- **Fix:** Orphan sweep now removes phantom positions from bot tracking directly — no exchange order needed. Clears `_exit_failure_count` so the blocker can't persist. Logs PnL for accounting.
+- **Verified:** Immediately after fix, bot opened DRIFT + HEMI on cycle 1, reached 8 positions by cycle 2.
+
+#### 2. Exit -4005 "Quantity greater than max quantity" — positions getting stuck
+- **File:** `src/execution_core.py` (lines 700-713)
+- **Bug:** BAS/USDT had ~1M tokens but Binance max quantity per order was ~500K. The entry path already had halving retry logic for -4005, but the **exit path didn't**. Exit failed 5 times → position ghost-closed → orphan left on exchange bleeding.
+- **Impact:** BAS was stuck at +21% profit but couldn't be closed by the bot. User had to close manually.
+- **Fix:** Added same halving fallback to `exit_position()`. When -4005 hits on exit, halve the amount and retry. Position manager handles partial fill and closes remaining on next tick.
+
+#### 3. TOWNS exit NoneType crash (prior session, documented here)
+- **File:** `src/execution_core.py`
+- **Bug:** `amount_to_precision(symbol, amount)` returned `None` for TOWNS during emergency close.
+- **Fix:** All 5 call sites now guarded: `float(raw) if raw is not None else fallback`.
+
+---
+
+### NEW EXIT: Early Thesis Invalid
+
+#### 4. `early_thesis_invalid` — cut momentum failures before they bleed to SL
+- **File:** `src/position_manager.py` (line ~558)
+- **What:** After 5 minutes, if `pnl < -1.0%` AND `peak_pnl < 0.3%` (position NEVER went meaningfully positive), exit immediately.
+- **Why:** The bot enters on a momentum thesis ("price is going up"). If after 5 minutes the price has only gone DOWN and never showed any upside, the thesis was wrong from the start. Holding to the -3.5% SL wastes ~$50 per bad entry.
+- **Key difference from old exits that destroyed -$884:**
+  - Old `no_traction_5m`: killed at -2% blanket, regardless of whether the position had peaked. Destroyed winners that dipped before running.
+  - New: only kills positions where upside **NEVER materialized** (peak < 0.3%). If it ever went +1%, the thesis had legs → let trailing stop manage.
+- **Cooldown:** 20 min (momentum failure tier). Added `"thesis"` to both cooldown trigger lists.
+- **First live result:** HEMI/USDT closed at -$43.70 (-1.5%) after 12 min. Without this, it would have bled to -3.5% SL = -$70+.
+
+---
+
+### AGGRESSIVE ENTRY SETTINGS
+
+#### 5. Anti-chase pullback: 3% → 2% → reverted to 3%
+- **File:** `src/analyzer.py` (lines 151, 163, 182, 206)
+- Tightened from 3% to 2% tolerance, then reverted to 3% after testing showed it was too restrictive. Current: 3% pullback tolerance for both longs and shorts.
+
+#### 6. Fast-track pullback tolerance: 2.5% → 1.5% → reverted to 2.5%
+- **File:** `src/analyzer.py` (line 215)
+- Same pattern — tightened then reverted. Fast-track entries need room because they're chasing already-moving tokens.
+
+#### 7. 5m RSI direction gate: added then loosened
+- **File:** `src/analyzer.py` (lines 344-364)
+- Added RSI slope gate to block entries against declining RSI. Loosened threshold from -5 to -15 to avoid blocking too many valid entries.
+
+#### 8. Fast-track ta_score bonus: +15 points
+- **File:** `src/analyzer.py` (lines 382-386)
+- **What:** Fast-track entries get a +15 ta_score bonus because lagging indicators (EMA/MACD/OBV) haven't caught up with the move. The fast-track approval itself IS the quality signal.
+- **Impact:** Fast-track entries that scored 35-40 (borderline) now score 50-55 (comfortable pass). More momentum plays get through.
+
+#### 9. ANALYZER_MIN_SCORE: 40 → 35
+- **File:** `.env` (line 236)
+- Lowered to let more momentum setups through, especially fast-track entries that get the +15 bonus.
+
+#### 10. REGIME_MAX_POSITIONS increased
+- **File:** `src/bigbrother.py` (lines 92-98)
+- **Before → After:** sideways 6→8, bull 10→12, bear 4→5, choppy 3→4
+- More positions = more diversification and more capital deployed.
+
+#### 11. Shorter cooldown, higher leverage, lower Bayesian threshold
+- **File:** `.env`
+- `SYMBOL_COOLDOWN_MINUTES`: 120 → 45
+- `BAYESIAN_THRESHOLD_NORMAL`: 0.45 → 0.40
+- `BAYESIAN_THRESHOLD_VOLATILE`: 0.52 → 0.43
+- Combined effect: bot enters more often, on more tokens, with less hesitation.
+
+---
+
+### CONFIGURATION CHANGES (v4.1)
+
+| Parameter | Old | New | File |
+|-----------|-----|-----|------|
+| `SYMBOL_COOLDOWN_MINUTES` | 120 | 45 | `.env` |
+| `BAYESIAN_THRESHOLD_NORMAL` | 0.45 | 0.40 | `.env` |
+| `BAYESIAN_THRESHOLD_VOLATILE` | 0.52 | 0.43 | `.env` |
+| `ANALYZER_MIN_SCORE` | 40 | 35 | `.env` |
+| `MAX_POSITIONS` | 8 | 10 | `.env` |
+| `REGIME_MAX_POSITIONS` bull | 10 | 12 | `bigbrother.py` |
+| `REGIME_MAX_POSITIONS` sideways | 6 | 8 | `bigbrother.py` |
+| `REGIME_MAX_POSITIONS` bear | 4 | 5 | `bigbrother.py` |
+| `REGIME_MAX_POSITIONS` choppy | 3 | 4 | `bigbrother.py` |
+| Fast-track ta_score bonus | 0 | +15 | `analyzer.py` |
+| 5m RSI gate threshold | (none) | -15 | `analyzer.py` |
+| `early_thesis_invalid` exit | (none) | 5min / -1% / peak<0.3% | `position_manager.py` |
+| Orphan sweep exit method | Exchange sell | Direct tracking removal | `server.py` |
+| Exit -4005 handling | (none) | Halve and retry | `execution_core.py` |
+
+### FILES MODIFIED IN v4.1
+
+| File | Changes |
+|------|---------|
+| `src/position_manager.py` | `early_thesis_invalid` exit in `_momentum_exit_reason`, `"thesis"` added to cooldown triggers |
+| `src/execution_core.py` | Exit -4005 halving retry logic |
+| `src/analyzer.py` | Fast-track +15 bonus, 5m RSI gate, anti-chase/pullback tuning |
+| `src/bigbrother.py` | `REGIME_MAX_POSITIONS` increased |
+| `backend/server.py` | Orphan sweep rewritten (no exchange sell for phantom positions) |
+| `.env` | Cooldown, Bayesian thresholds, min score, max positions |
+
+---
+
+## v4.0 — April 3-4, 2026 — Futures Mode Migration + Capital Efficiency
+
+> **Mission:** Migrate from spot to Binance USDT-M Futures with isolated margin and leverage. Fix 5 critical bugs where futures NOTIONAL was treated as MARGIN, crushing position sizing from $8,700 → $1,250.
+
+---
+
+### ARCHITECTURE: Futures Mode
+
+#### 1. Isolated margin futures with configurable leverage
+- **Files:** `src/exchange_ccxt.py`, `src/execution_core.py`, `backend/server.py`, `.env`
+- Bot now trades Binance USDT-M Perpetual Futures with isolated margin
+- Default leverage: 7x (configurable via `FUTURES_DEFAULT_LEVERAGE`)
+- Position sizing accounts for leverage: $1,250 margin = $8,750 notional exposure
+
+#### 2. Five places treated NOTIONAL as MARGIN — fixed all
+- **File:** `backend/server.py`, `src/position_manager.py`
+
+| Bug | What Happened | Fix |
+|-----|---------------|-----|
+| Size cap | `equity * max_single_exposure_pct` capped NOTIONAL at $1,250 | Multiply cap by leverage for futures |
+| Cash guard | `available_cash * 0.92` capped notional to wallet cash | Multiply by leverage for futures |
+| Cash deduction | Subtracted full notional ($8,700) from cash | Subtract margin ($1,243) instead |
+| Cash fetch | Used spot wallet instead of futures wallet | Use `_futures_exchange.exchange.fetch_balance()` |
+| Exposure check | Summed `amount_usd` (notional) for exposure | Sum `margin_usd` (notional / leverage) instead |
+
+- **Result:** 4 positions × ~$1,250 margin = $4,796 margin used / $33,575 notional. 96% wallet utilization (was 14%).
+
+---
+
+### CIRCUIT BREAKER FALSE TRIP — 3 bugs fixed
+
+#### 3. Anchor inflated by unrealized PnL
+- **File:** `backend/server.py`
+- Grace cycles 1-5 re-anchored every cycle. Position pumped +$477, inflating anchor to $5,353. When pump reversed, CB saw "loss" of $455 (8.5%) → false TRIP.
+- **Fix:** Anchor ONCE at cycle 1 only (clean wallet balance before positions inflate it).
+
+#### 4. Threshold too tight for 7x leverage
+- **File:** `backend/server.py`
+- 8% threshold on $5k wallet = $400 max loss before trip. With 7x leverage, 1% adverse move = 7% equity swing → trips from a single bad trade.
+- **Fix:** 15% threshold for futures mode.
+
+#### 5. Anchor key persistence across restarts
+- **File:** `backend/server.py`
+- `STATE` initialized `_cb_day_start_equity` to `0.0` → key always exists → anchor check always passed → anchor never re-set → armed at $0.00.
+- **Fix:** Use `cycle == 1` check instead of key existence.
+
+---
+
+### BINANCE -4005 "Quantity > Max Quantity" — entry fix
+
+#### 6. `_clamp_amount` didn't read raw Binance filters
+- **File:** `src/exchange_ccxt.py` (lines 484-505)
+- CCXT doesn't always populate `limits.amount.max` for futures markets. ALT/USDT tried 463,000 tokens but Binance max was ~60,000.
+- **Fix:** Added fallback to read raw `market['info']['filters']` for `MARKET_LOT_SIZE`/`LOT_SIZE` `maxQty`.
+
+#### 7. `_retry` misclassified -4005 as "too small"
+- **File:** `src/exchange_ccxt.py` (lines 277-284)
+- -4005 (quantity TOO LARGE) was classified as `SubMinimumAmountError` (too SMALL), causing entry to give up.
+- **Fix:** Removed -4005 from SubMinimumAmountError patterns. Only -4164 (min notional) triggers dust classification.
+
+#### 8. Entry halving safety net
+- **File:** `src/execution_core.py` (lines 611-622)
+- When -4005 detected on entry, halve amount and retry (up to 3 times).
+- **Result:** ALT/USDT enters via halving fallback (468K → 234K → 117K → 58K tokens).
+
+---
+
+### CONFIGURATION CHANGES (v4.0)
+
+| Parameter | Old | New | File |
+|-----------|-----|-----|------|
+| `TRADING_MODE` | spot | futures | `.env` |
+| `FUTURES_DEFAULT_LEVERAGE` | (none) | 7 | `.env` |
+| `_CB_THRESHOLD` (futures) | 0.08 | 0.15 | `server.py` |
+| CB anchor logic | Key existence check | `cycle == 1` | `server.py` |
+| Cash fetch (futures) | Spot wallet | Futures wallet | `server.py` |
+| Position sizing (futures) | Notional-based caps | Margin-based caps | `server.py` |
+| Exposure calculation | Sum notional | Sum margin | `position_manager.py` |
+| `-4005` classification | SubMinimumAmountError | Separate handling | `exchange_ccxt.py` |
+| `_clamp_amount` max qty | CCXT only | CCXT + raw Binance filters | `exchange_ccxt.py` |
+
+### FILES MODIFIED IN v4.0
+
+| File | Changes |
+|------|---------|
+| `backend/server.py` | Futures cash fetch, margin-based sizing, CB anchor/threshold fixes |
+| `src/position_manager.py` | Margin-based exposure calculation |
+| `src/exchange_ccxt.py` | `_clamp_amount` raw filter fallback, `_retry` -4005 reclassification |
+| `src/execution_core.py` | Entry -4005 halving retry, NoneType guard on `amount_to_precision` |
+| `.env` | `TRADING_MODE=futures`, `FUTURES_DEFAULT_LEVERAGE=7` |
+
+---
+
+## v3.5 — March 26, 2026 — Data-Driven Exit Overhaul
+
+> **Mission:** The exit system was the #1 cause of losses. Analysis of 37 real trades showed 7+ momentum exits had 0% win rate and destroyed -$884 total. Trailing stop (100% win rate) was the only profitable exit but never activated because momentum exits killed positions first. Complete overhaul to let winners run.
+
+---
+
+### THE DATA (37 trades analyzed)
+
+```
+Win rate:       22%
+Avg win:        $2.96
+Avg loss:       $31.28
+Risk:Reward:    0.09 (catastrophic)
+Total PnL:      -$884
+Expectancy:     -$23.87/trade
+
+Winners held:   avg 0.41h
+Losers held:    avg 3.78h (9x longer — INVERTED)
+```
+
+**Key finding:** trailing_stop had 100% win rate, but the 7 momentum exits killed positions before trailing could activate at +2%. The exits designed to "protect" were actually destroying all profit.
+
+---
+
+### EXITS REMOVED (all had 0% win rate)
+
+- `momentum_died` / `momentum_died_10m` / `momentum_died_15m` / `momentum_died_20m`
+- `no_traction` / `no_traction_5m` / `no_traction_aggressive`
+- `momentum_stall` / `momentum_stall_aggressive`
+- `hard_loss_cut`
+- 50% scale-down partial exit logic (created zombie half-positions)
+
+### NEW SIMPLIFIED EXIT SYSTEM
+
+| Exit | Condition | Purpose |
+|------|-----------|---------|
+| **Stop Loss** | -3.5% | Hard floor — only downside protector |
+| **Trailing Stop** | +1.0% activate, 1.0% distance | **THE profit engine** (was +2% — never triggered) |
+| **Time Exit** | 3h, only if pnl ≤ 0 | Kill stale losers, let green positions ride |
+| **Time Exit Max** | 6h hard ceiling | Safety cap even for green positions |
+| **momentum_faded** | Peak ≥ 3%, gave back 60%+, pnl < 0.5% | Only momentum exit kept — don't let big winners turn to losers |
+
+### REGIME SCALING (exit parameters)
+
+| Regime | SL Mult | Trail Mult | Time Mult |
+|--------|---------|------------|-----------|
+| Bull | 1.4× | 1.3× | 1.5× |
+| Sideways | 1.0× | 1.0× | 1.0× |
+| Bear | 0.7× | 0.8× | 0.6× |
+| Choppy | 0.65× | 0.7× | 0.5× |
+
+### OTHER v3.5 CHANGES
+
+#### Quant Mutator threshold floors fixed
+- **File:** `src/quant_mutator.py`
+- `hot_streak` floor: 0.12 → 0.40 (was letting bot enter EVERYTHING during streaks)
+- `emergency_pnl` cap: 0.35 → 0.45
+- `drought_relief` floor: 0.45 → 0.40
+- **Root cause:** 69% trailing stop WR triggered "hot streak" → mutator kept lowering threshold → 0.12 → 185 trades/day, 11 stop losses (-$208).
+
+#### Time exit: don't kill profitable positions
+- **File:** `src/position_manager.py`
+- `if hold_h >= effective_time_exit_hours and pnl_pct <= 0` — only kill losers
+- Safety cap: `time_exit_max` at 2× time limit for even green positions
+
+#### $2500 absolute position size cap
+- **File:** `src/risk_manager.py`
+- Hard cap per position to prevent oversized bets from Kelly formula edge cases.
+
+#### Max positions reduced
+- **File:** `.env`, `src/bigbrother.py`
+- MAX_POSITIONS: 8 → 5
+- REGIME_MAX_POSITIONS: bull 10→5, sideways 8→5, bear 6→3, choppy 4→3
+- (Later increased in v4.1 for aggressive trading)
+
+### CONFIGURATION CHANGES (v3.5)
+
+| Parameter | Old | New | File |
+|-----------|-----|-----|------|
+| `STOP_LOSS_PCT` | -2.5 | -3.5 | `.env` |
+| `TRAILING_STOP_ACTIVATE_PCT` | 0.5 | 1.0 | `.env` |
+| `TRAILING_STOP_DISTANCE_PCT` | 0.8 | 1.0 | `.env` |
+| `TIME_EXIT_HOURS` | 2.0 | 3.0 | `.env` |
+| `SYMBOL_COOLDOWN_MINUTES` | 90 | 120 | `.env` |
+| `MAX_POSITIONS` | 8 | 5 | `.env` |
+| Quant Mutator `hot_streak` floor | 0.12 | 0.40 | `quant_mutator.py` |
+| `REGIME_MAX_POSITIONS` | bull 10, sideways 8 | bull 5, sideways 5 | `bigbrother.py` |
+| Time exit green positions | Killed at time limit | Ride to 2× limit | `position_manager.py` |
+| Scale-down exits | Active | Disabled | `position_manager.py` |
+| Momentum exits (7 types) | All active | All removed | `position_manager.py` |
+
+### FILES MODIFIED IN v3.5
+
+| File | Changes |
+|------|---------|
+| `src/position_manager.py` | Gutted `_momentum_exit_reason`, simplified `_tick_position`, time exit green-hold |
+| `src/quant_mutator.py` | Threshold floors for hot_streak, emergency_pnl, drought_relief |
+| `src/bigbrother.py` | REGIME_SCALE updated, REGIME_MAX_POSITIONS reduced |
+| `src/risk_manager.py` | $2500 absolute position cap, drawdown scale adjustments |
+| `.env` | SL=-3.5, trail=1.0/1.0, time=3h, cooldown=120m, max_positions=5 |
+
+---
+
+### CURRENT STATUS (April 4, 2026 — 12:37 UTC+8)
+
+```
+Version:         v4.1
+Mode:            Binance USDT-M Futures (Isolated, 7x leverage)
+Regime:          choppy → mode: volatile
+Open positions:  7 (DRIFT +8.5%, KERNEL +7.2%, DEGO +1.6%, ALGO +1.3%, BR -5.4%, M -0.1%, D -0.5%)
+Session PnL:     +$257 (+5.2%)
+Equity:          ~$5,178
+Wallet balance:  ~$4,921 + unrealized
+```
+
+### DEFENSE LAYERS (current, ordered by speed)
+
+| Time | Check | What It Catches |
+|------|-------|-----------------|
+| Every tick | Exchange SL (STOP_MARKET) | Crash protection even if bot is down |
+| Every tick | Trailing stop (+1% activate, 1% distance) | Locks in profit on runners |
+| Every tick | Stop loss -3.5% | Hard downside floor |
+| 5 min | `early_thesis_invalid` | Momentum never materialized (pnl < -1%, peak < 0.3%) |
+| Every 2 min | BigBrother health monitor | RSI collapsed (< 40 declining) on losing position |
+| 30 min | `momentum_faded` | Had +3% peak but gave back 60%+ |
+| 3h | Time exit | Stale losers that never triggered anything |
+| 6h | Time exit max | Hard ceiling for all positions |
+
+### AGENT ARCHITECTURE (all running)
+
+```
+Watcher (548 pairs → 60 candidates, 1h return + volume + RSI scoring)
+  → Analyzer (60 → 2-6 setups, RSI/EMA/MACD + fast-track + 5m RSI gate)
+    → BigBrother (regime gates + health monitor + RSI checks every 2min)
+      → Risk Manager (drawdown scaling, $2500 cap, daily limit, consecutive-loss pause)
+        → Quant Mutator (Bayesian scoring, threshold 0.40, floors locked)
+          → Churn Guard (3/symbol/4h) + Cooldown (45m base)
+            → Position Manager (trailing stops, dynamic TP ratcheting, tier exits, early thesis check)
+              → Exchange SL (STOP_MARKET on Binance, dynamically updated with trailing)
+```
+
+### EXPECTATIONS
+
+**What should happen:**
+- 6-10 positions open at any time, filling available margin
+- Bad entries caught within 5-12 min by `early_thesis_invalid` (saving ~$25 per bad trade vs SL)
+- Winners ride trailing stop to +2-5%+ (DRIFT already at +8.5%)
+- Equity curve trending up with small controlled losses and occasional big winners
+
+**What to watch for:**
+- If `early_thesis_invalid` fires too often (>50% of entries), the 5-min / -1% thresholds may be too tight
+- If trailing stop never activates, market is range-bound — consider reducing position count
+- If SL fires frequently, entry quality needs improvement (analyzer gates)
+- If positions cluster in one direction, BigBrother regime detection may need tuning
+
+---
+
 ## v3.4 — March 24, 2026 — Strategy Overhaul: Stop Fighting the Trend
 
 > **Mission:** After fixing all pipeline bugs (v3.1–v3.3.1), the bot was still bleeding **-$401/day**. NAV dropped from $12,900 → $12,431. The pipeline worked perfectly — scanning, scoring, entering, exiting — but the **strategy itself** was fundamentally wrong. This release fixes the strategy.
