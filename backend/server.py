@@ -1013,8 +1013,18 @@ async def _run_cycle():
             # ── Position rotation: replace worst performer with better opportunity ──
             # When max_positions is the blocker and a strong signal appears,
             # close the worst-performing losing position to make room.
+            # GUARD: disabled in choppy/volatile — rotation in these regimes is
+            # pure churn (5/15 recent trades were rotated_out at -$166 total).
             _rotated = False
-            if "max_positions" in gate_reason and _setup_rank_score >= 35.0:
+            _cur_regime = STATE.get("regime", "sideways")
+            _cur_bb_mode = STATE.get("bigbrother_mode", "normal")
+            _rotation_allowed = (
+                "max_positions" in gate_reason
+                and _setup_rank_score >= 45.0
+                and _cur_regime not in ("choppy", "bear")
+                and _cur_bb_mode != "volatile"
+            )
+            if _rotation_allowed:
                 try:
                     _worst_pos = None
                     _worst_pnl = float("inf")
@@ -1022,7 +1032,7 @@ async def _run_cycle():
                     for _p in list(_position_manager._positions.values()):
                         if _p.status != "open" or _p.setup_type in ("synced_holding", "exchange_holding"):
                             continue
-                        if _p.hold_time_hours() * 60 < 5.0:
+                        if _p.hold_time_hours() * 60 < 15.0:
                             continue
                         try:
                             _wp = await _execution.get_current_price(_p.symbol)
@@ -1036,7 +1046,7 @@ async def _run_cycle():
                         except Exception:
                             continue
 
-                    if _worst_pos and _worst_pnl <= -1.0:
+                    if _worst_pos and _worst_pnl <= -2.5:
                         logger.info(
                             f"[ROTATION] Closing {_worst_pos.symbol} "
                             f"(PnL={_worst_pnl:+.2f}% hold={_worst_pos.hold_time_hours():.1f}h) "
@@ -1718,6 +1728,8 @@ async def _save_trade_to_db(trade: dict):
         doc["exchange"] = cfg.exchange_name
         doc["exchange_mode"] = cfg.exchange_mode
         doc["trading_mode"] = STATE.get("trading_mode", "spot")
+        doc.setdefault("regime", STATE.get("regime", "unknown"))
+        doc.setdefault("bigbrother_mode", STATE.get("bigbrother_mode", "normal"))
         doc["saved_at"] = int(time.time())
         await _db.trades.insert_one(doc)
     except Exception as e:
