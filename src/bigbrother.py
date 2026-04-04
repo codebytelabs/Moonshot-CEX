@@ -51,8 +51,8 @@ REGIME_CAPITAL = {
     # max_single_pct: per-position margin as % of equity (dynamic, replaces static .env cap)
     # Bull: aggressive — 18% per position × 8 slots = up to 144% margin (leveraged)
     "bull":     {"max_exposure_pct": 0.90, "size_mult": 1.00, "max_single_pct": 0.18},
-    # Sideways: base — 15% per position × 6 slots = up to 90% margin
-    "sideways": {"max_exposure_pct": 0.82, "size_mult": 0.92, "max_single_pct": 0.15},
+    # Sideways: base — 13% per position × 6 slots = up to 78% margin
+    "sideways": {"max_exposure_pct": 0.78, "size_mult": 0.85, "max_single_pct": 0.13},
     # Bear: cautious — 10% per position × 4 slots = up to 40% margin
     "bear":     {"max_exposure_pct": 0.55, "size_mult": 0.65, "max_single_pct": 0.10},
     # Choppy: minimal — 8% per position × 3 slots = up to 24% margin
@@ -89,10 +89,20 @@ CHOPPY_MIN_TA_SCORE = 50.0
 # ── Per-regime max concurrent positions ───────────────────────────────────────
 REGIME_MAX_POSITIONS = {
     "bull":     10,
-    "sideways": 8,
+    "sideways": 6,
     # BEAR/CHOPPY: fewer, higher-conviction entries only
     "bear":     4,
     "choppy":   3,
+}
+
+# ── Volatile mode overlay ──────────────────────────────────────────────────────
+# When mode=volatile, reduce position count and size further.
+# Prevents loading up leveraged positions in a fading/choppy market.
+# sideways+volatile: 6 × 0.75 = 4 max positions, 0.85 × 0.85 = 0.72× size
+VOLATILE_MODE_OVERLAY = {
+    "max_positions_mult": 0.75,   # reduce max positions by 25%
+    "size_mult":          0.85,   # reduce position size by 15%
+    "exposure_mult":      0.85,   # reduce max exposure by 15%
 }
 
 # ── Per-regime Bayesian threshold override ────────────────────────────────────
@@ -275,7 +285,7 @@ class BigBrotherAgent:
             "regime_capital": regime_capital,
             "regime_setup_allowlist": list(REGIME_SETUP_ALLOWLIST.get(self.regime, set())),
             "choppy_min_ta_score": CHOPPY_MIN_TA_SCORE if self.regime in ("choppy", "bear") else 0.0,
-            "regime_max_positions": REGIME_MAX_POSITIONS.get(self.regime, 5),
+            "regime_max_positions": regime_capital["max_positions"],
             "drawdown": round(drawdown, 4),
             "win_rate": health["win_rate"],
             "consecutive_losses": health["consecutive_losses"],
@@ -297,13 +307,25 @@ class BigBrotherAgent:
         }
 
     def _build_regime_capital(self, regime: str) -> dict:
-        """Return capital deployment limits for the current regime."""
+        """Return capital deployment limits for the current regime.
+        When mode=volatile, applies VOLATILE_MODE_OVERLAY to reduce exposure."""
         cap = REGIME_CAPITAL.get(regime, REGIME_CAPITAL["sideways"])
+        max_pos = REGIME_MAX_POSITIONS.get(regime, 6)
+        size_m = cap["size_mult"]
+        exp_pct = cap["max_exposure_pct"]
+
+        # Volatile mode overlay: reduce everything when market is whipsaw
+        if self.mode == "volatile":
+            ov = VOLATILE_MODE_OVERLAY
+            max_pos = max(2, int(max_pos * ov["max_positions_mult"]))
+            size_m = round(size_m * ov["size_mult"], 3)
+            exp_pct = round(exp_pct * ov["exposure_mult"], 3)
+
         return {
-            "max_exposure_pct": cap["max_exposure_pct"],
-            "size_mult": cap["size_mult"],
+            "max_exposure_pct": exp_pct,
+            "size_mult": size_m,
             "max_single_pct": cap.get("max_single_pct", 0.15),
-            "max_positions": REGIME_MAX_POSITIONS.get(regime, 6),
+            "max_positions": max_pos,
         }
 
     def _detect_regime(self, btc_ticker: Optional[dict], closed_trades: list[dict]) -> str:
