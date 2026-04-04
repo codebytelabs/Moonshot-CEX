@@ -3,10 +3,13 @@ WatcherAgent — Market scanner.
 Fetches all USDT pairs, filters by volume, scores by composite momentum,
 and returns the top N candidates for the AnalyzerAgent.
 
-v3.2 — Regime-aware:
+v3.3 — Regime-aware + Futures short support:
   • In BEAR/CHOPPY regimes, additionally scans GateIO leveraged SHORT tokens
     (3S/5S suffix, e.g. BTC3S, ETH3S, SOL3S) tagged with direction="short".
-  • Short candidates are scored with BEARISH momentum indicators (inverted).
+  • In FUTURES mode, scans for bearish momentum on regular tokens to generate
+    actual futures short candidates (not leveraged ETFs). These tokens are
+    actively dumping and can be shorted on futures for profit.
+  • Short candidates are scored with BEARISH momentum indicators.
   • The opportunity universe expands to 150+ symbols in bear mode.
 """
 import asyncio
@@ -54,10 +57,11 @@ class WatcherAgent:
         self.top_n = top_n
         self._scan_count = 0
 
-    async def scan(self, regime: str = "sideways") -> list[dict]:
+    async def scan(self, regime: str = "sideways", futures_mode: bool = False) -> list[dict]:
         """
         Scan all USDT pairs + regime-appropriate leveraged tokens.
         In BEAR/CHOPPY regimes also scans SHORT ETF tokens.
+        In futures mode, also scans for bearish short candidates on regular tokens.
         Returns list of dicts: {symbol, score, ticker, timestamp, direction}
         """
         t0 = time.monotonic()
@@ -122,17 +126,22 @@ class WatcherAgent:
                         "vol_usd": vol_usd, "direction": "long",
                     })
             else:
-                # Regular spot: skip stablecoins and declining tokens
+                # Regular token: skip stablecoins
                 if base in _STABLE_BASES:
                     continue
                 pct_24h = float(ticker.get("percentage") or 0.0)
                 # Long momentum requires POSITIVE 24h move — skip anything down >3%
-                if pct_24h < -3.0:
-                    continue
-                if vol_usd >= min_vol:
+                if pct_24h >= -3.0 and vol_usd >= min_vol:
                     long_candidates.append({
                         "symbol": symbol, "ticker": ticker,
                         "vol_usd": vol_usd, "direction": "long",
+                    })
+                # Futures short: tokens actively dumping (24h < -1%) are short candidates
+                # Only in futures mode — spot can't short regular tokens.
+                if futures_mode and pct_24h <= -1.0 and vol_usd >= min_vol:
+                    short_candidates.append({
+                        "symbol": symbol, "ticker": ticker,
+                        "vol_usd": vol_usd, "direction": "short",
                     })
 
         if not long_candidates and not short_candidates:
@@ -145,9 +154,28 @@ class WatcherAgent:
 
         if long_candidates:
             long_scored = await self._score_batch(long_candidates, inverted=False)
-        if short_candidates and bear_mode:
-            short_scored = await self._score_batch(short_candidates, inverted=True)
-            logger.info(f"[Watcher] Bear mode: scored {len(short_scored)} short-token candidates")
+        if short_candidates:
+            # Leveraged ETF shorts use inverted=True; futures shorts use for_short=True
+            _has_futures_shorts = futures_mode and any(
+                not any(c["symbol"].replace("/USDT", "").endswith(sfx)
+                        for sfx in SHORT_TOKEN_SUFFIXES)
+                for c in short_candidates
+            )
+            if _has_futures_shorts:
+                # Split: leveraged ETF tokens vs regular futures shorts
+                _etf_shorts = [c for c in short_candidates
+                               if any(c["symbol"].replace("/USDT", "").endswith(sfx)
+                                      for sfx in SHORT_TOKEN_SUFFIXES)]
+                _futures_shorts = [c for c in short_candidates if c not in _etf_shorts]
+                if _etf_shorts:
+                    short_scored.extend(await self._score_batch(_etf_shorts, inverted=True))
+                if _futures_shorts:
+                    _fs = await self._score_batch(_futures_shorts, for_short=True)
+                    short_scored.extend(_fs)
+                    logger.info(f"[Watcher] Futures short: scored {len(_fs)} bearish candidates")
+            elif bear_mode:
+                short_scored = await self._score_batch(short_candidates, inverted=True)
+                logger.info(f"[Watcher] Bear mode: scored {len(short_scored)} short-token candidates")
 
         all_scored = long_scored + short_scored
         all_scored.sort(key=lambda x: x["score"], reverse=True)
@@ -250,17 +278,21 @@ class WatcherAgent:
         result = await self.btc_momentum_score()
         return result["bullish"]
 
-    async def _score_batch(self, candidates: list[dict], inverted: bool) -> list[dict]:
-        """Score a batch of candidates. inverted=True applies bearish scoring logic."""
-        tasks = [self._score_symbol(c, inverted=inverted) for c in candidates]
+    async def _score_batch(self, candidates: list[dict], inverted: bool = False, for_short: bool = False) -> list[dict]:
+        """Score a batch of candidates.
+        inverted=True: leveraged ETF short-token scoring.
+        for_short=True: futures short scoring (bearish momentum on regular tokens).
+        """
+        tasks = [self._score_symbol(c, inverted=inverted, for_short=for_short) for c in candidates]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         return [r for r in results if r is not None and not isinstance(r, Exception)]
 
-    async def _score_symbol(self, candidate: dict, inverted: bool = False) -> Optional[dict]:
+    async def _score_symbol(self, candidate: dict, inverted: bool = False, for_short: bool = False) -> Optional[dict]:
         """
         Score a single symbol using 5m OHLCV + composite indicators.
-        inverted=True: bearish short-token scoring — RSI oversold, MACD negative,
-        red candles, and EMA death cross all give higher scores.
+        inverted=True: leveraged ETF short-token scoring (token rises when underlying falls).
+        for_short=True: futures short scoring — reward bearish momentum on the token itself
+                        (RSI 25-45, MACD<0, red candles, EMA death cross, negative ROC).
         """
         symbol = candidate["symbol"]
         ticker = candidate["ticker"]
@@ -299,7 +331,20 @@ class WatcherAgent:
 
         # ── RSI ───────────────────────────────────────────────────────────
         rsi = _compute_rsi(closes, 14)
-        if not inverted:
+        if for_short:
+            # FUTURES SHORT: reward bearish RSI zone 25-45 (downward momentum,
+            # not yet oversold/bouncing). RSI > 55 = bullish = bad for short.
+            if 25 <= rsi <= 45:
+                rsi_pts = 15.0
+            elif 45 < rsi <= 50:
+                rsi_pts = 8.0
+            elif 20 <= rsi < 25:
+                rsi_pts = 5.0  # too oversold, bounce risk
+            elif rsi < 20:
+                rsi_pts = 0.0  # heavily oversold, don't short
+            else:
+                rsi_pts = max(0.0, 15.0 * (55.0 - rsi) / 15.0)  # fade as RSI rises
+        elif not inverted:
             # LONG: favour upward momentum zone 55-75
             if 55 <= rsi <= 75:
                 rsi_pts = 15.0
@@ -312,7 +357,6 @@ class WatcherAgent:
         else:
             # SHORT token: these tokens rise when underlying falls.
             # Score highest when RSI of the SHORT TOKEN itself is in bullish zone 55-75
-            # (meaning the short token is gaining strength = underlying is falling)
             if 55 <= rsi <= 75:
                 rsi_pts = 15.0
             elif 50 <= rsi < 55:
@@ -326,7 +370,10 @@ class WatcherAgent:
 
         # ── MACD histogram ────────────────────────────────────────────────
         macd_hist = _compute_macd_hist(closes, 12, 26, 9)
-        if not inverted:
+        if for_short:
+            # FUTURES SHORT: reward negative MACD histogram (bearish momentum)
+            macd_pts = min(20.0, max(0.0, abs(macd_hist) * 60.0)) if macd_hist < 0 else 0.0
+        elif not inverted:
             macd_pts = min(20.0, max(0.0, macd_hist * 60.0)) if macd_hist > 0 else 0.0
         else:
             # Short token: MACD > 0 means the short token is trending up = good
@@ -336,7 +383,10 @@ class WatcherAgent:
 
         # ── Candle direction ──────────────────────────────────────────────
         if len(closes) >= 4:
-            if not inverted:
+            if for_short:
+                # FUTURES SHORT: consecutive RED candles = selling pressure
+                momentum_count = sum(1 for i in range(-3, 0) if closes[i] < closes[i - 1])
+            elif not inverted:
                 # LONG: consecutive green candles
                 momentum_count = sum(1 for i in range(-3, 0) if closes[i] > closes[i - 1])
             else:
@@ -352,7 +402,10 @@ class WatcherAgent:
         obv = _compute_obv(closes, volumes)
         if len(obv) >= 10:
             obv_slope = (obv[-1] - obv[-10]) / (abs(obv[-10]) + 1e-9)
-            if not inverted:
+            if for_short:
+                # FUTURES SHORT: negative OBV = money flowing OUT = selling pressure
+                obv_pts = min(15.0, max(0.0, abs(obv_slope) * 15.0)) if obv_slope < 0 else 0.0
+            elif not inverted:
                 obv_pts = min(15.0, max(0.0, obv_slope * 15.0))
             else:
                 # Short token: positive OBV on the token = money flowing into it = good
@@ -365,7 +418,15 @@ class WatcherAgent:
         # ── Rate of Change (12-bar) ───────────────────────────────────────
         if len(closes) >= 13:
             roc = (closes[-1] - closes[-13]) / closes[-13] * 100
-            if not inverted:
+            if for_short:
+                # FUTURES SHORT: reward negative ROC (price falling)
+                if roc <= -3.0:
+                    roc_pts = min(20.0, abs(roc) * 2.5)
+                elif roc < 0:
+                    roc_pts = abs(roc) * 3.0
+                else:
+                    roc_pts = 0.0
+            elif not inverted:
                 if roc >= 3.0:
                     roc_pts = min(20.0, roc * 2.5)
                 elif roc > 0:
@@ -373,7 +434,6 @@ class WatcherAgent:
                 else:
                     roc_pts = 0.0
             else:
-                # Short token: positive ROC on token itself is good
                 if roc >= 3.0:
                     roc_pts = min(20.0, roc * 2.5)
                 elif roc > 0:
@@ -389,7 +449,11 @@ class WatcherAgent:
         ema9 = _ema(closes, 9)
         ema21 = _ema(closes, 21)
         ema50 = _ema(closes, 50) if len(closes) >= 50 else None
-        if not inverted:
+        if for_short:
+            # FUTURES SHORT: reward bearish EMA alignment (death cross)
+            ema_aligned = ema9 < ema21
+            ema_fully_aligned = (ema9 < ema21 < ema50) if ema50 is not None else False
+        elif not inverted:
             ema_aligned = ema9 > ema21
             ema_fully_aligned = (ema9 > ema21 > ema50) if ema50 is not None else False
         else:
@@ -406,7 +470,22 @@ class WatcherAgent:
             return_1h = (closes[-1] - closes[-13]) / closes[-13] * 100.0
         else:
             return_1h = 0.0
-        if not inverted:
+        if for_short:
+            # FUTURES SHORT: reward negative 1h return (token is DUMPING)
+            abs_ret = abs(return_1h)
+            if return_1h <= -5.0:
+                ret1h_pts = 35.0
+            elif return_1h <= -3.0:
+                ret1h_pts = 25.0
+            elif return_1h <= -2.0:
+                ret1h_pts = 18.0
+            elif return_1h <= -1.0:
+                ret1h_pts = 10.0
+            elif return_1h <= -0.5:
+                ret1h_pts = 5.0
+            else:
+                ret1h_pts = 0.0
+        elif not inverted:
             if return_1h >= 5.0:
                 ret1h_pts = 35.0
             elif return_1h >= 3.0:
@@ -431,56 +510,93 @@ class WatcherAgent:
         score += ret1h_pts
         score_breakdown["return_1h"] = ret1h_pts
 
-        # ── 24h trend bonus — momentum requires positive daily price action ─
+        # ── 24h trend bonus — momentum requires strong daily price action ───
         pct_change_24h = float(ticker.get("percentage") or 0.0)
-        if pct_change_24h >= 10.0:
-            trend_pts = 25.0
-        elif pct_change_24h >= 5.0:
-            trend_pts = 18.0
-        elif pct_change_24h >= 2.0:
-            trend_pts = 10.0
-        elif pct_change_24h >= 1.0:
-            trend_pts = 5.0
+        if for_short:
+            # FUTURES SHORT: reward negative 24h trend (sustained selling)
+            abs_24h = abs(pct_change_24h)
+            if pct_change_24h <= -10.0:
+                trend_pts = 25.0
+            elif pct_change_24h <= -5.0:
+                trend_pts = 18.0
+            elif pct_change_24h <= -2.0:
+                trend_pts = 10.0
+            elif pct_change_24h <= -1.0:
+                trend_pts = 5.0
+            else:
+                trend_pts = 0.0
         else:
-            trend_pts = 0.0  # flat/negative already pre-filtered for longs
+            if pct_change_24h >= 10.0:
+                trend_pts = 25.0
+            elif pct_change_24h >= 5.0:
+                trend_pts = 18.0
+            elif pct_change_24h >= 2.0:
+                trend_pts = 10.0
+            elif pct_change_24h >= 1.0:
+                trend_pts = 5.0
+            else:
+                trend_pts = 0.0
         score += trend_pts
         score_breakdown["trend_24h"] = trend_pts
 
-        # ── ANTI-CHASE: pullback from recent high penalty ────────────────
-        # If price has already peaked and is pulling back, the pump is OVER.
-        # Check: high of last 12 5m candles (= 1 hour) vs current close.
-        # >2% pullback = distribution underway → heavy penalty.
-        # This prevents entering DUSDT-style pump-and-dump tops.
-        if len(candles_np) >= 12:
-            recent_highs = candles_np[-12:, 2].astype(float)  # column 2 = high
-            recent_high = float(np.max(recent_highs))
-            if recent_high > 0 and closes[-1] > 0:
-                pullback_pct = (recent_high - closes[-1]) / recent_high * 100.0
-                if pullback_pct >= 5.0:
-                    chase_penalty = -35.0
-                elif pullback_pct >= 3.0:
-                    chase_penalty = -25.0
-                elif pullback_pct >= 2.0:
-                    chase_penalty = -15.0
-                elif pullback_pct >= 1.0:
-                    chase_penalty = -8.0
-                else:
-                    chase_penalty = 0.0
-                score += chase_penalty
-                score_breakdown["anti_chase"] = chase_penalty
+        # ── ANTI-CHASE penalty ───────────────────────────────────────────
+        if for_short:
+            # FUTURES SHORT anti-chase: if price bounced >2% from recent LOW,
+            # the dump is OVER and it's recovering — don't short a reversal.
+            if len(candles_np) >= 12:
+                recent_lows = candles_np[-12:, 3].astype(float)  # column 3 = low
+                recent_low = float(np.min(recent_lows))
+                if recent_low > 0 and closes[-1] > 0:
+                    bounce_pct = (closes[-1] - recent_low) / recent_low * 100.0
+                    if bounce_pct >= 5.0:
+                        chase_penalty = -35.0
+                    elif bounce_pct >= 3.0:
+                        chase_penalty = -25.0
+                    elif bounce_pct >= 2.0:
+                        chase_penalty = -15.0
+                    elif bounce_pct >= 1.0:
+                        chase_penalty = -8.0
+                    else:
+                        chase_penalty = 0.0
+                    score += chase_penalty
+                    score_breakdown["anti_chase"] = chase_penalty
+            # Penalty for GREEN candle sequence (momentum reversing UP)
+            if len(closes) >= 5:
+                green_count = sum(1 for i in range(-4, 0) if closes[i] > closes[i - 1])
+                if green_count >= 3:
+                    green_penalty = -12.0
+                    score += green_penalty
+                    score_breakdown["bullish_candles_penalty"] = green_penalty
+        else:
+            # LONG anti-chase: pullback from recent high
+            if len(candles_np) >= 12:
+                recent_highs = candles_np[-12:, 2].astype(float)  # column 2 = high
+                recent_high = float(np.max(recent_highs))
+                if recent_high > 0 and closes[-1] > 0:
+                    pullback_pct = (recent_high - closes[-1]) / recent_high * 100.0
+                    if pullback_pct >= 5.0:
+                        chase_penalty = -35.0
+                    elif pullback_pct >= 3.0:
+                        chase_penalty = -25.0
+                    elif pullback_pct >= 2.0:
+                        chase_penalty = -15.0
+                    elif pullback_pct >= 1.0:
+                        chase_penalty = -8.0
+                    else:
+                        chase_penalty = 0.0
+                    score += chase_penalty
+                    score_breakdown["anti_chase"] = chase_penalty
 
-        # ── ANTI-CHASE: bearish candle sequence penalty ──────────────────
-        # If last 3 of 4 candles are RED, momentum has flipped bearish.
-        # Don't enter long into active selling pressure.
-        if len(closes) >= 5 and not inverted:
-            red_count = sum(1 for i in range(-4, 0) if closes[i] < closes[i - 1])
-            if red_count >= 3:
-                red_penalty = -12.0
-                score += red_penalty
-                score_breakdown["bearish_candles"] = red_penalty
+            # Penalty for RED candle sequence (bearish) on longs
+            if len(closes) >= 5 and not inverted:
+                red_count = sum(1 for i in range(-4, 0) if closes[i] < closes[i - 1])
+                if red_count >= 3:
+                    red_penalty = -12.0
+                    score += red_penalty
+                    score_breakdown["bearish_candles"] = red_penalty
         price = ticker.get("last") or 0.0
         vol_usd = candidate["vol_usd"]
-        setup_type = "momentum_short" if inverted else "momentum"
+        setup_type = "momentum_short" if (inverted or for_short) else "momentum"
 
         return {
             "symbol": symbol,

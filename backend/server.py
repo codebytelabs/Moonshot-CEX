@@ -557,7 +557,8 @@ async def _run_cycle():
     async def _legacy_pipeline():
         """Legacy watcher → analyzer → context → bayesian pipeline."""
         nonlocal _sv_watcher_count, _sv_analyzer_count, _sv_cycle_errors
-        cands = await _watcher.scan(regime=current_regime)
+        _is_futures = STATE.get("trading_mode", "spot") == "futures"
+        cands = await _watcher.scan(regime=current_regime, futures_mode=_is_futures)
         _sv_watcher_count = len(cands) if cands else 0
         if not cands:
             return []
@@ -941,6 +942,25 @@ async def _run_cycle():
                         f"[Sizing] {symbol} BTC bull bonus: ×{_btc_size_mult:.2f} → ${size_usd:.0f} "
                         f"(BTC score={_btc_momentum['score']:.2f})"
                     )
+        elif _direction == "short" and not _is_strategy_signal:
+            # FUTURES SHORT: invert BTC momentum — BTC weakness HELPS shorts.
+            # BTC crash (score=0.0) → full size (best time to short alts)
+            # BTC strong (score=1.0) → reduce short size (risky to short in bull)
+            _btc_short_mult = min(1.2, max(0.3, 1.3 - _btc_size_mult))
+            if _btc_size_mult >= 1.0:
+                # BTC very bullish → reduce short sizing significantly
+                size_usd *= _btc_short_mult
+                logger.info(
+                    f"[Sizing] {symbol} SHORT BTC-bull penalty: ×{_btc_short_mult:.2f} → ${size_usd:.0f} "
+                    f"(BTC score={_btc_momentum['score']:.2f})"
+                )
+            elif _btc_size_mult <= 0.3:
+                # BTC crashing → shorts get a boost
+                size_usd *= _btc_short_mult
+                logger.info(
+                    f"[Sizing] {symbol} SHORT BTC-crash bonus: ×{_btc_short_mult:.2f} → ${size_usd:.0f} "
+                    f"(BTC score={_btc_momentum['score']:.2f})"
+                )
 
         # Symbol cooldown gate — prevent revenge-trading after recent stop-loss
         if _position_manager.is_symbol_on_cooldown(symbol):
@@ -1092,8 +1112,9 @@ async def _run_cycle():
             if _alerts:
                 decision = setup.get("decision", {})
                 strat_label = f" [{_strat_name}]" if _strat_name else ""
+                _entry_emoji = "🔴 SHORT" if _direction == "short" else "🟢 ENTERED"
                 await _alerts.send(
-                    f"🟢 ENTERED {symbol}{strat_label} (Rank #{_slot_rank}/{len(approved)})\n"
+                    f"{_entry_emoji} {symbol}{strat_label} (Rank #{_slot_rank}/{len(approved)})\n"
                     f"Setup: {setup.get('setup_type')} | Score: {setup.get('ta_score'):.1f} | Rank={_setup_rank_score:.1f}\n"
                     f"Entry: {pos.entry_price:.6f} | Size: ${size_usd:.2f}\n"
                     f"Posterior: {decision.get('posterior', 0):.3f}",

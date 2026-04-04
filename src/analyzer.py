@@ -124,6 +124,17 @@ class AnalyzerAgent:
                         f"< EMA50 {ema50_4h:.6f} * 0.90 (deeply below trend)"
                     )
                     return None
+        # ── SHORT: 4h EMA50 trend gate — block shorting tokens in strong uptrends ──
+        elif direction == "short" and "4h" in tf_data:
+            closes_4h = tf_data["4h"][:, 4]
+            if len(closes_4h) >= 50:
+                ema50_4h = _ema(closes_4h, 50)
+                if closes_4h[-1] > ema50_4h * 1.10:
+                    logger.debug(
+                        f"[Analyzer] {symbol} SHORT filtered: price {closes_4h[-1]:.6f} "
+                        f"> EMA50 {ema50_4h:.6f} * 1.10 (deeply above trend — uptrend)"
+                    )
+                    return None
 
         # ── ANTI-CHASE: hard pullback-from-high gate ──────────────────────────
         # If price has already peaked and pulled back >3% from recent high,
@@ -131,6 +142,7 @@ class AnalyzerAgent:
         # This is the #1 fix for DUSDT/PROMPTUSDT "bought the top" entries.
         _closes_5m = data_5m[:, 4]
         _highs_5m = data_5m[:, 2]
+        _lows_5m = data_5m[:, 3]
         if direction == "long" and len(_highs_5m) >= 12:
             _recent_high = float(np.max(_highs_5m[-12:]))
             _current = float(_closes_5m[-1])
@@ -142,6 +154,18 @@ class AnalyzerAgent:
                         f"below 1h high {_recent_high:.6f} — pump already topped"
                     )
                     return None
+        # ── SHORT: anti-chase bounce gate — block shorting tokens recovering from lows ──
+        elif direction == "short" and len(_lows_5m) >= 12:
+            _recent_low = float(np.min(_lows_5m[-12:]))
+            _current = float(_closes_5m[-1])
+            if _recent_low > 0:
+                _bounce_pct = (_current - _recent_low) / _recent_low * 100.0
+                if _bounce_pct >= 3.0:
+                    logger.info(
+                        f"[Analyzer] {symbol} SHORT BLOCKED: price {_current:.6f} is {_bounce_pct:.1f}% "
+                        f"above 1h low {_recent_low:.6f} — dump already bottomed"
+                    )
+                    return None
 
         # ── Momentum fast-track: >2% 1h return bypasses EMA/MACD gates ────────
         # When price is ACTUALLY pumping NOW, lagging indicators haven't confirmed.
@@ -151,7 +175,30 @@ class AnalyzerAgent:
         _return_1h = 0.0
         if len(_closes_5m) >= 13:
             _return_1h = (_closes_5m[-1] - _closes_5m[-13]) / _closes_5m[-13] * 100.0
-            if _return_1h >= 2.0:
+            # ── SHORT fast-track: < -2% 1h return = active dump ──────────────
+            if direction == "short" and _return_1h <= -2.0:
+                _ft_low = float(np.min(_lows_5m[-12:])) if len(_lows_5m) >= 12 else _closes_5m[-1]
+                _ft_bounce = (_closes_5m[-1] - _ft_low) / _ft_low * 100.0 if _ft_low > 0 else 0
+                _ft_near_low = _ft_bounce < 2.5
+                _ft_red_count = 0
+                if len(_closes_5m) >= 4:
+                    _ft_red_count = sum(1 for i in range(-3, 0) if _closes_5m[i] < _closes_5m[i - 1])
+                _ft_candles_ok = _ft_red_count >= 2 or (_return_1h <= -5.0 and _ft_red_count >= 1)
+                _ft_rsi = _compute_rsi(_closes_5m, 14) if len(_closes_5m) >= 15 else 50.0
+                _ft_rsi_ok = 10 < _ft_rsi < 55  # bearish zone, not yet totally oversold
+                if _ft_near_low and _ft_candles_ok and _ft_rsi_ok:
+                    _fast_track = True
+                    logger.info(
+                        f"[Analyzer] {symbol} SHORT FAST-TRACK: 1h return {_return_1h:.1f}% "
+                        f"bounce={_ft_bounce:.1f}% red={_ft_red_count}/3 RSI={_ft_rsi:.0f} — approved"
+                    )
+                else:
+                    logger.info(
+                        f"[Analyzer] {symbol} SHORT FAST-TRACK DENIED: 1h return {_return_1h:.1f}% "
+                        f"but bounce={_ft_bounce:.1f}% red={_ft_red_count}/3 RSI={_ft_rsi:.0f} — "
+                        f"dump exhausting, applying normal gates"
+                    )
+            elif direction != "short" and _return_1h >= 2.0:
                 # Exhaustion check 1: price must be within 2.5% of recent 1h high
                 # If it's already pulled back more, the move is dying
                 _ft_high = float(np.max(_highs_5m[-12:])) if len(_highs_5m) >= 12 else _closes_5m[-1]
@@ -189,7 +236,7 @@ class AnalyzerAgent:
                         f"pump exhausting, applying normal gates"
                     )
 
-        # ── EMA alignment: 1h OR 15m EMA9 > EMA21 ────────────────────────────
+        # ── EMA alignment ────────────────────────────────────────────────────
         # Momentum tokens breaking out on 15m may not yet show 1h EMA9>EMA21 (lagging).
         # Accept either timeframe — catches early breakouts before 1h confirms.
         # SKIPPED if fast-track (price already confirmed momentum).
@@ -205,6 +252,20 @@ class AnalyzerAgent:
                     _ema_ok = True
             if not _ema_ok:
                 logger.debug(f"[Analyzer] {symbol} filtered: neither 1h nor 15m EMA9>EMA21")
+                return None
+        # ── SHORT: bearish EMA alignment: 1h OR 15m EMA9 < EMA21 ─────────────
+        elif direction == "short" and not _fast_track:
+            _ema_ok = False
+            if "1h" in tf_data:
+                _c1h = tf_data["1h"][:, 4]
+                if len(_c1h) >= 21 and _ema(_c1h, 9) < _ema(_c1h, 21):
+                    _ema_ok = True
+            if not _ema_ok and "15m" in tf_data:
+                _c15m = tf_data["15m"][:, 4]
+                if len(_c15m) >= 21 and _ema(_c15m, 9) < _ema(_c15m, 21) * 0.999:
+                    _ema_ok = True
+            if not _ema_ok:
+                logger.debug(f"[Analyzer] {symbol} SHORT filtered: neither 1h nor 15m EMA9<EMA21")
                 return None
 
         # ── RSI gate: 40-82, block overbought entries ─────────────────────────
@@ -233,6 +294,26 @@ class AnalyzerAgent:
                             f"({_rsi_prev:.1f} → {rsi_1h:.1f}) — distribution"
                         )
                         return None
+        # ── SHORT: RSI gate — block oversold (bounce risk) entries ────────────
+        elif direction == "short" and "1h" in tf_data:
+            _c1h_rsi = tf_data["1h"][:, 4]
+            if len(_c1h_rsi) >= 14:
+                rsi_1h = _compute_rsi(_c1h_rsi, 14)
+                if rsi_1h < 20:
+                    logger.info(f"[Analyzer] {symbol} SHORT filtered: 1h RSI {rsi_1h:.1f} < 20 (oversold — bounce risk)")
+                    return None
+                if rsi_1h > 60 and not _fast_track:
+                    logger.debug(f"[Analyzer] {symbol} SHORT filtered: 1h RSI {rsi_1h:.1f} > 60 (not bearish enough)")
+                    return None
+                # Check for rising RSI from oversold: accumulation signal
+                if len(_c1h_rsi) >= 16 and not _fast_track:
+                    _rsi_prev = _compute_rsi(_c1h_rsi[:-2], 14)
+                    if _rsi_prev < 30 and rsi_1h > _rsi_prev + 3:
+                        logger.info(
+                            f"[Analyzer] {symbol} SHORT filtered: 1h RSI rising from oversold "
+                            f"({_rsi_prev:.1f} → {rsi_1h:.1f}) — accumulation"
+                        )
+                        return None
 
         # ── MACD confirmation: hist > 0 OR rising ─────────────────────────────
         # hist > 0 = confirmed momentum. hist rising (crossing from below) = momentum STARTING.
@@ -248,6 +329,17 @@ class AnalyzerAgent:
                         f"[Analyzer] {symbol} filtered: 1h MACD {hist_now:.6f} ≤0 and not rising"
                     )
                     return None
+        # ── SHORT: MACD confirmation — hist < 0 OR declining ─────────────────
+        elif direction == "short" and "1h" in tf_data and not _fast_track:
+            _c1h_macd = tf_data["1h"][:, 4]
+            if len(_c1h_macd) >= 36:
+                hist_now = _compute_macd_hist(_c1h_macd, 12, 26, 9)
+                hist_prev = _compute_macd_hist(_c1h_macd[:-1], 12, 26, 9)
+                if hist_now >= 0 and hist_now >= hist_prev:
+                    logger.debug(
+                        f"[Analyzer] {symbol} SHORT filtered: 1h MACD {hist_now:.6f} ≥0 and not falling"
+                    )
+                    return None
 
         # Setup classification
         setup_type = self._classify_setup(tf_data, ta_scores)
@@ -256,6 +348,9 @@ class AnalyzerAgent:
         # as momentum. Position sizing (kelly × ta_score) auto-scales weak signals smaller.
         if setup_type == "neutral":
             setup_type = "momentum"
+        # Override for short direction
+        if direction == "short":
+            setup_type = "momentum_short"
 
         # Entry zone
         entry_zone = self._compute_entry_zone(price, atr, support, resistance, setup_type)
@@ -280,6 +375,7 @@ class AnalyzerAgent:
             "vol_usd": candidate.get("vol_usd", 0.0),
             "vol_ratio": candidate.get("vol_ratio", 1.0),
             "pct_change_24h": candidate.get("pct_change_24h", 0.0),
+            "direction": direction,
             "features": features,
             "timestamp": int(time.time()),
         }
@@ -401,6 +497,11 @@ class AnalyzerAgent:
             stop_loss = price - 1.8 * atr
             take_profit_1 = price + 2.0 * (price - stop_loss)
             take_profit_2 = price + 4.0 * (price - stop_loss)
+        elif setup_type == "momentum_short":
+            entry = price
+            stop_loss = price + 1.8 * atr
+            take_profit_1 = price - 2.0 * (stop_loss - price)
+            take_profit_2 = price - 4.0 * (stop_loss - price)
         elif setup_type == "pullback":
             entry = price
             stop_loss = max(support - 0.5 * atr, price - 2.0 * atr)
@@ -417,10 +518,16 @@ class AnalyzerAgent:
             take_profit_1 = price + 2.0 * (price - stop_loss)
             take_profit_2 = price + 4.0 * (price - stop_loss)
 
-        if stop_loss >= entry:
-            return None
+        _is_short = setup_type == "momentum_short"
 
-        risk_per_unit = entry - stop_loss
+        if _is_short:
+            if stop_loss <= entry:
+                return None
+            risk_per_unit = stop_loss - entry
+        else:
+            if stop_loss >= entry:
+                return None
+            risk_per_unit = entry - stop_loss
 
         # ── Enforce minimum 2% stop distance ──────────────────────────────────
         # ATR-based stops can be <1% on low-volatility tokens — these get hit
@@ -428,18 +535,31 @@ class AnalyzerAgent:
         min_risk = entry * 0.02
         if risk_per_unit < min_risk:
             risk_per_unit = min_risk
-            stop_loss = entry - risk_per_unit
-            take_profit_1 = entry + 2.0 * risk_per_unit
-            take_profit_2 = entry + 4.0 * risk_per_unit
+            if _is_short:
+                stop_loss = entry + risk_per_unit
+                take_profit_1 = entry - 2.0 * risk_per_unit
+                take_profit_2 = entry - 4.0 * risk_per_unit
+            else:
+                stop_loss = entry - risk_per_unit
+                take_profit_1 = entry + 2.0 * risk_per_unit
+                take_profit_2 = entry + 4.0 * risk_per_unit
         # ── Enforce maximum 6% stop distance (config safety net) ─────────
         max_risk = entry * 0.06
         if risk_per_unit > max_risk:
             risk_per_unit = max_risk
-            stop_loss = entry - risk_per_unit
-            take_profit_1 = entry + 2.0 * risk_per_unit
-            take_profit_2 = entry + 4.0 * risk_per_unit
+            if _is_short:
+                stop_loss = entry + risk_per_unit
+                take_profit_1 = entry - 2.0 * risk_per_unit
+                take_profit_2 = entry - 4.0 * risk_per_unit
+            else:
+                stop_loss = entry - risk_per_unit
+                take_profit_1 = entry + 2.0 * risk_per_unit
+                take_profit_2 = entry + 4.0 * risk_per_unit
 
-        rr_ratio = (take_profit_1 - entry) / risk_per_unit if risk_per_unit > 0 else 0.0
+        if _is_short:
+            rr_ratio = (entry - take_profit_1) / risk_per_unit if risk_per_unit > 0 else 0.0
+        else:
+            rr_ratio = (take_profit_1 - entry) / risk_per_unit if risk_per_unit > 0 else 0.0
 
         # Reject setups where R:R is below 1.8 — not worth the risk
         if rr_ratio < 1.8:

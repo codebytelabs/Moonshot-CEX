@@ -69,8 +69,8 @@ REGIME_CAPITAL = {
 # CHOPPY: breakout longs only (cleanest signal) + short tokens.
 # pullback/mean_reversion are dangerous in bear/choppy (dip-buying in a downtrend).
 REGIME_SETUP_ALLOWLIST = {
-    "bull":     {"breakout", "momentum", "pullback", "consolidation_breakout", "mean_reversion"},
-    "sideways": {"breakout", "momentum", "pullback", "consolidation_breakout"},
+    "bull":     {"breakout", "momentum", "momentum_short", "pullback", "consolidation_breakout", "mean_reversion"},
+    "sideways": {"breakout", "momentum", "momentum_short", "pullback", "consolidation_breakout"},
     # BEAR: momentum longs + shorts. The BTC trend gate (EMA9 >= EMA21*0.997, RSI>40)
     # blocks longs when BTC is genuinely dropping. Regime-level blanket ban was
     # redundant — it sat in 100% cash while alts pumped +11% (TAO, C, HUMA).
@@ -96,13 +96,14 @@ REGIME_MAX_POSITIONS = {
 }
 
 # ── Volatile mode overlay ──────────────────────────────────────────────────────
-# When mode=volatile, reduce position count and size further.
-# Prevents loading up leveraged positions in a fading/choppy market.
-# sideways+volatile: 6 × 0.75 = 4 max positions, 0.85 × 0.85 = 0.72× size
+# When mode=volatile, reduce SIZE aggressively but keep position slots open.
+# Volatile markets are OPPORTUNITIES (big swings to catch), but each bet
+# should be smaller until win rate recovers.
+# sideways+volatile: 5 max positions, 0.85 × 0.80 = 0.68× size
 VOLATILE_MODE_OVERLAY = {
-    "max_positions_mult": 0.75,   # reduce max positions by 25%
-    "size_mult":          0.85,   # reduce position size by 15%
-    "exposure_mult":      0.85,   # reduce max exposure by 15%
+    "max_positions_mult": 0.85,   # reduce max positions by ~15% (6→5 in sideways)
+    "size_mult":          0.80,   # reduce position size by 20%
+    "exposure_mult":      0.80,   # reduce max exposure by 20%
 }
 
 # ── Per-regime Bayesian threshold override ────────────────────────────────────
