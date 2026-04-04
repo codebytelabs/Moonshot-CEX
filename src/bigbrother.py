@@ -10,9 +10,11 @@ v3.1 — Regime-adaptive strategy:
   • Choppy = deadliest regime for momentum bots → minimal trading mode
 """
 import time
+import collections
 from typing import Optional
 from loguru import logger
 import httpx
+import numpy as np
 
 from .risk_manager import RiskManager
 from .bayesian_engine import BayesianDecisionEngine
@@ -88,11 +90,11 @@ CHOPPY_MIN_TA_SCORE = 50.0
 
 # ── Per-regime max concurrent positions ───────────────────────────────────────
 REGIME_MAX_POSITIONS = {
-    "bull":     10,
-    "sideways": 6,
+    "bull":     12,
+    "sideways": 8,
     # BEAR/CHOPPY: fewer, higher-conviction entries only
-    "bear":     4,
-    "choppy":   3,
+    "bear":     5,
+    "choppy":   4,
 }
 
 # ── Volatile mode overlay ──────────────────────────────────────────────────────
@@ -101,7 +103,7 @@ REGIME_MAX_POSITIONS = {
 # should be smaller until win rate recovers.
 # sideways+volatile: 5 max positions, 0.85 × 0.80 = 0.68× size
 VOLATILE_MODE_OVERLAY = {
-    "max_positions_mult": 0.85,   # reduce max positions by ~15% (6→5 in sideways)
+    "max_positions_mult": 1.0,    # keep all slots open — size_mult handles risk
     "size_mult":          0.80,   # reduce position size by 20%
     "exposure_mult":      0.80,   # reduce max exposure by 20%
 }
@@ -185,6 +187,18 @@ class BigBrotherAgent:
         self._sv_pos_snapshots: dict[str, list[float]] = {}  # symbol → [pnl_pct history]
         # Last supervisor report (exposed via get_status_summary)
         self._sv_last_report: dict = {}
+
+        # ── Position Health Monitor state ─────────────────────────────────────
+        # Tracks per-position RSI snapshots for momentum reversal detection
+        self._hm_rsi_snapshots: dict[str, list[float]] = {}  # symbol → [rsi history]
+
+        # ── Self-Improvement Loop state ───────────────────────────────────────
+        self._learning_log: list[dict] = []           # in-memory learning log
+        self._learning_log_max: int = 200             # keep last 200 entries
+        self._pattern_interval: int = 120             # run pattern detector every 120 cycles (~30 min)
+        self._pattern_last_run: int = 0               # last cycle pattern detector ran
+        self._confirmed_issues: list[dict] = []       # issues surfaced to dashboard
+        self._confirmed_issues_max: int = 10          # max concurrent issues
 
     async def supervise(
         self,
@@ -625,6 +639,8 @@ class BigBrotherAgent:
         closed_trades: list,
         current_equity: float,
         position_manager=None,
+        exchange=None,
+        db=None,
     ) -> dict:
         """Comprehensive health audit — runs every ~2 minutes.
 
@@ -635,6 +651,8 @@ class BigBrotherAgent:
           4. Concentration risk (correlated positions)
           5. Exchange health (API errors, latency)
           6. Self-healing actions (tighten stops, alerts, mode shifts)
+          7. Position health monitor (live RSI/momentum check, close stale losers)
+          8. Self-improvement pattern detector (every ~30 min)
 
         Returns dict with findings and actions taken.
         """
@@ -693,7 +711,45 @@ class BigBrotherAgent:
             report["alerts"].append(exchange_health["detail"])
             self._record_event("supervisor_exchange_degraded", exchange_health["detail"])
 
-        # ── 6. Overall Verdict ───────────────────────────────────────────────
+        # ── 6. Position Health Monitor — live RSI/momentum check ───────────
+        # Fetches 5m candles, computes RSI, closes stale losers with fading momentum.
+        hm_closes = []
+        if exchange and position_manager:
+            hm_closes = await self._health_monitor_positions(
+                positions, exchange, position_manager, db
+            )
+            report["checks"]["health_monitor"] = {
+                "closed": [c["symbol"] for c in hm_closes],
+                "count": len(hm_closes),
+            }
+            for hmc in hm_closes:
+                report["actions"].append(
+                    f"CLOSED: {hmc['symbol']} — {hmc['reason']} (PnL={hmc['pnl_pct']:+.1f}%)"
+                )
+
+        # ── 7. Self-Improvement Pattern Detector (every ~30 min) ───────────
+        if (self._cycle_count - self._pattern_last_run) >= self._pattern_interval:
+            self._pattern_last_run = self._cycle_count
+            new_issues = self._detect_patterns(closed_trades)
+            report["checks"]["pattern_detector"] = {
+                "issues_found": len(new_issues),
+                "total_learning_log": len(self._learning_log),
+            }
+            if new_issues:
+                for issue in new_issues:
+                    report["actions"].append(f"ISSUE: {issue['summary']}")
+                    report["alerts"].append(issue["summary"])
+                if self.alerts:
+                    issue_text = "\n".join([f"• {i['summary']}" for i in new_issues])
+                    await self.alerts.send(
+                        f"🧠 Self-Improvement: {len(new_issues)} pattern(s) detected\n{issue_text}",
+                        priority="high",
+                    )
+
+        # Attach confirmed issues to report for dashboard
+        report["confirmed_issues"] = self._confirmed_issues
+
+        # ── 8. Overall Verdict ───────────────────────────────────────────────
         critical_count = len(report["alerts"])
         if critical_count >= 3:
             report["verdict"] = "CRITICAL"
@@ -963,6 +1019,386 @@ class BigBrotherAgent:
             # If red and stagnant — let stop_loss handle it, don't interfere
         except Exception as e:
             logger.debug(f"[Supervisor] Heal failed for {pos.symbol}: {e}")
+
+    # ── Position Health Monitor ─────────────────────────────────────────────
+    # Every ~2 min: fetch 5m candles for each open position, compute RSI,
+    # detect momentum reversal, close stale losers with fading momentum.
+
+    @staticmethod
+    def _compute_rsi_from_closes(closes: np.ndarray, period: int = 14) -> float:
+        if len(closes) < period + 1:
+            return 50.0
+        deltas = np.diff(closes)
+        gains = np.where(deltas > 0, deltas, 0.0)
+        losses = np.where(deltas < 0, -deltas, 0.0)
+        avg_gain = np.mean(gains[-period:])
+        avg_loss = np.mean(losses[-period:])
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return float(100.0 - (100.0 / (1.0 + rs)))
+
+    async def _health_monitor_positions(
+        self, positions: list, exchange, position_manager, db=None
+    ) -> list[dict]:
+        """Live RSI/momentum check on every open position.
+
+        Rules:
+        - Position must be >2 min old
+        - Position must be negative (PnL < 0)
+        - Fetch 5m candles → compute RSI-14
+        - LONG: RSI < 40 AND RSI declining (current < prev snapshot by 5+ pts) → close
+        - SHORT: RSI > 60 AND RSI rising → close
+        - Also close if momentum has fully reversed (RSI crossed 50 against position)
+          AND position held > 5 min AND PnL < -1%
+
+        Returns list of dicts describing each closed position.
+        """
+        closed_results = []
+        now = time.time()
+
+        for pos in positions:
+            if getattr(pos, "status", "") != "open":
+                continue
+            if getattr(pos, "setup_type", "") in ("synced_holding", "exchange_holding"):
+                continue
+
+            symbol = pos.symbol
+            hold_minutes = (now - pos.opened_at) / 60.0
+
+            # Must be open > 2 minutes
+            if hold_minutes < 2.0:
+                continue
+
+            try:
+                current_price = await position_manager.execution.get_current_price(symbol)
+                if current_price <= 0:
+                    continue
+                pnl_pct = pos.current_pnl_pct(current_price)
+            except Exception:
+                continue
+
+            # Only check positions that are negative
+            if pnl_pct >= 0:
+                # Clean RSI snapshots for green positions
+                self._hm_rsi_snapshots.pop(symbol, None)
+                continue
+
+            # Fetch 5m candles for RSI
+            try:
+                candles = await exchange.fetch_ohlcv(symbol, "5m", limit=30)
+                if not candles or len(candles) < 16:
+                    continue
+                closes = np.array([c[4] for c in candles], dtype=float)
+                rsi = self._compute_rsi_from_closes(closes, 14)
+            except Exception as e:
+                logger.debug(f"[HealthMonitor] Candle fetch failed for {symbol}: {e}")
+                continue
+
+            # Track RSI snapshots for trend detection
+            if symbol not in self._hm_rsi_snapshots:
+                self._hm_rsi_snapshots[symbol] = []
+            self._hm_rsi_snapshots[symbol].append(rsi)
+            if len(self._hm_rsi_snapshots[symbol]) > 5:
+                self._hm_rsi_snapshots[symbol] = self._hm_rsi_snapshots[symbol][-5:]
+
+            rsi_history = self._hm_rsi_snapshots[symbol]
+            side = getattr(pos, "side", "long")
+            close_reason = None
+
+            if side == "long":
+                # RSI < 40 and declining by 5+ pts from previous check → momentum gone
+                if rsi < 40 and len(rsi_history) >= 2 and rsi_history[-2] - rsi >= 5:
+                    close_reason = f"health_monitor_rsi_fade (RSI {rsi:.0f}, was {rsi_history[-2]:.0f})"
+                # RSI crossed below 35 AND position > 5 min AND losing > 1%
+                elif rsi < 35 and hold_minutes > 5.0 and pnl_pct < -1.0:
+                    close_reason = f"health_monitor_momentum_lost (RSI {rsi:.0f}, PnL {pnl_pct:+.1f}%)"
+            else:  # short
+                # RSI > 60 and rising by 5+ pts → momentum reversed against short
+                if rsi > 60 and len(rsi_history) >= 2 and rsi - rsi_history[-2] >= 5:
+                    close_reason = f"health_monitor_rsi_bounce (RSI {rsi:.0f}, was {rsi_history[-2]:.0f})"
+                # RSI crossed above 65 AND position > 5 min AND losing > 1%
+                elif rsi > 65 and hold_minutes > 5.0 and pnl_pct < -1.0:
+                    close_reason = f"health_monitor_momentum_lost (RSI {rsi:.0f}, PnL {pnl_pct:+.1f}%)"
+
+            if close_reason:
+                logger.info(
+                    f"[HealthMonitor] CLOSING {symbol} ({side}): {close_reason} | "
+                    f"hold={hold_minutes:.1f}min PnL={pnl_pct:+.1f}%"
+                )
+                try:
+                    result = await position_manager._execute_exit(
+                        pos, current_price, close_reason, pos.amount
+                    )
+                    if result:
+                        closed_results.append({
+                            "symbol": symbol,
+                            "reason": close_reason,
+                            "pnl_pct": round(pnl_pct, 2),
+                            "pnl_usd": float(result.get("pnl_usd", 0)),
+                            "hold_min": round(hold_minutes, 1),
+                            "rsi": round(rsi, 1),
+                            "side": side,
+                            "result": result,
+                        })
+                        # Log lesson for self-improvement
+                        self._log_lesson(pos, result, close_reason, rsi)
+                except Exception as e:
+                    logger.warning(f"[HealthMonitor] Exit failed for {symbol}: {e}")
+
+        # Clean RSI snapshots for closed/missing positions
+        open_syms = {getattr(p, "symbol", "") for p in positions if getattr(p, "status", "") == "open"}
+        for sym in list(self._hm_rsi_snapshots.keys()):
+            if sym not in open_syms:
+                del self._hm_rsi_snapshots[sym]
+
+        if closed_results:
+            logger.info(f"[HealthMonitor] Closed {len(closed_results)} position(s) with fading momentum")
+
+        return closed_results
+
+    # ── Self-Improvement: Learning Log ────────────────────────────────────────
+
+    def _log_lesson(self, pos, exit_result: dict, close_reason: str, rsi_at_close: float) -> None:
+        """Record WHY a position was taken and WHY it was closed.
+
+        Called on every health-monitor close. Can also be called externally
+        for any losing trade close.
+        """
+        entry = {
+            "ts": int(time.time()),
+            "symbol": pos.symbol,
+            "side": getattr(pos, "side", "long"),
+            "setup_type": getattr(pos, "setup_type", "unknown"),
+            "entry_price": pos.entry_price,
+            "exit_price": float(exit_result.get("exit_price", 0)),
+            "pnl_pct": float(exit_result.get("pnl_pct", 0)),
+            "pnl_usd": float(exit_result.get("pnl_usd", 0)),
+            "hold_minutes": round(pos.hold_time_hours() * 60, 1),
+            "close_reason": close_reason,
+            "rsi_at_close": round(rsi_at_close, 1),
+            "regime_at_entry": self.regime,
+            "mode_at_entry": self.mode,
+            "decision": getattr(pos, "decision", {}),
+            "lesson": self._generate_lesson(pos, close_reason, rsi_at_close),
+        }
+        self._learning_log.append(entry)
+        if len(self._learning_log) > self._learning_log_max:
+            self._learning_log = self._learning_log[-self._learning_log_max:]
+
+        logger.info(
+            f"[SelfImprove] LESSON: {entry['symbol']} {entry['side']} "
+            f"setup={entry['setup_type']} regime={entry['regime_at_entry']} "
+            f"PnL={entry['pnl_pct']:+.1f}% reason={close_reason} | {entry['lesson']}"
+        )
+
+    def log_losing_trade(self, trade_dict: dict) -> None:
+        """Record a losing trade from normal exit flow (called from server.py)."""
+        entry = {
+            "ts": int(time.time()),
+            "symbol": trade_dict.get("symbol", "?"),
+            "side": trade_dict.get("side", "long"),
+            "setup_type": trade_dict.get("setup_type", "unknown"),
+            "entry_price": float(trade_dict.get("entry_price", 0)),
+            "exit_price": float(trade_dict.get("exit_price", 0)),
+            "pnl_pct": float(trade_dict.get("pnl_pct", 0)),
+            "pnl_usd": float(trade_dict.get("pnl_usd", 0)),
+            "hold_minutes": float(trade_dict.get("hold_minutes", 0)),
+            "close_reason": trade_dict.get("close_reason", "unknown"),
+            "rsi_at_close": 0.0,  # not available for normal exits
+            "regime_at_entry": trade_dict.get("regime", self.regime),
+            "mode_at_entry": trade_dict.get("mode", self.mode),
+            "decision": trade_dict.get("decision", {}),
+            "lesson": f"Lost {trade_dict.get('pnl_pct', 0):+.1f}% via {trade_dict.get('close_reason', '?')} "
+                      f"after {trade_dict.get('hold_minutes', 0):.0f}min in {self.regime} regime",
+        }
+        self._learning_log.append(entry)
+        if len(self._learning_log) > self._learning_log_max:
+            self._learning_log = self._learning_log[-self._learning_log_max:]
+
+    @staticmethod
+    def _generate_lesson(pos, close_reason: str, rsi: float) -> str:
+        side = getattr(pos, "side", "long")
+        setup = getattr(pos, "setup_type", "unknown")
+        hold_min = pos.hold_time_hours() * 60
+        if "rsi_fade" in close_reason:
+            return (f"Entered {side} {setup}, RSI faded to {rsi:.0f} after {hold_min:.0f}min — "
+                    f"momentum was already exhausted at entry")
+        if "momentum_lost" in close_reason:
+            return (f"Entered {side} {setup}, momentum fully reversed (RSI={rsi:.0f}) "
+                    f"after {hold_min:.0f}min — entry was against emerging trend")
+        if "rsi_bounce" in close_reason:
+            return (f"Short {setup} hit RSI bounce to {rsi:.0f} after {hold_min:.0f}min — "
+                    f"selling pressure exhausted")
+        return f"{side} {setup} closed after {hold_min:.0f}min: {close_reason}"
+
+    # ── Self-Improvement: Pattern Detector ────────────────────────────────────
+
+    def _detect_patterns(self, closed_trades: list) -> list[dict]:
+        """Scan learning log + recent losing trades for repeated failure patterns.
+
+        Runs every ~30 min. Looks for:
+          1. Same setup_type losing 3+ times → "setup X is failing"
+          2. Same regime producing 70%+ losers → "regime X is toxic"
+          3. Positions dying within 5 min consistently → "entries too late"
+          4. RSI range at entry correlating with losses → "bad RSI zone"
+
+        Returns list of new confirmed issues.
+        """
+        new_issues = []
+        cutoff = time.time() - 7200  # last 2 hours
+
+        # Combine learning log + recent closed losing trades
+        recent_lessons = [e for e in self._learning_log if e["ts"] > cutoff]
+
+        # Also pull losing trades from closed_trades (last 20)
+        recent_losers = []
+        for t in closed_trades[-20:]:
+            if float(t.get("pnl_usd", 0)) < 0:
+                recent_losers.append({
+                    "setup_type": t.get("setup_type", "unknown"),
+                    "close_reason": t.get("close_reason", "unknown"),
+                    "pnl_pct": float(t.get("pnl_pct", 0)),
+                    "hold_minutes": float(t.get("hold_minutes", t.get("hold_time_hours", 0) * 60)),
+                    "regime_at_entry": t.get("regime", "unknown"),
+                    "side": t.get("side", "long"),
+                })
+
+        all_losses = recent_lessons + recent_losers
+        if len(all_losses) < 3:
+            return []
+
+        # ── Pattern 1: Same setup_type failing repeatedly ─────────────────
+        setup_counts = collections.Counter(e.get("setup_type", "?") for e in all_losses)
+        for setup, count in setup_counts.items():
+            if count >= 3 and setup != "unknown":
+                issue_id = f"setup_failing:{setup}"
+                if not self._issue_already_confirmed(issue_id):
+                    issue = {
+                        "id": issue_id,
+                        "severity": "high" if count >= 5 else "medium",
+                        "summary": f"Setup '{setup}' has failed {count}x in last 2h — review entry quality gates",
+                        "count": count,
+                        "ts": int(time.time()),
+                        "category": "setup_type",
+                    }
+                    new_issues.append(issue)
+                    self._add_confirmed_issue(issue)
+
+        # ── Pattern 2: Same regime producing mostly losers ────────────────
+        regime_stats = collections.defaultdict(lambda: {"wins": 0, "losses": 0})
+        for t in closed_trades[-30:]:
+            r = t.get("regime", "unknown")
+            if float(t.get("pnl_usd", 0)) > 0:
+                regime_stats[r]["wins"] += 1
+            else:
+                regime_stats[r]["losses"] += 1
+        for regime, stats in regime_stats.items():
+            total = stats["wins"] + stats["losses"]
+            if total >= 5 and stats["losses"] / total >= 0.70:
+                issue_id = f"regime_toxic:{regime}"
+                if not self._issue_already_confirmed(issue_id):
+                    wr = stats["wins"] / total * 100
+                    issue = {
+                        "id": issue_id,
+                        "severity": "high",
+                        "summary": (f"Regime '{regime}' has {wr:.0f}% win rate over last {total} trades "
+                                    f"— consider pausing entries in this regime"),
+                        "count": total,
+                        "ts": int(time.time()),
+                        "category": "regime",
+                    }
+                    new_issues.append(issue)
+                    self._add_confirmed_issue(issue)
+
+        # ── Pattern 3: Positions dying within 5 min consistently ──────────
+        quick_deaths = [e for e in all_losses if e.get("hold_minutes", 999) < 5.0]
+        if len(quick_deaths) >= 3:
+            issue_id = "quick_death_pattern"
+            if not self._issue_already_confirmed(issue_id):
+                issue = {
+                    "id": issue_id,
+                    "severity": "high",
+                    "summary": f"{len(quick_deaths)} positions died within 5 min — entries may be chasing exhausted moves",
+                    "count": len(quick_deaths),
+                    "ts": int(time.time()),
+                    "category": "timing",
+                }
+                new_issues.append(issue)
+                self._add_confirmed_issue(issue)
+
+        # ── Pattern 4: Same close_reason repeated ─────────────────────────
+        reason_counts = collections.Counter()
+        for e in all_losses:
+            # Normalize close reason to base category
+            reason = e.get("close_reason", "unknown")
+            if "rsi_fade" in reason:
+                reason_counts["rsi_fade"] += 1
+            elif "momentum_lost" in reason:
+                reason_counts["momentum_lost"] += 1
+            elif "stop_loss" in reason:
+                reason_counts["stop_loss"] += 1
+            elif "time_exit" in reason:
+                reason_counts["time_exit"] += 1
+            elif "trailing" in reason:
+                reason_counts["trailing_stop"] += 1
+            else:
+                reason_counts[reason] += 1
+
+        for reason, count in reason_counts.items():
+            if count >= 4:
+                issue_id = f"exit_pattern:{reason}"
+                if not self._issue_already_confirmed(issue_id):
+                    issue = {
+                        "id": issue_id,
+                        "severity": "medium",
+                        "summary": f"Exit reason '{reason}' triggered {count}x in 2h — investigate root cause",
+                        "count": count,
+                        "ts": int(time.time()),
+                        "category": "exit_reason",
+                    }
+                    new_issues.append(issue)
+                    self._add_confirmed_issue(issue)
+
+        if new_issues:
+            logger.info(
+                f"[SelfImprove] Pattern detector found {len(new_issues)} new issue(s) "
+                f"from {len(all_losses)} recent losses"
+            )
+
+        return new_issues
+
+    def _issue_already_confirmed(self, issue_id: str) -> bool:
+        """Check if an issue is already in the confirmed list (avoid duplicates)."""
+        return any(i["id"] == issue_id for i in self._confirmed_issues)
+
+    def _add_confirmed_issue(self, issue: dict) -> None:
+        """Add an issue to the confirmed list, evicting oldest if full."""
+        # Remove stale issues (>4 hours old)
+        cutoff = time.time() - 14400
+        self._confirmed_issues = [i for i in self._confirmed_issues if i["ts"] > cutoff]
+        self._confirmed_issues.append(issue)
+        if len(self._confirmed_issues) > self._confirmed_issues_max:
+            self._confirmed_issues = self._confirmed_issues[-self._confirmed_issues_max:]
+
+    def dismiss_issue(self, issue_id: str) -> bool:
+        """Dismiss a confirmed issue (called from dashboard API)."""
+        before = len(self._confirmed_issues)
+        self._confirmed_issues = [i for i in self._confirmed_issues if i["id"] != issue_id]
+        return len(self._confirmed_issues) < before
+
+    @property
+    def confirmed_issues(self) -> list[dict]:
+        """Return current confirmed issues for dashboard display."""
+        # Evict stale issues on read
+        cutoff = time.time() - 14400
+        self._confirmed_issues = [i for i in self._confirmed_issues if i["ts"] > cutoff]
+        return self._confirmed_issues
+
+    @property
+    def learning_log(self) -> list[dict]:
+        """Return recent learning log entries."""
+        return self._learning_log[-50:]
 
     @property
     def supervisor_due(self) -> bool:
