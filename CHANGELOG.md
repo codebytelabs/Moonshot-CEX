@@ -5,6 +5,77 @@ Format: **version → date → category → what changed → why**.
 
 ---
 
+## v5.0 — April 5, 2026 — Wave Rider: Strategy C Overhaul
+
+> **Mission:** After analyzing all 76 trades, the bot was bleeding -$1,795 from three root causes: (1) `early_thesis_invalid` exit killed 41% of all trades with 0% win rate (-$863), (2) regime detector used bot's own win rate creating a self-reinforcing doom loop (loses → choppy → worse params → more losses), (3) position sizing crushed to 0.44× by stacked overlays (regime 0.55× + volatile 0.80×) making wins too small to offset losses. Strategy C ("Wave Rider") fixes all three with a "trade big or stay in cash" philosophy.
+
+---
+
+### CRITICAL FIXES
+
+**1. Disabled `early_thesis_invalid` exit** (`position_manager.py`)
+- 0% win rate across 31 trades, -$863 total loss
+- Killed positions after 5 min if never positive — but these same positions would hit -3.5% SL anyway
+- Disabling lets some RECOVER and reach trailing stop activation (+1.2%)
+- Stop-loss remains the proper downside protector
+
+**2. Broke regime doom loop** (`bigbrother.py`)
+- Old: regime score = BTC(4×) + **win_rate(8×)** + profit_factor(2×) - loss_penalty
+- Bot loses → WR drops → regime becomes choppy → tighter SL/smaller size → more losses → WR drops more → **stuck in choppy FOREVER**
+- New: regime score = **BTC 24h change ONLY** — no bot performance metrics
+- Choppy override: BTC in tight range (-1.2% to +1.2%), not bot win rate
+
+**3. BTC Trend Master Switch** (`server.py`)
+- Binary ON/OFF: BTC momentum score ≥ 0.45 → trade at full size. Below → **block ALL new long entries**
+- Replaces graduated sizing that bled money in choppy (0.3× size on weak BTC = tiny wins, normal losses)
+- Existing positions ride their trailing stops regardless of switch state
+- Short tokens exempt (they profit from BTC weakness)
+
+**4. Flattened SL regime scaling** (`bigbrother.py`)
+- Old: choppy SL × 0.65 = -2.28% — too tight for 7× leverage (0.33% price noise triggers it)
+- New: SL stays at **-3.5% flat** across ALL regimes. Trail and time still scale.
+
+**5. Killed position size death spiral** (`bigbrother.py`)
+- Removed volatile overlay stacking: was 0.80× on top of regime 0.55× = 0.44× total
+- Volatile overlay now 1.0× (disabled) — BTC trend switch handles risk via entry gating
+- Restored choppy size_mult: 0.55 → 0.75
+- Min margin floor: $150 (data: money-printing period avg $467, bleeding period $65-88)
+
+**6. Trailing stop activation 1.0% → 1.2%** (`.env`)
+- 20% more breathing room for entry noise (spread, slippage, first candle)
+- With 7× leverage, 0.17% price move = 1.2% PnL → activates naturally on real momentum
+
+### CONFIGURATION CHANGES
+
+| Parameter | Old | New | Why |
+|-----------|-----|-----|-----|
+| `TRAILING_STOP_ACTIVATE_PCT` | 1.0% | 1.2% | Entry noise breathing room |
+| `REGIME_SCALE.choppy.sl` | 0.65 | 1.0 | -2.28% was too tight for 7× lev |
+| `REGIME_SCALE.*.sl` | varied | 1.0 (all) | SL is a floor, not a knob |
+| `REGIME_CAPITAL.choppy.size_mult` | 0.55 | 0.75 | Prevent tiny positions |
+| `VOLATILE_MODE_OVERLAY.size_mult` | 0.80 | 1.0 | Kill stacking death spiral |
+| `VOLATILE_MODE_OVERLAY.exposure_mult` | 0.80 | 1.0 | Kill stacking death spiral |
+| `REGIME_MAX_POSITIONS.bull` | 12 | 8 | Focus on quality |
+| `REGIME_MAX_POSITIONS.choppy` | 4 | 5 | Allow diversification |
+| `early_thesis_invalid` | enabled | **disabled** | 0% WR, -$863 |
+| Regime detector WR weight | 8× | **0** (removed) | Broke doom loop |
+| BTC trend gate | graduated sizing | **binary block** | Cash > bleeding |
+| Min margin floor | none | **$150** | Meaningful position sizes |
+
+### STRATEGY PHILOSOPHY
+
+```
+OLD: "Trade always, scale down when uncertain"
+  → Result: bled -$1,795 with tiny positions that couldn't recover losses
+
+NEW (Wave Rider): "Trade big when BTC trends up, sit in cash when it doesn't"
+  → BTC up? Full conviction, meaningful size, trailing stops lock profit
+  → BTC flat/down? Zero new longs. Existing positions ride their stops.
+  → Simple: hop on uptrend → make money → trend fades → cash → repeat
+```
+
+---
+
 ## v4.2 — April 4, 2026 — Stop the Bleeding: Regime Protection + Anti-Churn
 
 > **Mission:** Bot was bleeding from three root causes: (1) regime downgrade protection was never wired in, (2) stop-loss and exit orders failed on large positions due to Binance -4005 max quantity errors, (3) position rotation was killing positions at -1% in choppy/volatile markets causing destructive churn. This release fixes all three.
