@@ -776,8 +776,8 @@ async def _run_cycle():
     # This replaces the graduated sizing approach that bled -$1,795 in choppy markets.
     # Existing positions keep riding their trailing stops regardless of this switch.
     #
-    # ON (score >= 0.45): Full entries allowed, normal sizing
-    # OFF (score < 0.45): ZERO new long entries. Shorts still allowed (profit from weakness).
+    # ON (score >= 0.30): Full entries allowed, normal sizing
+    # OFF (score < 0.30): ZERO new long entries. Shorts still allowed (profit from weakness).
     _btc_momentum = {"score": 0.7, "bullish": True}  # default: moderate
     _btc_size_mult = 1.0  # v5.0: no graduated sizing — binary ON/OFF
     _btc_trend_on = True   # master switch
@@ -789,12 +789,12 @@ async def _run_cycle():
         except Exception as _btc_err:
             logger.warning(f"[Cycle {cycle}] BTC momentum check failed: {_btc_err}")
 
-        _btc_trend_on = _btc_momentum["score"] >= 0.45
+        _btc_trend_on = _btc_momentum["score"] >= 0.30
         STATE["btc_trend_master_switch"] = _btc_trend_on
 
         if not _btc_trend_on:
             logger.info(
-                f"[Cycle {cycle}] 🔴 BTC TREND SWITCH OFF — score={_btc_momentum['score']:.2f} < 0.45. "
+                f"[Cycle {cycle}] 🔴 BTC TREND SWITCH OFF — score={_btc_momentum['score']:.2f} < 0.30. "
                 f"Blocking new long entries. Existing positions ride trailing stops."
             )
         # When switch is ON, no size scaling — trade with full conviction
@@ -950,7 +950,7 @@ async def _run_cycle():
                 trace["steps"].append(f"skip_btc_trend_off:{symbol}")
                 logger.info(
                     f"[Swarm] {symbol} BLOCKED: BTC trend switch OFF "
-                    f"(score={_btc_momentum['score']:.2f} < 0.45). Waiting for uptrend."
+                    f"(score={_btc_momentum['score']:.2f} < 0.30). Waiting for uptrend."
                 )
                 continue
             # When switch is ON → full size, no scaling (trade with conviction)
