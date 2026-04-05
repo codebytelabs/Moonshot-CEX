@@ -1070,12 +1070,13 @@ class BigBrotherAgent:
             close_reason = None
 
             if side == "long":
-                # RSI < 40 and declining by 5+ pts from previous check → momentum gone
-                if rsi < 40 and len(rsi_history) >= 2 and rsi_history[-2] - rsi >= 5:
-                    close_reason = f"health_monitor_rsi_fade (RSI {rsi:.0f}, was {rsi_history[-2]:.0f})"
-                # RSI crossed below 35 AND position > 5 min AND losing > 1%
-                elif rsi < 35 and hold_minutes > 5.0 and pnl_pct < -1.0:
-                    close_reason = f"health_monitor_momentum_lost (RSI {rsi:.0f}, PnL {pnl_pct:+.1f}%)"
+                # DISABLED (v5.0 Wave Rider): health_monitor_rsi_fade was closing longs
+                # at -0.5% to -1.8% — same premature exit problem as early_thesis_invalid.
+                # In a weak BTC market (RSI=37), EVERY alt's RSI drops below 40, causing
+                # the monitor to kill ALL positions before trailing stops can activate.
+                # The -3.5% stop-loss is the proper risk manager, not RSI monitoring.
+                # Keeping short-side monitoring intact (less data, different dynamics).
+                pass
             else:  # short
                 # RSI > 60 and rising by 5+ pts → momentum reversed against short
                 if rsi > 60 and len(rsi_history) >= 2 and rsi - rsi_history[-2] >= 5:
