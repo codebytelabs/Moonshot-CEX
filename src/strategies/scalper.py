@@ -88,7 +88,7 @@ class ScalpingSniper(BaseStrategy):
         long_candidates = []
         short_candidates = []
         for sym, tk in tickers.items():
-            if not sym.endswith("/USDT") or sym not in set(pairs):
+            if "/USDT" not in sym or sym not in set(pairs):
                 continue
             vol = float(tk.get("quoteVolume") or 0)
             last = float(tk.get("last") or 0)

@@ -91,7 +91,7 @@ class BreakoutORB(BaseStrategy):
         short_candidates = []
         pair_set = set(pairs)
         for sym, tk in tickers.items():
-            if not sym.endswith("/USDT") or sym not in pair_set:
+            if "/USDT" not in sym or sym not in pair_set:
                 continue
             vol = float(tk.get("quoteVolume") or 0)
             last = float(tk.get("last") or 0)
