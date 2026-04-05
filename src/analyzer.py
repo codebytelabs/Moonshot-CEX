@@ -148,7 +148,7 @@ class AnalyzerAgent:
             _current = float(_closes_5m[-1])
             if _recent_high > 0:
                 _pullback_pct = (_recent_high - _current) / _recent_high * 100.0
-                if _pullback_pct >= 3.0:
+                if _pullback_pct >= 5.0:
                     logger.info(
                         f"[Analyzer] {symbol} BLOCKED: price {_current:.6f} is {_pullback_pct:.1f}% "
                         f"below 1h high {_recent_high:.6f} — pump already topped"
