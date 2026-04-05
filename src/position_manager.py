@@ -592,14 +592,13 @@ class PositionManager:
         peak_pnl_pct = pos.current_pnl_pct(pos.highest_price if pos.side == "long" else pos.lowest_price)
         giveback_pct = peak_pnl_pct - pnl_pct
 
-        # Early thesis invalid: position entered on momentum but it NEVER materialized.
-        # After 5 min: losing >1% AND peak was <0.3% (never went meaningfully green).
-        # This is NOT the same as old no_traction exits that killed at -2% blanket:
-        #   - Old: killed at -2% regardless of peak → destroyed winners that dipped first
-        #   - New: only kills if peak < 0.3% — if it ever went +1% then the thesis had legs
-        # 5 min threshold lets normal entry noise settle (spread, order fill, first candle).
-        if hold_minutes >= 5.0 and pnl_pct < -1.0 and peak_pnl_pct < 0.3:
-            return "early_thesis_invalid"
+        # DISABLED (v5.0 Wave Rider): early_thesis_invalid had 0% win rate across
+        # 31 trades (-$863 total). It killed 41% of all trades before trailing stop
+        # could activate. The positions it killed would hit -3.5% SL anyway, but
+        # disabling this allows some to RECOVER and reach trailing activation.
+        # The stop-loss is the proper downside protector, not a 5-minute impatience exit.
+        # if hold_minutes >= 5.0 and pnl_pct < -1.0 and peak_pnl_pct < 0.3:
+        #     return "early_thesis_invalid"
 
         # Momentum faded: had a significant peak (+3%+) but gave back 70%+ of gains.
         # This is the ONE justified momentum exit — don't let a +5% winner turn into -2% loser.

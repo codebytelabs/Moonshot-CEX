@@ -31,13 +31,13 @@ MODES = ("normal", "volatile", "safety", "paused")
 #   trail = trailing stop  (lower trail_activate = activates sooner)
 #   time  = time exit hours
 REGIME_SCALE = {
-    # With simplified exits (SL + trailing + time only, no momentum kills),
-    # trailing stop is the PRIMARY profit-capture mechanism. Scaling must ensure
-    # trailing activates — never push trail_activate above 1.5% (base × scale).
-    "bull":     {"sl": 1.4,  "trail": 1.3,  "time": 1.5},   # wider stops, longer rides
-    "sideways": {"sl": 1.0,  "trail": 1.0,  "time": 1.0},   # default: SL=-3.5%, trail=1%/1%, time=2h
-    "bear":     {"sl": 0.7,  "trail": 0.8,  "time": 0.75},  # SL=-2.45%, trail=0.8%/0.8%, time=1.5h
-    "choppy":   {"sl": 0.65, "trail": 0.7,  "time": 0.75},  # SL=-2.28%, trail=0.7%/0.7%, time=1.5h
+    # v5.0 Wave Rider: SL is FLAT at 1.0× across all regimes.
+    # Data: choppy SL×0.65 = -2.28% was too tight for 7x leverage (0.33% noise triggers it).
+    # The stop-loss is a hard floor, not a knob to turn. Trail and time still scale.
+    "bull":     {"sl": 1.0,  "trail": 1.2,  "time": 1.5},   # wider trail/time, SL flat
+    "sideways": {"sl": 1.0,  "trail": 1.0,  "time": 1.0},   # default: SL=-3.5%, trail=1.2%/1%, time=3h
+    "bear":     {"sl": 1.0,  "trail": 0.9,  "time": 0.75},  # SL=-3.5% flat, tighter trail, shorter time
+    "choppy":   {"sl": 1.0,  "trail": 0.85, "time": 0.75},  # SL=-3.5% flat, trail=1.02%/0.85%, time=2.25h
 }
 
 # ── Per-regime capital deployment limits ───────────────────────────────────────
@@ -50,15 +50,14 @@ REGIME_SCALE = {
 # trend-fighting — no need for a blanket capital lockdown.
 # Bull/sideways → full throttle with good TA confirmation.
 REGIME_CAPITAL = {
-    # max_single_pct: per-position margin as % of equity (dynamic, replaces static .env cap)
-    # Bull: aggressive — 18% per position × 8 slots = up to 144% margin (leveraged)
-    "bull":     {"max_exposure_pct": 0.90, "size_mult": 1.00, "max_single_pct": 0.18},
-    # Sideways: base — 13% per position × 6 slots = up to 78% margin
-    "sideways": {"max_exposure_pct": 0.78, "size_mult": 0.85, "max_single_pct": 0.13},
-    # Bear: cautious — 10% per position × 4 slots = up to 40% margin
-    "bear":     {"max_exposure_pct": 0.55, "size_mult": 0.65, "max_single_pct": 0.10},
-    # Choppy: minimal — 8% per position × 3 slots = up to 24% margin
-    "choppy":   {"max_exposure_pct": 0.42, "size_mult": 0.55, "max_single_pct": 0.08},
+    # v5.0 Wave Rider: restored healthy sizing. Old choppy 0.55×0.80=0.44× created
+    # a death spiral where wins shrank to $5-20 and couldn't offset losses.
+    # The BTC trend master switch now controls ENTRY gating, not position sizing.
+    # When we trade, we trade with MEANINGFUL size. When we don't, we're in cash.
+    "bull":     {"max_exposure_pct": 0.90, "size_mult": 1.00, "max_single_pct": 0.15},
+    "sideways": {"max_exposure_pct": 0.80, "size_mult": 0.90, "max_single_pct": 0.13},
+    "bear":     {"max_exposure_pct": 0.65, "size_mult": 0.80, "max_single_pct": 0.12},
+    "choppy":   {"max_exposure_pct": 0.60, "size_mult": 0.75, "max_single_pct": 0.10},
 }
 
 # ── Per-regime setup allowlist ─────────────────────────────────────────────────
@@ -90,22 +89,23 @@ CHOPPY_MIN_TA_SCORE = 50.0
 
 # ── Per-regime max concurrent positions ───────────────────────────────────────
 REGIME_MAX_POSITIONS = {
-    "bull":     12,
-    "sideways": 8,
-    # BEAR/CHOPPY: fewer, higher-conviction entries only
+    "bull":     8,
+    "sideways": 6,
+    # v5.0: BTC trend master switch blocks entries when BTC is weak.
+    # When we DO trade in bear/choppy, allow enough slots for diversification.
     "bear":     5,
-    "choppy":   4,
+    "choppy":   5,
 }
 
 # ── Volatile mode overlay ──────────────────────────────────────────────────────
-# When mode=volatile, reduce SIZE aggressively but keep position slots open.
-# Volatile markets are OPPORTUNITIES (big swings to catch), but each bet
-# should be smaller until win rate recovers.
-# sideways+volatile: 5 max positions, 0.85 × 0.80 = 0.68× size
+# v5.0 Wave Rider: DISABLED stacking. Old volatile overlay (0.80×) stacked on
+# top of regime scaling (0.55×) = 0.44× total, creating a position size death
+# spiral. The BTC trend master switch now handles risk by blocking entries
+# entirely when BTC is weak — no need to also shrink positions.
 VOLATILE_MODE_OVERLAY = {
-    "max_positions_mult": 1.0,    # keep all slots open — size_mult handles risk
-    "size_mult":          0.80,   # reduce position size by 20%
-    "exposure_mult":      0.80,   # reduce max exposure by 20%
+    "max_positions_mult": 1.0,    # no reduction
+    "size_mult":          1.0,    # no reduction (was 0.80 — caused death spiral)
+    "exposure_mult":      1.0,    # no reduction (was 0.80)
 }
 
 # ── Per-regime Bayesian threshold override ────────────────────────────────────
@@ -345,49 +345,29 @@ class BigBrotherAgent:
 
     def _detect_regime(self, btc_ticker: Optional[dict], closed_trades: list[dict]) -> str:
         """
-        4-regime detector: bull | sideways | bear | choppy.
+        v5.0 Wave Rider regime detector — MARKET-ONLY signals.
 
-        Signals:
-          1. BTC 24h % change  (primary market direction)
-          2. Recent win rate over last 20 trades (breadth of the bot's edge)
-          3. Profit factor  (gross profit / gross loss — quality of wins)
-          4. ATR expansion proxy via win rate volatility + short avg hold time
-          5. Consecutive loss penalty
+        CRITICAL FIX: Old detector used bot's own win rate (8× weight) as primary
+        signal → self-reinforcing doom loop. Bot loses → WR drops → choppy → worse
+        params → more losses → WR drops more → stuck in choppy FOREVER.
 
-        Choppy regime is detected separately AFTER the bull/sideways/bear
-        classification: it overrides "sideways" when win rate is poor AND
-        closed trades suggest many short holds (whipsaws).
+        New design: regime is determined ONLY by BTC market data.
+          1. BTC 24h % change  (primary direction — weight 7×)
+          2. BTC range (tight range = choppy signal)
+          3. LLM macro overlay (optional leading indicator)
+
+        Bot performance (WR, PF) is deliberately EXCLUDED to break the feedback loop.
+        The BTC trend master switch in server.py handles entry gating separately.
         """
-        # ── Signal 1: BTC price change ───────────────────────────────────────
+        # ── Signal 1: BTC price change (THE primary signal) ───────────────────
         btc_change = 0.0
         if btc_ticker:
             btc_change = float(btc_ticker.get("percentage") or 0.0)
 
-        # ── Signal 2: Recent win rate & profit factor ─────────────────────────
-        recent = closed_trades[-20:] if len(closed_trades) >= 20 else closed_trades
-        if recent:
-            wins = [t for t in recent if t.get("pnl_usd", 0) > 0]
-            losses = [t for t in recent if t.get("pnl_usd", 0) <= 0]
-            recent_wr = len(wins) / len(recent)
-            gross_profit = sum(t.get("pnl_usd", 0) for t in wins)
-            gross_loss = abs(sum(t.get("pnl_usd", 0) for t in losses)) or 1.0
-            profit_factor = gross_profit / gross_loss
-        else:
-            recent_wr = 0.5
-            profit_factor = 1.0
-
-        # ── Signal 3: Consecutive loss penalty ──────────────────────────────
-        health = self.risk.check_portfolio_health(self.risk.peak_equity)
-        consec_losses = health.get("consecutive_losses", 0)
-        loss_penalty = min(consec_losses * 0.5, 3.0)
-
-        # ── Composite score: weighted bull/bear pressure (-10 → +10) ─────────
-        score = (
-            (btc_change / 3.0) * 4.0           # BTC: ±4 weight
-            + (recent_wr - 0.5) * 8.0          # Win rate: ±4 weight
-            + (profit_factor - 1.0) * 2.0      # Profit factor: ±2 weight
-            - loss_penalty                      # Consecutive loss drag
-        )
+        # ── Composite score: BTC-only (-10 → +10) ────────────────────────────
+        # BTC 24h change is the dominant signal. +3% = strong bull, -3% = bear.
+        # No bot WR, no profit factor, no consecutive loss penalty.
+        score = (btc_change / 2.5) * 5.0   # BTC: ±5 weight (scaled so ±2.5% → ±5)
 
         if score >= 2.5:
             primary = "bull"
@@ -397,14 +377,10 @@ class BigBrotherAgent:
             primary = "sideways"
 
         # ── LLM macro signal integration ────────────────────────────────────
-        # LLM reads current BTC/macro news and returns a -1 to +1 score.
-        # Adds ±1.5 to the composite score, acting as a leading indicator that
-        # can push regime classification before TA metrics catch up.
-        # Weight is 1.5 (modest: LLM overrides require TA confirmation too).
         if self._llm_macro_score != 0.0:
             score_with_llm = score + self._llm_macro_score * 1.5
             logger.debug(
-                f"[BigBrother] Regime score: TA={score:.2f} + LLM={self._llm_macro_score:+.2f}×1.5 "
+                f"[BigBrother] Regime score: BTC={score:.2f} + LLM={self._llm_macro_score:+.2f}×1.5 "
                 f"= {score_with_llm:.2f} ({self._llm_macro_label})"
             )
             if score_with_llm >= 2.5 and primary != "bull":
@@ -414,28 +390,15 @@ class BigBrotherAgent:
                 logger.info(f"[BigBrother] LLM macro downgraded regime: {primary} → bear")
                 primary = "bear"
 
-        # ── Choppy override ───────────────────────────────────────────────────
-        # Choppy = sideways market but with volatile/whipsaw behaviour.
-        # Indicators:
-        #   - Win rate below 42% despite not being "bear" (score > -2)
-        #   - Many very short holds (avg hold < 45 min) among recent losses
-        #   - BTC change is between -1.5% and +1.5% (tight range)
-        if primary in ("sideways", "bear"):
-            avg_hold_h = self._avg_hold_hours(recent)
-            choppy_signals = 0
-            if recent_wr < 0.42:
-                choppy_signals += 1
-            if avg_hold_h > 0 and avg_hold_h < 0.75:  # avg hold < 45 min = whipsaws
-                choppy_signals += 1
-            if -1.5 < btc_change < 1.5:
-                choppy_signals += 1
-
-            if choppy_signals >= 2:
-                logger.debug(
-                    f"[BigBrother] Choppy detected: wr={recent_wr:.0%} avg_hold={avg_hold_h:.1f}h "
-                    f"btc={btc_change:+.1f}%"
-                )
-                return "choppy"
+        # ── Choppy override — MARKET-ONLY signal ─────────────────────────────
+        # Choppy = BTC in tight range with no clear direction.
+        # Uses ONLY BTC price action, NOT bot win rate (which caused doom loop).
+        if primary == "sideways" and -1.2 < btc_change < 1.2:
+            # BTC in a very tight range → likely choppy/whipsaw market
+            logger.debug(
+                f"[BigBrother] Choppy detected: btc={btc_change:+.1f}% (tight range)"
+            )
+            return "choppy"
 
         return primary
 

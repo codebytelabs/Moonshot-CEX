@@ -770,13 +770,17 @@ async def _run_cycle():
     _choppy_min_ta = float(STATE.get("choppy_min_ta_score", 0.0))
     _current_regime = STATE.get("regime", "sideways")
 
-    # ── BTC Momentum Score — graduated alt sizing based on BTC strength ─────
-    # Alts correlate 0.6-0.95 with BTC (SUI 0.93, ADA 0.91, XLM 0.91).
-    # Instead of binary block/allow, BTC momentum continuously scales alt sizing:
-    #   score=0.0 (crash) → full block | 0.5 → half size | 1.0 → full size | 1.2 → bull bonus
-    # Short tokens (3S/5S/DOWN) are exempt — they profit from BTC falling.
+    # ── BTC Trend Master Switch (v5.0 Wave Rider) ──────────────────────────
+    # CORE STRATEGY: "Hop on the uptrend, make money, close when done, repeat."
+    # Binary decision: BTC trending up → trade aggressively. BTC NOT trending → CASH.
+    # This replaces the graduated sizing approach that bled -$1,795 in choppy markets.
+    # Existing positions keep riding their trailing stops regardless of this switch.
+    #
+    # ON (score >= 0.45): Full entries allowed, normal sizing
+    # OFF (score < 0.45): ZERO new long entries. Shorts still allowed (profit from weakness).
     _btc_momentum = {"score": 0.7, "bullish": True}  # default: moderate
-    _btc_size_mult = 0.7
+    _btc_size_mult = 1.0  # v5.0: no graduated sizing — binary ON/OFF
+    _btc_trend_on = True   # master switch
     if not _skip_entries:
         try:
             _btc_momentum = await _watcher.btc_momentum_score()
@@ -784,7 +788,17 @@ async def _run_cycle():
             STATE["btc_momentum_score"] = _btc_momentum["score"]
         except Exception as _btc_err:
             logger.warning(f"[Cycle {cycle}] BTC momentum check failed: {_btc_err}")
-        _btc_size_mult = min(max(_btc_momentum["score"], 0.0), 1.2)  # sizing multiplier
+
+        _btc_trend_on = _btc_momentum["score"] >= 0.45
+        STATE["btc_trend_master_switch"] = _btc_trend_on
+
+        if not _btc_trend_on:
+            logger.info(
+                f"[Cycle {cycle}] 🔴 BTC TREND SWITCH OFF — score={_btc_momentum['score']:.2f} < 0.45. "
+                f"Blocking new long entries. Existing positions ride trailing stops."
+            )
+        # When switch is ON, no size scaling — trade with full conviction
+        # When switch is OFF, longs blocked entirely (handled per-setup below)
 
     for _slot_rank, setup in enumerate(approved if not _skip_entries else [], 1):
         symbol = setup["symbol"]
@@ -855,6 +869,14 @@ async def _run_cycle():
             # Cash guard: don't exceed available margin × leverage
             if _uses_exchange_account_state():
                 size_usd = min(size_usd, available_cash_usd * 0.92 * _trade_leverage)
+            # v5.0 Wave Rider: minimum margin floor — positions below $150 margin
+            # produce wins too small to offset losses ($5-20 wins vs $30-40 losses).
+            # Data: money-printing period had $467 avg margin; bleeding period $65-88.
+            _margin_usd = size_usd / _trade_leverage
+            _MIN_MARGIN_FLOOR = 150.0
+            if _margin_usd < _MIN_MARGIN_FLOOR:
+                size_usd = _MIN_MARGIN_FLOOR * _trade_leverage
+                logger.info(f"[Sizing] {symbol} margin floor applied: ${_margin_usd:.0f} → ${_MIN_MARGIN_FLOOR:.0f}")
             logger.info(
                 f"[Sizing] {symbol} FINAL notional=${size_usd:.0f} margin=${size_usd/_trade_leverage:.0f} "
                 f"(lev={_trade_leverage}x cap={_regime_max_single_pct:.0%} regime={_current_regime})"
@@ -914,52 +936,32 @@ async def _run_cycle():
                 trace["steps"].append(f"skip_held:{symbol}")
             continue
 
-        # BTC momentum gate — graduated alt sizing based on BTC strength.
-        # score=0.0 → full block (crash), 0.3 → 30% size, 1.0 → full, 1.2 → bull bonus.
-        # Strategy-originated signals bypass this gate — they have built-in trend filters.
-        # Short tokens (3S/5S/DOWN) are exempt — they profit from BTC falling.
+        # ── BTC Trend Master Switch Gate (v5.0 Wave Rider) ──────────────────
+        # Binary: BTC trending → trade at full size. BTC NOT trending → block longs.
+        # Replaces graduated sizing that bled -$1,795 in choppy markets.
+        # Short tokens and strategy signals are exempt (they have their own filters).
         _direction = setup.get("direction", "long")
         _is_strategy_signal = bool(setup.get("strategy", ""))
         if _direction == "long" and not _is_strategy_signal:
             _base = symbol.replace("/USDT", "").replace(":USDT", "")
             _is_short_token = any(_base.endswith(sfx) for sfx in ("3S", "5S", "DOWN"))
-            if not _is_short_token:
-                if _btc_size_mult <= 0.05:
-                    # Crash floor: BTC in freefall → full block
-                    trace["steps"].append(f"skip_btc_crash:{symbol}")
-                    logger.info(f"[Swarm] {symbol} skipped: BTC crash (momentum={_btc_momentum['score']:.2f})")
-                    continue
-                elif _btc_size_mult < 1.0:
-                    # Graduated: reduce size proportionally to BTC weakness
-                    size_usd *= _btc_size_mult
-                    logger.info(
-                        f"[Sizing] {symbol} BTC momentum scaling: ×{_btc_size_mult:.2f} → ${size_usd:.0f} "
-                        f"(BTC score={_btc_momentum['score']:.2f})"
-                    )
-                elif _btc_size_mult > 1.0:
-                    # Bull bonus: BTC strongly bullish → slight size boost for alt longs
-                    size_usd *= _btc_size_mult
-                    logger.info(
-                        f"[Sizing] {symbol} BTC bull bonus: ×{_btc_size_mult:.2f} → ${size_usd:.0f} "
-                        f"(BTC score={_btc_momentum['score']:.2f})"
-                    )
-        elif _direction == "short" and not _is_strategy_signal:
-            # FUTURES SHORT: invert BTC momentum — BTC weakness HELPS shorts.
-            # BTC crash (score=0.0) → full size (best time to short alts)
-            # BTC strong (score=1.0) → reduce short size (risky to short in bull)
-            _btc_short_mult = min(1.2, max(0.3, 1.3 - _btc_size_mult))
-            if _btc_size_mult >= 1.0:
-                # BTC very bullish → reduce short sizing significantly
-                size_usd *= _btc_short_mult
+            if not _is_short_token and not _btc_trend_on:
+                # Master switch OFF → block ALL new long entries
+                trace["steps"].append(f"skip_btc_trend_off:{symbol}")
                 logger.info(
-                    f"[Sizing] {symbol} SHORT BTC-bull penalty: ×{_btc_short_mult:.2f} → ${size_usd:.0f} "
-                    f"(BTC score={_btc_momentum['score']:.2f})"
+                    f"[Swarm] {symbol} BLOCKED: BTC trend switch OFF "
+                    f"(score={_btc_momentum['score']:.2f} < 0.45). Waiting for uptrend."
                 )
-            elif _btc_size_mult <= 0.3:
-                # BTC crashing → shorts get a boost
-                size_usd *= _btc_short_mult
+                continue
+            # When switch is ON → full size, no scaling (trade with conviction)
+        elif _direction == "short" and not _is_strategy_signal:
+            # FUTURES SHORT: allowed even when BTC trend is OFF (shorts profit from weakness).
+            # When BTC is strongly bullish, reduce short size slightly.
+            if _btc_momentum["score"] >= 0.8:
+                _btc_short_penalty = 0.6
+                size_usd *= _btc_short_penalty
                 logger.info(
-                    f"[Sizing] {symbol} SHORT BTC-crash bonus: ×{_btc_short_mult:.2f} → ${size_usd:.0f} "
+                    f"[Sizing] {symbol} SHORT BTC-bull penalty: ×{_btc_short_penalty:.2f} → ${size_usd:.0f} "
                     f"(BTC score={_btc_momentum['score']:.2f})"
                 )
 
