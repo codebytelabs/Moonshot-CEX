@@ -85,9 +85,22 @@ class BayesianDecisionEngine:
         catalyst_count = len(context.get("catalysts", []))
         risk_count = len(context.get("risks", []))
 
-        if sentiment == "bullish":
+        # Direction-aware sentiment: for shorts, bearish = good, bullish = bad.
+        # Without this flip, ALL shorts get penalized (ctx_base=0.30) because the
+        # context agent correctly identifies dumping tokens as "bearish", but the
+        # old code treated bearish as universally negative.
+        direction = setup.get("direction", "long")
+        _effective_sentiment = sentiment
+        if direction == "short":
+            # Flip: bearish context is BULLISH for shorts, bullish is BEARISH for shorts
+            if sentiment == "bearish":
+                _effective_sentiment = "bullish"
+            elif sentiment == "bullish":
+                _effective_sentiment = "bearish"
+
+        if _effective_sentiment == "bullish":
             ctx_base = 0.6 + ctx_confidence * 0.3
-        elif sentiment == "bearish":
+        elif _effective_sentiment == "bearish":
             ctx_base = 0.3 - ctx_confidence * 0.2
         else:
             # When context agent is disabled (neutral + no catalysts + no risks),
