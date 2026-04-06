@@ -623,7 +623,11 @@ async def _run_cycle():
     else:
         _consecutive_zero_setups += 1
 
-    # Merge: deduplicate by symbol — strategy signals take priority over legacy
+    # Merge: deduplicate by symbol — strategy signals take priority over legacy.
+    # Legacy cap: momentum pipeline has 27% win rate over 100 trades; limit it to
+    # _MAX_LEGACY_SLOTS so the 3 new strategies (scalper, mean_reversion, breakout)
+    # get the majority of entry opportunities.
+    _MAX_LEGACY_SLOTS = 2
     seen_symbols = set()
     approved = []
     for setup in strategy_setups:
@@ -631,11 +635,20 @@ async def _run_cycle():
         if sym not in seen_symbols:
             seen_symbols.add(sym)
             approved.append(setup)
+    _legacy_added = 0
     for setup in legacy_approved:
+        if _legacy_added >= _MAX_LEGACY_SLOTS:
+            break
         sym = setup.get("symbol", "")
         if sym not in seen_symbols:
             seen_symbols.add(sym)
             approved.append(setup)
+            _legacy_added += 1
+    if len(legacy_approved) > _legacy_added:
+        logger.info(
+            f"[Cycle {cycle}] Legacy cap: {_legacy_added}/{len(legacy_approved)} "
+            f"legacy signals admitted (max={_MAX_LEGACY_SLOTS})"
+        )
 
     # ── Unified quality ranking — best opportunities fill limited slots first ──
     # Composite rank = posterior (Bayesian confidence) × ta_score (TA quality).
