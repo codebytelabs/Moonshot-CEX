@@ -843,6 +843,7 @@ async def _run_cycle():
     _btc_momentum = {"score": 0.7, "bullish": True}  # default: moderate
     _btc_size_mult = 1.0  # v5.0: no graduated sizing — binary ON/OFF
     _btc_trend_on = True   # master switch
+    _btc_threshold = 0.45  # default; overridden below per regime
     if not _skip_entries:
         try:
             _btc_momentum = await _watcher.btc_momentum_score()
@@ -851,13 +852,18 @@ async def _run_cycle():
         except Exception as _btc_err:
             logger.warning(f"[Cycle {cycle}] BTC momentum check failed: {_btc_err}")
 
-        _btc_trend_on = _btc_momentum["score"] >= 0.40
+        # v6.0 OVERHAUL: regime-aware BTC trend threshold
+        # Bear/choppy: require BTC score >= 0.55 (real momentum, not dead cat bounce)
+        # Bull/sideways: standard 0.45 threshold
+        _current_regime_for_btc = STATE.get("regime", "sideways")
+        _btc_threshold = 0.55 if _current_regime_for_btc in ("bear", "choppy") else 0.45
+        _btc_trend_on = _btc_momentum["score"] >= _btc_threshold
         STATE["btc_trend_master_switch"] = _btc_trend_on
 
         if not _btc_trend_on:
             logger.info(
-                f"[Cycle {cycle}] 🔴 BTC TREND SWITCH OFF — score={_btc_momentum['score']:.2f} < 0.40. "
-                f"Blocking new long entries. Existing positions ride trailing stops."
+                f"[Cycle {cycle}] 🔴 BTC TREND SWITCH OFF — score={_btc_momentum['score']:.2f} < {_btc_threshold:.2f} "
+                f"(regime={_current_regime_for_btc}). Blocking new long entries."
             )
         # When switch is ON, no size scaling — trade with full conviction
         # When switch is OFF, longs blocked entirely (handled per-setup below)
@@ -1012,7 +1018,7 @@ async def _run_cycle():
                 trace["steps"].append(f"skip_btc_trend_off:{symbol}")
                 logger.info(
                     f"[Swarm] {symbol} BLOCKED: BTC trend switch OFF "
-                    f"(score={_btc_momentum['score']:.2f} < 0.40). Waiting for uptrend."
+                    f"(score={_btc_momentum['score']:.2f} < {_btc_threshold:.2f}). Waiting for uptrend."
                 )
                 continue
             # When switch is ON → full size, no scaling (trade with conviction)
