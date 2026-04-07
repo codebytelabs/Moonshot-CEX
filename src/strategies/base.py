@@ -41,6 +41,10 @@ class StrategySignal:
     reason: str = ""                  # why this signal was generated
     features: dict = field(default_factory=dict)  # ML / context features
     timestamp: float = field(default_factory=time.time)
+    # Strategy-specific exit parameters (override global defaults in position_manager)
+    trail_activate_pct: float = 0.0    # 0 = use global default
+    trail_distance_pct: float = 0.0    # 0 = use global default
+    max_hold_minutes: float = 0.0      # 0 = use global default
 
     @property
     def risk_reward(self) -> float:
@@ -80,6 +84,14 @@ class StrategySignal:
                 "posterior": self.confidence,
                 "threshold": 0.45,
                 "r_multiple": self.risk_reward,
+            },
+            "strategy_exit_params": {
+                "stop_loss_pct": self.stop_loss_pct,
+                "trail_activate_pct": self.trail_activate_pct,
+                "trail_distance_pct": self.trail_distance_pct,
+                "max_hold_minutes": self.max_hold_minutes,
+                "tp1_pct": self.tp1_pct,
+                "tp2_pct": self.tp2_pct,
             },
         }
 

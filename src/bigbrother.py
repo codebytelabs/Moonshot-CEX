@@ -89,12 +89,12 @@ CHOPPY_MIN_TA_SCORE = 50.0
 
 # ── Per-regime max concurrent positions ───────────────────────────────────────
 REGIME_MAX_POSITIONS = {
-    "bull":     8,
-    "sideways": 6,
-    # v5.0: BTC trend master switch blocks entries when BTC is weak.
-    # When we DO trade in bear/choppy, allow enough slots for diversification.
-    "bear":     5,
-    "choppy":   5,
+    # v6.0 OVERHAUL: max 4 positions across all regimes. Fewer, higher-quality trades.
+    # Data: over-diversification with 6-8 slots = weak conviction per position.
+    "bull":     4,
+    "sideways": 4,
+    "bear":     3,
+    "choppy":   2,
 }
 
 # ── Volatile mode overlay ──────────────────────────────────────────────────────

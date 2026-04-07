@@ -166,12 +166,12 @@ class RiskManager:
         if exposure_pct >= eff_max_exposure:
             return False, f"max_exposure reached ({exposure_pct:.1%} >= {eff_max_exposure:.1%})"
 
-        # Hard halt only at extreme drawdown — DRAWDOWN_SCALE handles sizing reduction.
-        # Drawdown recovery: if halted for 100+ consecutive cycles (~50 min), the peak
-        # is likely stale/inflated (e.g. from spot wallet bleed-through). Reset peak to
-        # current equity so the bot can trade again. Real drawdowns recover via smaller
-        # sizing (DRAWDOWN_SCALE), not permanent lockout.
-        _DRAWDOWN_RECOVERY_CYCLES = 100
+        # Drawdown recovery: if halted for N consecutive cycles, the peak is
+        # likely stale/inflated (unrealized PnL pumped it up, then positions
+        # closed at a loss). Reset peak to current equity so bot trades again.
+        # Real drawdowns are handled by DRAWDOWN_SCALE (smaller sizing), not
+        # permanent lockout.
+        _DRAWDOWN_RECOVERY_CYCLES = 30  # ~15 min at 30s/cycle (was 100 = ~50 min)
         drawdown = self._compute_drawdown(current_equity)
         if drawdown >= 0.30:
             self._drawdown_halt_cycles += 1
@@ -186,6 +186,21 @@ class RiskManager:
                 drawdown = 0.0  # allow this cycle through
             else:
                 return False, f"drawdown_halt ({drawdown:.1%} > 30%) [{self._drawdown_halt_cycles}/{_DRAWDOWN_RECOVERY_CYCLES} cycles]"
+        elif drawdown >= self.max_drawdown_pct:
+            # Soft drawdown halt: same recovery mechanism but with shorter window.
+            # Peak equity often inflated by unrealized gains that evaporated.
+            self._drawdown_halt_cycles += 1
+            if self._drawdown_halt_cycles >= _DRAWDOWN_RECOVERY_CYCLES:
+                old_peak = self.peak_equity
+                self.peak_equity = current_equity
+                self._drawdown_halt_cycles = 0
+                logger.warning(
+                    f"[Risk] Soft drawdown recovery: peak reset ${old_peak:,.2f} → ${current_equity:,.2f} "
+                    f"after {_DRAWDOWN_RECOVERY_CYCLES} halted cycles (was {drawdown:.1%} drawdown)"
+                )
+                drawdown = 0.0
+            else:
+                return False, f"max_drawdown hit ({drawdown:.1%}) [{self._drawdown_halt_cycles}/{_DRAWDOWN_RECOVERY_CYCLES} cycles]"
         else:
             self._drawdown_halt_cycles = 0  # reset counter when not halted
 
@@ -200,9 +215,6 @@ class RiskManager:
 
         if self._day_trade_count >= self.max_daily_trades:
             return False, f"max_daily_trades reached ({self._day_trade_count}/{self.max_daily_trades})"
-
-        if drawdown >= self.max_drawdown_pct:
-            return False, f"max_drawdown hit ({drawdown:.1%})"
 
         return True, "ok"
 

@@ -154,11 +154,15 @@ class LeverageEngine:
         return leverage
 
     def adjust_for_account_tier(self, leverage: int, equity: float) -> int:
-        """Reduce max leverage for smaller accounts (more vulnerable to liquidation)."""
+        """Reduce max leverage for smaller accounts (more vulnerable to liquidation).
+
+        v6.0 OVERHAUL: hard cap at 5x regardless of account size.
+        Trade data showed high leverage (7-10x) amplified losses without
+        improving win rate — smaller moves trigger stops on leveraged positions.
+        """
+        _HARD_CAP = 5
         if equity < 500:
-            return min(leverage, 3)
+            return min(leverage, 3, _HARD_CAP)
         elif equity < 2000:
-            return min(leverage, 5)
-        elif equity < 10000:
-            return min(leverage, 8)
-        return leverage
+            return min(leverage, 5, _HARD_CAP)
+        return min(leverage, _HARD_CAP)

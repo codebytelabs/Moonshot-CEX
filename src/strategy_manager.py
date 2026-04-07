@@ -54,6 +54,13 @@ class StrategyManager:
         self._strategies["breakout"] = BreakoutORB(self.exchange, breakout_cfg)
         self._strategies["mean_reversion"] = MeanReversionStrategy(self.exchange, mean_rev_cfg)
 
+        # ── v6.0 OVERHAUL: disable underperforming strategies ───────────
+        # Trade data analysis: scalper 0% WR, mean_reversion 0% WR.
+        # Only breakout strategy produces viable signals. Keep scalper/mean_rev
+        # instantiated but disabled so they can be re-enabled without code changes.
+        self._strategies["scalper"]._enabled = False
+        self._strategies["mean_reversion"]._enabled = False
+
         enabled = [name for name, s in self._strategies.items() if s.enabled]
         logger.info(f"[StrategyManager] Initialized {len(enabled)} strategies: {enabled}")
 

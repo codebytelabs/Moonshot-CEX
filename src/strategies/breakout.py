@@ -282,6 +282,9 @@ class BreakoutORB(BaseStrategy):
             timeframe="15m",
             setup_type="breakout_orb",
             reason=" | ".join(reasons),
+            trail_activate_pct=self.config["trail_activate_pct"],
+            trail_distance_pct=self.config["trail_distance_pct"],
+            max_hold_minutes=self.config["max_hold_minutes_loser"],
         )
 
     async def _analyze_breakdown(self, symbol: str, vol_usd: float, last_price: float) -> Optional[StrategySignal]:
@@ -411,6 +414,9 @@ class BreakoutORB(BaseStrategy):
             timeframe="15m",
             setup_type="breakdown_orb",
             reason=" | ".join(reasons),
+            trail_activate_pct=self.config["trail_activate_pct"],
+            trail_distance_pct=self.config["trail_distance_pct"],
+            max_hold_minutes=self.config["max_hold_minutes_loser"],
         )
 
     def check_exit(self, position: dict, current_price: float, regime: str = "sideways") -> Optional[str]:

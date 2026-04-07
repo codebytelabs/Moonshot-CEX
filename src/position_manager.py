@@ -70,6 +70,10 @@ class Position:
         # Protects position even when bot is down
         self.exchange_sl_order_id: Optional[str] = None
 
+        # Strategy-specific exit params (override global defaults when present)
+        # Keys: stop_loss_pct, trail_activate_pct, trail_distance_pct, max_hold_minutes
+        self.strategy_exit_params: dict = {}
+
     def _compute_liquidation_price(self) -> float:
         """Estimate liquidation price for isolated margin futures position."""
         if self.leverage <= 1:
@@ -139,6 +143,7 @@ class Position:
             "margin_usd": round(getattr(self, "margin_usd", self.amount_usd), 4),
             "liquidation_price": round(getattr(self, "liquidation_price", 0.0), 6),
             "exchange_sl_order_id": getattr(self, "exchange_sl_order_id", None),
+            "strategy_exit_params": getattr(self, "strategy_exit_params", {}),
         }
 
 
@@ -338,6 +343,7 @@ class PositionManager:
             # Dynamic TP trailing: restore initial distances
             pos._initial_tp1_dist = abs(pos.take_profit_1 - pos.entry_price)
             pos._initial_tp2_dist = abs(pos.take_profit_2 - pos.entry_price)
+            pos.strategy_exit_params = doc.get("strategy_exit_params", {})
             return pos
         except Exception as e:
             logger.warning(f"[PM] restore_position_from_dict failed: {e} | doc={doc.get('symbol', '?')}")
@@ -428,6 +434,16 @@ class PositionManager:
             side=direction,
             leverage=actual_leverage,
         )
+        # Propagate strategy-specific exit params so _tick_position uses them
+        _strat_exit = setup.get("strategy_exit_params", {})
+        if _strat_exit:
+            pos.strategy_exit_params = _strat_exit
+            logger.info(
+                f"[PM] {symbol} strategy exit params: "
+                f"sl={_strat_exit.get('stop_loss_pct')}% "
+                f"trail={_strat_exit.get('trail_activate_pct')}/{_strat_exit.get('trail_distance_pct')}% "
+                f"max_hold={_strat_exit.get('max_hold_minutes')}min"
+            )
         self._positions[pos.id] = pos
         self._record_entry(symbol)
         active_positions.set(len(self._positions))
@@ -669,6 +685,26 @@ class PositionManager:
         trail_activate = regime_params.get("trailing_activate_pct", self.trailing_activate_pct) if regime_params else self.trailing_activate_pct
         trail_dist = regime_params.get("trailing_distance_pct", self.trailing_distance_pct) if regime_params else self.trailing_distance_pct
         effective_time_exit_hours = regime_params.get("time_exit_hours", self.time_exit_hours) if regime_params else self.time_exit_hours
+
+        # Strategy-specific exit params override global/regime defaults.
+        # Strategies define tight, fast exits (scalper: SL -0.5%, 15min hold;
+        # mean_reversion: SL -1.2%, 60min hold) but position_manager was using
+        # global SL -3.5% and 2h hold for everything — causing strategy positions
+        # to bleed 3-6x more than intended before exiting.
+        _sep = getattr(pos, "strategy_exit_params", {})
+        if _sep:
+            _s_sl = float(_sep.get("stop_loss_pct", 0))
+            if _s_sl < 0:
+                sl_pct = _s_sl  # e.g., -1.2 for mean_reversion
+            _s_trail_act = float(_sep.get("trail_activate_pct", 0))
+            if _s_trail_act > 0:
+                trail_activate = _s_trail_act
+            _s_trail_dist = float(_sep.get("trail_distance_pct", 0))
+            if _s_trail_dist > 0:
+                trail_dist = _s_trail_dist
+            _s_hold_min = float(_sep.get("max_hold_minutes", 0))
+            if _s_hold_min > 0:
+                effective_time_exit_hours = _s_hold_min / 60.0
 
         pnl_pct = pos.current_pnl_pct(current_price)
         r_multiple = pos.current_r_multiple(current_price)
@@ -1004,9 +1040,14 @@ class PositionManager:
 
     @property
     def has_failed_exits(self) -> bool:
-        """True if any open position has accumulated exit failures."""
+        """True if any open position has 2+ consecutive exit failures.
+        
+        Was > 0 (one failure blocked ALL entries). Changed to >= 2 so the bot
+        gets one retry cycle before locking out new entries. Ghost-close kicks
+        in at 3 failures anyway, so the block window is at most 1-2 cycles.
+        """
         return any(
-            self._exit_failure_count.get(pos.id, 0) > 0
+            self._exit_failure_count.get(pos.id, 0) >= 2
             for pos in self._positions.values()
             if pos.status == "open"
         )

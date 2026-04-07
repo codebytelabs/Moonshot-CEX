@@ -110,29 +110,19 @@ class AnalyzerAgent:
         sr_tf = tf_data.get("1h", tf_data.get("15m", data_5m))
         support, resistance = _compute_support_resistance(sr_tf[:, 2], sr_tf[:, 3], sr_tf[:, 4])
 
-        # ── 4h EMA50 trend gate (loose): only block deeply falling tokens ──────
-        # 10% tolerance — only rejects tokens crashing hard in a 4h downtrend.
-        # Individual momentum breakouts trade fine even when below 4h EMA50.
+        # ── v6.0 OVERHAUL: 4H EMA99 trend filter ──────────────────────────
+        # Only go long when price is above 4H EMA99 (or within 2% tolerance).
+        # EMA99 captures the macro trend — trading against it is the #1 loss source.
+        # 2% tolerance allows early entries on tokens just breaking above the trend.
         direction = candidate.get("direction", "long")
         if direction == "long" and "4h" in tf_data:
             closes_4h = tf_data["4h"][:, 4]
-            if len(closes_4h) >= 50:
-                ema50_4h = _ema(closes_4h, 50)
-                if closes_4h[-1] < ema50_4h * 0.90:
-                    logger.debug(
-                        f"[Analyzer] {symbol} filtered: price {closes_4h[-1]:.6f} "
-                        f"< EMA50 {ema50_4h:.6f} * 0.90 (deeply below trend)"
-                    )
-                    return None
-        # ── SHORT: 4h EMA50 trend gate — block shorting tokens in strong uptrends ──
-        elif direction == "short" and "4h" in tf_data:
-            closes_4h = tf_data["4h"][:, 4]
-            if len(closes_4h) >= 50:
-                ema50_4h = _ema(closes_4h, 50)
-                if closes_4h[-1] > ema50_4h * 1.10:
-                    logger.debug(
-                        f"[Analyzer] {symbol} SHORT filtered: price {closes_4h[-1]:.6f} "
-                        f"> EMA50 {ema50_4h:.6f} * 1.10 (deeply above trend — uptrend)"
+            if len(closes_4h) >= 99:
+                ema99_4h = _ema(closes_4h, 99)
+                if closes_4h[-1] < ema99_4h * 0.98:
+                    logger.info(
+                        f"[Analyzer] {symbol} BLOCKED: price {closes_4h[-1]:.6f} "
+                        f"< 4H EMA99 {ema99_4h:.6f} * 0.98 (below macro trend)"
                     )
                     return None
 
@@ -415,9 +405,12 @@ class AnalyzerAgent:
         # as momentum. Position sizing (kelly × ta_score) auto-scales weak signals smaller.
         if setup_type == "neutral":
             setup_type = "momentum"
-        # Override for short direction
+        # ── v6.0 OVERHAUL: block short direction entirely ────────────────
+        # Trade data: momentum_short had negative expectancy across all regimes.
+        # Focus exclusively on long momentum setups.
         if direction == "short":
-            setup_type = "momentum_short"
+            logger.debug(f"[Analyzer] {symbol} BLOCKED: short direction disabled (v6.0 overhaul)")
+            return None
 
         # Entry zone
         entry_zone = self._compute_entry_zone(price, atr, support, resistance, setup_type)
@@ -538,9 +531,9 @@ class AnalyzerAgent:
         elif score_4h >= 45 and rsi < 48:
             return "pullback"
 
-        # MEAN REVERSION: oversold + tight range
-        elif rsi < 35 and bb_width < 0.04:
-            return "mean_reversion"
+        # MEAN REVERSION: disabled in v6.0 overhaul (0% win rate in trade data)
+        # elif rsi < 35 and bb_width < 0.04:
+        #     return "mean_reversion"
 
         # CONSOLIDATION BREAKOUT: volume surge out of tight range
         elif bb_width < 0.035 and vol_spike >= 1.8:

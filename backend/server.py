@@ -31,7 +31,7 @@ from src.analyzer import AnalyzerAgent
 from src.context_agent import ContextAgent
 from src.bayesian_engine import BayesianDecisionEngine
 from src.execution_core import ExecutionCore, FuturesExecutionCore
-from src.position_manager import PositionManager
+from src.position_manager import PositionManager, Position
 from src.risk_manager import RiskManager
 from src.quant_mutator import QuantMutator
 from src.bigbrother import BigBrotherAgent
@@ -102,6 +102,45 @@ _leverage_engine: Optional[LeverageEngine] = None
 # orphan sweep. Used as a safety net to prevent duplicate opens when crash recovery
 # misses a position (the BTR 3× bug: transient API → bot lost track → re-entered).
 _exchange_open_symbols: set[str] = set()
+
+# ── v6.0 OVERHAUL: dynamic symbol blacklist ──────────────────────────────────
+# Symbols with 0% win rate across 3+ closed trades are blacklisted.
+# Refreshed at startup and every 50 swarm cycles from MongoDB trade history.
+_symbol_blacklist: set[str] = set()
+_blacklist_refresh_cycle: int = 0
+_BLACKLIST_REFRESH_INTERVAL = 50  # refresh every 50 cycles (~25 min)
+_BLACKLIST_MIN_TRADES = 3  # need at least 3 trades to blacklist
+
+
+async def _refresh_symbol_blacklist():
+    """Scan closed trades in MongoDB and blacklist symbols with 0% win rate (3+ trades)."""
+    global _symbol_blacklist
+    if _db is None:
+        return
+    try:
+        pipeline = [
+            {"$match": {"status": "closed"}},
+            {"$group": {
+                "_id": "$symbol",
+                "total": {"$sum": 1},
+                "wins": {"$sum": {"$cond": [{"$gt": ["$pnl_usd", 0]}, 1, 0]}},
+            }},
+            {"$match": {"total": {"$gte": _BLACKLIST_MIN_TRADES}, "wins": 0}},
+        ]
+        cursor = _db.trades.aggregate(pipeline)
+        bad_symbols = set()
+        async for doc in cursor:
+            sym = doc["_id"]
+            if sym:
+                bad_symbols.add(sym)
+        if bad_symbols != _symbol_blacklist:
+            logger.info(
+                f"[Blacklist] Updated: {len(bad_symbols)} symbols with 0% WR "
+                f"({', '.join(sorted(bad_symbols)[:10])}{'...' if len(bad_symbols) > 10 else ''})"
+            )
+        _symbol_blacklist = bad_symbols
+    except Exception as e:
+        logger.warning(f"[Blacklist] Refresh error: {e}")
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -377,6 +416,9 @@ async def _startup():
     # ── Crash Recovery: reload open positions from MongoDB ─────────────────
     await _recover_positions_from_db()
 
+    # ── v6.0: Load symbol blacklist from trade history ───────────────────
+    await _refresh_symbol_blacklist()
+
     # Auto-start swarm
     _swarm_task = asyncio.create_task(_swarm_loop())
     STATE["running"] = True
@@ -481,10 +523,17 @@ async def _swarm_loop():
 
 async def _run_cycle():
     global _min_score_live, _bayesian_threshold_live, _consecutive_zero_setups
+    global _blacklist_refresh_cycle
 
     STATE["cycle_count"] += 1
     cycle = STATE["cycle_count"]
     trace = {"cycle": cycle, "steps": []}
+
+    # v6.0: periodic blacklist refresh
+    _blacklist_refresh_cycle += 1
+    if _blacklist_refresh_cycle >= _BLACKLIST_REFRESH_INTERVAL:
+        _blacklist_refresh_cycle = 0
+        await _refresh_symbol_blacklist()
 
     # ── CIRCUIT BREAKER: emergency stop if day loss exceeds threshold ──
     # Uses actual equity vs day-start equity (captures unrealized losses too).
@@ -624,10 +673,10 @@ async def _run_cycle():
         _consecutive_zero_setups += 1
 
     # Merge: deduplicate by symbol — strategy signals take priority over legacy.
-    # Legacy cap: momentum pipeline has 27% win rate over 100 trades; limit it to
-    # _MAX_LEGACY_SLOTS so the 3 new strategies (scalper, mean_reversion, breakout)
-    # get the majority of entry opportunities.
-    _MAX_LEGACY_SLOTS = 2
+    # Legacy cap: when strategies produce signals, cap legacy to 2 slots so strategies
+    # get priority. But when strategy_signals=0 (common in choppy regime), allow up
+    # to 5 legacy signals so the bot doesn't sit completely idle.
+    _MAX_LEGACY_SLOTS = 2 if strategy_setups else 5
     seen_symbols = set()
     approved = []
     for setup in strategy_setups:
@@ -712,7 +761,7 @@ async def _run_cycle():
         # Funding gate: skip if extreme funding opposes our direction
         _dir = setup.get("direction", "long")
         abs_fr = abs(fr)
-        if abs_fr > 0.001:  # >0.1% per 8h is extreme
+        if abs_fr > 0.0015:  # >0.15% per 8h is extreme (was 0.1% — too tight, killed all entries)
             if (fr > 0 and _dir == "long") or (fr < 0 and _dir == "short"):
                 trace["steps"].append(f"skip_funding:{sym}:{_dir}:fr={fr:.6f}")
                 logger.info(
@@ -989,6 +1038,12 @@ async def _run_cycle():
         if _position_manager.is_symbol_churning(symbol):
             trace["steps"].append(f"skip_churn:{symbol}")
             logger.info(f"[Swarm] {symbol} skipped: churn guard (3+ entries in 4h)")
+            continue
+
+        # v6.0 OVERHAUL: symbol blacklist — block 0% WR repeat losers
+        if symbol in _symbol_blacklist:
+            trace["steps"].append(f"skip_blacklist:{symbol}")
+            logger.info(f"[Swarm] {symbol} BLACKLISTED: 0% win rate across {_BLACKLIST_MIN_TRADES}+ trades")
             continue
 
         # v3.1: Setup allowlist gate — regime restricts which setup types are allowed
@@ -1589,6 +1644,73 @@ async def _sweep_orphan_algo_orders_and_positions():
                         )
                     except Exception as ge:
                         logger.debug(f"[OrphanSweep] Ghost-close error for {pos.symbol}: {ge}")
+
+        # Step 4: Adopt untracked exchange positions into PM for SL/TP/trailing protection
+        # Without this, positions opened by the bot but lost during restart (or exchange-
+        # side SL fills that partially closed) sit on exchange with ZERO exit management.
+        if _position_manager:
+            tracked_symbols = {p.symbol for p in _position_manager._positions.values() if p.status == "open"}
+            for fpos in raw_positions:
+                contracts = abs(float(fpos.get("contracts", 0)))
+                if contracts <= 0:
+                    continue
+                symbol = fpos.get("symbol", "")
+                if symbol in tracked_symbols:
+                    continue  # already tracked
+                try:
+                    side = fpos.get("side", "long")
+                    entry_price = float(fpos.get("entryPrice", 0) or 0)
+                    if entry_price <= 0:
+                        continue
+                    mark_price = float(fpos.get("markPrice", 0) or fpos.get("lastPrice", 0) or entry_price)
+                    notional = abs(float(fpos.get("notional", 0) or (contracts * mark_price)))
+                    _raw_lev = int(float(fpos.get("leverage", 0) or 0))
+                    leverage = _raw_lev if _raw_lev > 1 else (cfg.futures_default_leverage or 7)
+
+                    # Compute SL/TP from global defaults
+                    sl_pct = abs(_position_manager.stop_loss_pct) / 100.0
+                    stop_loss = entry_price * (1 - sl_pct) if side == "long" else entry_price * (1 + sl_pct)
+                    tp1 = entry_price * (1 + 0.04) if side == "long" else entry_price * (1 - 0.04)
+                    tp2 = entry_price * (1 + 0.10) if side == "long" else entry_price * (1 - 0.10)
+
+                    adopted = Position(
+                        symbol=symbol,
+                        entry_price=entry_price,
+                        amount=contracts,
+                        amount_usd=notional,
+                        stop_loss=stop_loss,
+                        take_profit_1=tp1,
+                        take_profit_2=tp2,
+                        setup_type="synced_holding",
+                        decision={},
+                        entry_fill={},
+                        side=side,
+                        leverage=leverage,
+                    )
+                    # Update highest/lowest to current price so trailing can activate
+                    adopted.highest_price = max(entry_price, mark_price)
+                    adopted.lowest_price = min(entry_price, mark_price)
+                    _position_manager._positions[adopted.id] = adopted
+                    active_positions.set(len(_position_manager._positions))
+
+                    # Place exchange-side SL for crash protection
+                    await _position_manager._place_exchange_sl(adopted)
+
+                    logger.info(
+                        f"[OrphanSweep] ADOPTED {symbol} {side} {leverage}x into PM: "
+                        f"entry={entry_price:.6f} sl={stop_loss:.6f} tp1={tp1:.6f} "
+                        f"amount=${notional:.2f} → now managed with SL/TP/trailing"
+                    )
+
+                    # Persist to DB
+                    if _db is not None:
+                        await _db.positions.update_one(
+                            {"symbol": symbol, "status": "open"},
+                            {"$set": adopted.to_dict()},
+                            upsert=True,
+                        )
+                except Exception as ae:
+                    logger.warning(f"[OrphanSweep] Failed to adopt {symbol}: {ae}")
 
     except Exception as e:
         logger.debug(f"[OrphanSweep] Sweep error: {e}")
