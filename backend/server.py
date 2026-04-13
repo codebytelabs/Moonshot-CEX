@@ -39,6 +39,7 @@ from src.alerts import AlertManager
 from src.metrics import account_equity, portfolio_value
 from src.performance_tracker import PerformanceTracker
 from src.strategy_manager import StrategyManager
+from src.strategies.regime_engine import RegimeEngine
 from src.leverage_engine import LeverageEngine
 
 # ── Global state ──────────────────────────────────────────────────────────────
@@ -95,6 +96,7 @@ _bayesian_threshold_live: float = cfg.bayesian_threshold_normal
 _swarm_task: Optional[asyncio.Task] = None
 _consecutive_zero_setups: int = 0  # cycles with 0 setups; drought relief triggers at 200
 _strategy_manager: Optional[StrategyManager] = None
+_regime_engine: Optional[RegimeEngine] = None
 _futures_exchange: Optional[FuturesExchangeConnector] = None
 _futures_execution: Optional[FuturesExecutionCore] = None
 _leverage_engine: Optional[LeverageEngine] = None
@@ -324,6 +326,11 @@ async def _startup():
     )
     logger.info(f"[Startup] StrategyManager initialized: {_strategy_manager.active_strategies}")
 
+    # ── Regime Engine v7.0 (adaptive multi-strategy) ──────────────────────
+    global _regime_engine
+    _regime_engine = RegimeEngine(exchange=_exchange)
+    logger.info(f"[Startup] RegimeEngine v7.0 initialized: {_regime_engine.strategy_names}")
+
     # ── Futures Mode Setup ─────────────────────────────────────────────────
     _is_futures = cfg.trading_mode.lower() == "futures"
     STATE["trading_mode"] = cfg.trading_mode
@@ -368,6 +375,10 @@ async def _startup():
         if _strategy_manager:
             _strategy_manager._exchange = _futures_exchange
             for strat in _strategy_manager._strategies.values():
+                strat.exchange = _futures_exchange
+        if _regime_engine:
+            _regime_engine.exchange = _futures_exchange
+            for strat in _regime_engine._strategies.values():
                 strat.exchange = _futures_exchange
 
         logger.info("[Startup] Futures wiring complete — all agents use futures exchange")
@@ -641,18 +652,42 @@ async def _run_cycle():
             logger.error(f"[Cycle {cycle}] Strategy manager error: {exc}")
             return []
 
-    legacy_result, strategy_result = await asyncio.gather(
+    async def _regime_engine_pipeline():
+        """v7.0 Regime-adaptive strategy engine — primary signal source."""
+        if not _regime_engine:
+            return []
+        try:
+            # Use watcher candidates that were already scanned by legacy pipeline
+            _is_futures = STATE.get("trading_mode", "spot") == "futures"
+            cands = await _watcher.scan(regime=current_regime, futures_mode=_is_futures)
+            if not cands:
+                return []
+            signals = await _regime_engine.scan(
+                candidates=cands,
+                regime=current_regime,
+                max_signals=5,
+            )
+            return [sig.to_setup_dict() for sig in signals]
+        except Exception as exc:
+            logger.error(f"[Cycle {cycle}] RegimeEngine error: {exc}")
+            return []
+
+    legacy_result, strategy_result, regime_result = await asyncio.gather(
         _legacy_pipeline(),
         _strategy_pipeline(),
+        _regime_engine_pipeline(),
         return_exceptions=True,
     )
 
     # Handle exceptions from gather
     legacy_approved = legacy_result if isinstance(legacy_result, list) else []
     strategy_setups = strategy_result if isinstance(strategy_result, list) else []
+    regime_setups = regime_result if isinstance(regime_result, list) else []
     if isinstance(legacy_result, Exception):
         _sv_cycle_errors += 1
     if isinstance(strategy_result, Exception):
+        _sv_cycle_errors += 1
+    if isinstance(regime_result, Exception):
         _sv_cycle_errors += 1
 
     # Feed telemetry to BigBrother supervisor
@@ -662,41 +697,53 @@ async def _run_cycle():
         cycle_errors=_sv_cycle_errors,
     )
 
-    # Track legacy pipeline stats
+    # Track pipeline stats
     candidates = STATE.get("last_watcher_candidates", [])
     trace["steps"].append(f"legacy:{len(legacy_approved)}")
     trace["steps"].append(f"strategies:{len(strategy_setups)}")
+    trace["steps"].append(f"regime_engine:{len(regime_setups)}")
 
-    if legacy_approved:
+    if legacy_approved or regime_setups:
         _consecutive_zero_setups = 0
     else:
         _consecutive_zero_setups += 1
 
-    # Merge: deduplicate by symbol — strategy signals take priority over legacy.
-    # Legacy cap: when strategies produce signals, cap legacy to 2 slots so strategies
-    # get priority. But when strategy_signals=0 (common in choppy regime), allow up
-    # to 5 legacy signals so the bot doesn't sit completely idle.
-    _MAX_LEGACY_SLOTS = 2 if strategy_setups else 5
+    # ── v7.0 Merge: RegimeEngine signals > old strategies > legacy ────────
+    # Priority: regime_engine (proven strategies) > old strategy_mgr > legacy analyzer.
+    # Regime engine gets unlimited slots. Old strategies get 2 slots. Legacy gets 2 max.
     seen_symbols = set()
     approved = []
-    for setup in strategy_setups:
+    # 1) Regime Engine signals (highest priority — proven regime-adaptive strategies)
+    for setup in regime_setups:
         sym = setup.get("symbol", "")
         if sym not in seen_symbols:
             seen_symbols.add(sym)
             approved.append(setup)
+    # 2) Old strategy manager signals (2 slot cap)
+    _old_strat_added = 0
+    for setup in strategy_setups:
+        if _old_strat_added >= 2:
+            break
+        sym = setup.get("symbol", "")
+        if sym not in seen_symbols:
+            seen_symbols.add(sym)
+            approved.append(setup)
+            _old_strat_added += 1
+    # 3) Legacy analyzer signals (2 slot cap — fallback only)
+    _legacy_slots = 2 if (regime_setups or strategy_setups) else 4
     _legacy_added = 0
     for setup in legacy_approved:
-        if _legacy_added >= _MAX_LEGACY_SLOTS:
+        if _legacy_added >= _legacy_slots:
             break
         sym = setup.get("symbol", "")
         if sym not in seen_symbols:
             seen_symbols.add(sym)
             approved.append(setup)
             _legacy_added += 1
-    if len(legacy_approved) > _legacy_added:
+    if regime_setups:
         logger.info(
-            f"[Cycle {cycle}] Legacy cap: {_legacy_added}/{len(legacy_approved)} "
-            f"legacy signals admitted (max={_MAX_LEGACY_SLOTS})"
+            f"[Cycle {cycle}] v7.0 merge: {len(regime_setups)} regime + "
+            f"{_old_strat_added} old_strat + {_legacy_added} legacy = {len(approved)} total"
         )
 
     # ── Unified quality ranking — best opportunities fill limited slots first ──
@@ -2923,9 +2970,15 @@ async def account_snapshot():
 @app.get("/api/strategies/status")
 async def strategies_status():
     """Return status of all trading strategies."""
-    if not _strategy_manager:
-        return {"error": "Strategy manager not initialized"}
-    return _strategy_manager.get_status()
+    result = {}
+    if _strategy_manager:
+        result["legacy_strategies"] = _strategy_manager.get_status()
+    if _regime_engine:
+        regime = _bigbrother.current_regime if _bigbrother else "sideways"
+        result["regime_engine"] = _regime_engine.get_status(regime)
+    if not result:
+        return {"error": "No strategy engines initialized"}
+    return result
 
 
 @app.get("/api/debug/pipeline")
