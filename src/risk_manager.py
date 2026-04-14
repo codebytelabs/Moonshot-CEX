@@ -217,13 +217,21 @@ class RiskManager:
         if day_pnl_pct <= -self.daily_loss_limit_pct:
             return False, f"daily_loss_limit hit ({day_pnl_pct:.1%})"
 
-        # Rolling win-rate gate: pause if last N trades have abysmal win rate
+        # Rolling win-rate gate: if last N trades have abysmal win rate,
+        # trigger a 60-min cooldown then resume (avoids permanent deadlock).
         if len(self._trade_history) >= self.rolling_wr_window:
             recent = self._trade_history[-self.rolling_wr_window:]
             wins = sum(1 for t in recent if t.get("won"))
             wr = wins / len(recent)
             if wr < self.rolling_wr_floor:
-                return False, f"rolling_winrate_pause ({wins}/{len(recent)} = {wr:.0%} < {self.rolling_wr_floor:.0%})"
+                if not self._pause_until or time.time() >= self._pause_until:
+                    self._pause_until = time.time() + 60 * 60  # 60-min cooldown
+                    logger.warning(
+                        f"[Risk] Rolling WR {wins}/{len(recent)} = {wr:.0%} < {self.rolling_wr_floor:.0%} "
+                        f"→ 60min cooldown"
+                    )
+                remaining = int(self._pause_until - time.time())
+                return False, f"rolling_winrate_cooldown ({wins}/{len(recent)} = {wr:.0%}, {remaining}s left)"
 
         return True, "ok"
 
