@@ -1051,34 +1051,27 @@ async def _run_cycle():
                 trace["steps"].append(f"skip_held:{symbol}")
             continue
 
+        # ── Direction gate ─────────────────────────────────────────────────
+        # v7.2: Shorts DISABLED. 0% win rate across ~17 short trades (net -$300+).
+        # Crypto altcoins have structural long bias; shorts fight gravity.
+        _direction = setup.get("direction", "long")
+        if _direction == "short":
+            trace["steps"].append(f"skip_short_disabled:{symbol}")
+            continue
+
         # ── BTC Trend Master Switch Gate (v5.0 Wave Rider) ──────────────────
         # Binary: BTC trending → trade at full size. BTC NOT trending → block longs.
-        # Replaces graduated sizing that bled -$1,795 in choppy markets.
-        # Short tokens and strategy signals are exempt (they have their own filters).
-        _direction = setup.get("direction", "long")
         _is_strategy_signal = bool(setup.get("strategy", ""))
         if _direction == "long" and not _is_strategy_signal:
             _base = symbol.replace("/USDT", "").replace(":USDT", "")
             _is_short_token = any(_base.endswith(sfx) for sfx in ("3S", "5S", "DOWN"))
             if not _is_short_token and not _btc_trend_on:
-                # Master switch OFF → block ALL new long entries
                 trace["steps"].append(f"skip_btc_trend_off:{symbol}")
                 logger.info(
                     f"[Swarm] {symbol} BLOCKED: BTC trend switch OFF "
                     f"(score={_btc_momentum['score']:.2f} < {_btc_threshold:.2f}). Waiting for uptrend."
                 )
                 continue
-            # When switch is ON → full size, no scaling (trade with conviction)
-        elif _direction == "short" and not _is_strategy_signal:
-            # FUTURES SHORT: allowed even when BTC trend is OFF (shorts profit from weakness).
-            # When BTC is strongly bullish, reduce short size slightly.
-            if _btc_momentum["score"] >= 0.8:
-                _btc_short_penalty = 0.6
-                size_usd *= _btc_short_penalty
-                logger.info(
-                    f"[Sizing] {symbol} SHORT BTC-bull penalty: ×{_btc_short_penalty:.2f} → ${size_usd:.0f} "
-                    f"(BTC score={_btc_momentum['score']:.2f})"
-                )
 
         # Symbol cooldown gate — prevent revenge-trading after recent stop-loss
         if _position_manager.is_symbol_on_cooldown(symbol):
