@@ -76,7 +76,9 @@ class RiskManager:
         max_kelly_fraction: float = 0.25,
         min_trades_for_kelly: int = 30,
         initial_equity: float = 1000.0,
-        max_daily_trades: int = 6,
+        max_daily_trades: int = 999,
+        rolling_wr_window: int = 10,
+        rolling_wr_floor: float = 0.30,
     ):
         self.max_positions = max_positions
         self.max_portfolio_exposure_pct = max_portfolio_exposure_pct
@@ -91,6 +93,8 @@ class RiskManager:
         self.min_trades_for_kelly = min_trades_for_kelly
 
         self.max_daily_trades = max_daily_trades
+        self.rolling_wr_window = rolling_wr_window
+        self.rolling_wr_floor = rolling_wr_floor
 
         self.peak_equity = initial_equity
         self._day_start_equity = initial_equity
@@ -213,8 +217,13 @@ class RiskManager:
         if day_pnl_pct <= -self.daily_loss_limit_pct:
             return False, f"daily_loss_limit hit ({day_pnl_pct:.1%})"
 
-        if self._day_trade_count >= self.max_daily_trades:
-            return False, f"max_daily_trades reached ({self._day_trade_count}/{self.max_daily_trades})"
+        # Rolling win-rate gate: pause if last N trades have abysmal win rate
+        if len(self._trade_history) >= self.rolling_wr_window:
+            recent = self._trade_history[-self.rolling_wr_window:]
+            wins = sum(1 for t in recent if t.get("won"))
+            wr = wins / len(recent)
+            if wr < self.rolling_wr_floor:
+                return False, f"rolling_winrate_pause ({wins}/{len(recent)} = {wr:.0%} < {self.rolling_wr_floor:.0%})"
 
         return True, "ok"
 

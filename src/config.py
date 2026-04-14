@@ -93,7 +93,7 @@ class Settings(BaseSettings):
     max_risk_per_trade_pct: float = Field(default=0.08, alias="MAX_RISK_PER_TRADE_PCT")
     max_drawdown_pct: float = Field(default=0.15, alias="MAX_DRAWDOWN_PCT")
     daily_loss_limit_pct: float = Field(default=0.05, alias="DAILY_LOSS_LIMIT_PCT")
-    max_daily_trades: int = Field(default=6, alias="MAX_DAILY_TRADES")
+    max_daily_trades: int = Field(default=999, alias="MAX_DAILY_TRADES")
     consecutive_loss_threshold: int = Field(default=3, alias="CONSECUTIVE_LOSS_THRESHOLD")
     consecutive_loss_pause_minutes: int = Field(default=30, alias="CONSECUTIVE_LOSS_PAUSE_MINUTES")
     # DEPRECATED: initial_equity_usd is ignored at runtime.
