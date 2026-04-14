@@ -32,6 +32,7 @@ class BBSqueezeStrategy(BaseStrategy):
     SQUEEZE_MIN_BARS = 3        # minimum bars in squeeze before valid
     ATR_SL_MULT = 2.5
     ATR_TP_MULT = 5.0           # asymmetric — big moves from squeezes
+    MAX_SL_PCT = -5.0           # hard cap — never risk more than 5%
     TRAIL_ACTIVATE_PCT = 2.0
     TRAIL_DISTANCE_PCT = 1.5
     MAX_HOLD_MINUTES = 300      # 5h — squeeze breakouts can run
@@ -151,6 +152,14 @@ class BBSqueezeStrategy(BaseStrategy):
             tp1 = price - atr_val * self.ATR_TP_MULT
             tp2 = price - atr_val * self.ATR_TP_MULT * 1.5
             sl_pct = -abs((sl - price) / price * 100)
+
+        # ── Hard cap SL at MAX_SL_PCT ──────────────────────────────────────
+        if sl_pct < self.MAX_SL_PCT:
+            sl_pct = self.MAX_SL_PCT
+            if direction == "long":
+                sl = price * (1 + sl_pct / 100)
+            else:
+                sl = price * (1 - sl_pct / 100)
 
         # ── Score ────────────────────────────────────────────────────────────
         score = 45.0

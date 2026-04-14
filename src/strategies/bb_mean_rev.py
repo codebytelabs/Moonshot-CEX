@@ -32,6 +32,7 @@ class BBMeanRevStrategy(BaseStrategy):
     ADX_MAX = 25                # only trade when ADX < 25 (no trend)
     ATR_SL_MULT = 2.0           # tighter stops for mean rev
     ATR_TP_MULT = 2.5           # target middle BB (~1.25:1 R:R)
+    MAX_SL_PCT = -5.0           # hard cap — never risk more than 5%
     TRAIL_ACTIVATE_PCT = 1.5
     TRAIL_DISTANCE_PCT = 1.0
     MAX_HOLD_MINUTES = 180      # 3h max — mean rev trades are quick
@@ -120,6 +121,14 @@ class BBMeanRevStrategy(BaseStrategy):
             tp1 = bb_mid
             tp2 = bb_lower * 1.01
             sl_pct = -abs((sl - price) / price * 100)
+
+        # ── Hard cap SL at MAX_SL_PCT ──────────────────────────────────────
+        if sl_pct < self.MAX_SL_PCT:
+            sl_pct = self.MAX_SL_PCT
+            if direction == "long":
+                sl = price * (1 + sl_pct / 100)
+            else:
+                sl = price * (1 - sl_pct / 100)
 
         # ── Score ────────────────────────────────────────────────────────────
         score = 45.0  # base

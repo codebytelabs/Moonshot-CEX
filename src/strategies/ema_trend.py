@@ -32,6 +32,7 @@ class EMATrendStrategy(BaseStrategy):
     ADX_THRESHOLD = 25          # minimum ADX for trend confirmation
     ATR_SL_MULT = 2.5           # stop loss = 2.5 × ATR
     ATR_TP_MULT = 5.0           # take profit = 5.0 × ATR (2:1 R:R)
+    MAX_SL_PCT = -5.0           # hard cap — never risk more than 5%
     TRAIL_ACTIVATE_PCT = 2.0    # activate trailing at +2%
     TRAIL_DISTANCE_PCT = 1.5    # trail distance 1.5%
     MAX_HOLD_MINUTES = 240      # 4h max hold
@@ -143,6 +144,14 @@ class EMATrendStrategy(BaseStrategy):
             tp1 = price - atr_val * self.ATR_TP_MULT
             tp2 = price - atr_val * self.ATR_TP_MULT * 1.5
             sl_pct = -abs((sl - price) / price * 100)
+
+        # ── Hard cap SL at MAX_SL_PCT ──────────────────────────────────────
+        if sl_pct < self.MAX_SL_PCT:
+            sl_pct = self.MAX_SL_PCT
+            if direction == "long":
+                sl = price * (1 + sl_pct / 100)
+            else:
+                sl = price * (1 - sl_pct / 100)
 
         # ── Score ────────────────────────────────────────────────────────────
         score = 40.0  # base

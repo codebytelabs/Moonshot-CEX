@@ -1136,15 +1136,15 @@ async def _run_cycle():
             # ── Position rotation: replace worst performer with better opportunity ──
             # When max_positions is the blocker and a strong signal appears,
             # close the worst-performing losing position to make room.
-            # GUARD: disabled in choppy/volatile — rotation in these regimes is
-            # pure churn (5/15 recent trades were rotated_out at -$166 total).
+            # GUARD: only rotate in sideways regime — bull/bear/choppy rotation
+            # is pure churn (13 rotated_out trades lost -$691 in last 10h).
             _rotated = False
             _cur_regime = STATE.get("regime", "sideways")
             _cur_bb_mode = STATE.get("bigbrother_mode", "normal")
             _rotation_allowed = (
                 "max_positions" in gate_reason
                 and _setup_rank_score >= 45.0
-                and _cur_regime not in ("choppy", "bear")
+                and _cur_regime == "sideways"
                 and _cur_bb_mode != "volatile"
             )
             if _rotation_allowed:

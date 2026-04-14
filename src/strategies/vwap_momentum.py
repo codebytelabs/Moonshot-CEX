@@ -29,6 +29,7 @@ class VWAPMomentumStrategy(BaseStrategy):
     VWAP_BUFFER_PCT = 0.3       # price must be 0.3%+ above/below VWAP
     ATR_SL_MULT = 2.0           # stop loss = 2 × ATR (tighter for momentum)
     ATR_TP_MULT = 4.0           # take profit = 4 × ATR (2:1 R:R)
+    MAX_SL_PCT = -5.0           # hard cap — never risk more than 5%
     TRAIL_ACTIVATE_PCT = 1.5    # activate trailing early — catch momentum
     TRAIL_DISTANCE_PCT = 1.2    # tight trail to lock in gains
     MAX_HOLD_MINUTES = 180      # 3h max — momentum trades are fast
@@ -145,6 +146,14 @@ class VWAPMomentumStrategy(BaseStrategy):
             tp1 = price - atr_val * self.ATR_TP_MULT
             tp2 = price - atr_val * self.ATR_TP_MULT * 1.5
             sl_pct = -abs((sl - price) / price * 100)
+
+        # ── Hard cap SL at MAX_SL_PCT ──────────────────────────────────────
+        if sl_pct < self.MAX_SL_PCT:
+            sl_pct = self.MAX_SL_PCT
+            if direction == "long":
+                sl = price * (1 + sl_pct / 100)
+            else:
+                sl = price * (1 - sl_pct / 100)
 
         # ── Score ────────────────────────────────────────────────────────────
         score = 40.0
