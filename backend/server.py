@@ -1031,7 +1031,8 @@ async def _run_cycle():
                 current_regime=_current_regime,
             )
         # v7.4: Apply BTC graduated sizing to position size
-        if _btc_size_scale < 1.0 and _btc_size_scale > 0 and _direction == "long" and not _is_strategy_signal:
+        _is_strat = bool(setup.get("strategy", ""))
+        if _btc_size_scale < 1.0 and _btc_size_scale > 0 and _direction == "long" and not _is_strat:
             _effective_btc_scale = _btc_size_scale
             # Quality override: strong signals get boosted BTC scale
             _q_ta = float(setup.get("ta_score", 0.0))
