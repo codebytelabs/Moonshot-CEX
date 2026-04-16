@@ -1006,18 +1006,45 @@ class PositionManager:
             logger.error(f"[PM] Partial exit failed for {pos.symbol} ({reason}): {e}")
             return None
 
-    async def emergency_close_all(self) -> list[dict]:
-        """Close all open positions immediately (emergency stop)."""
+    async def emergency_close_all(self, level: int = 3) -> list[dict]:
+        """Graduated emergency close — not all-or-nothing.
+
+        v7.3: 72 emergency_stop trades had 7% WR and -$988. Most were tiny losses
+        (-0.1% to -0.5%) that didn't need emergency closing. Graduated levels:
+          Level 1 (-8% day loss): close positions losing > 2% only
+          Level 2 (-12% day loss): close positions losing > 1%
+          Level 3 (-15% day loss): close everything (true emergency)
+        Winning/breakeven positions keep running with tightened trailing stops.
+        """
         results = []
+        # Map level → PnL threshold. Level 3 = close everything (threshold=+999)
+        _pnl_thresholds = {1: -2.0, 2: -1.0, 3: 999.0}
+        _close_if_below = _pnl_thresholds.get(level, 999.0)
+
         for pos in list(self._positions.values()):
-            if pos.status == "open":
-                try:
-                    price = await self.execution.get_current_price(pos.symbol)
+            if pos.status != "open":
+                continue
+            try:
+                price = await self.execution.get_current_price(pos.symbol)
+                pnl_pct = pos.current_pnl_pct(price)
+
+                if level >= 3 or pnl_pct <= _close_if_below:
+                    # Close this position
                     result = await self._execute_exit(pos, price, "emergency_stop", pos.amount)
                     if result:
                         results.append(result)
-                except Exception as e:
-                    logger.error(f"[PM] Emergency close failed for {pos.symbol}: {e}")
+                elif pos.trailing_stop is None and pnl_pct > 0:
+                    # Winning position without trail → activate trail now to protect gains
+                    if pos.side == "long":
+                        pos.trailing_stop = price * 0.995  # tight 0.5% trail
+                    else:
+                        pos.trailing_stop = price * 1.005
+                    await self._update_exchange_sl(pos, pos.trailing_stop)
+                    logger.info(
+                        f"[PM] EMERGENCY TIGHTEN: {pos.symbol} +{pnl_pct:.1f}% → trail at {pos.trailing_stop:.6f}"
+                    )
+            except Exception as e:
+                logger.error(f"[PM] Emergency close failed for {pos.symbol}: {e}")
         return results
 
     def get_open_positions(self) -> list[dict]:

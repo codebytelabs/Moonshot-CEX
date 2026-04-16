@@ -23,6 +23,7 @@ v3.1 — Adaptive sizing:
   • Conviction × liquidity × TA quality multipliers unchanged from v3.0
 """
 import time
+import math
 from typing import Optional
 from loguru import logger
 
@@ -105,6 +106,8 @@ class RiskManager:
         self._trade_history: list[dict] = []
         self._day_trade_count: int = 0
         self._drawdown_halt_cycles: int = 0  # consecutive cycles blocked by drawdown_halt
+        self._entries_this_cycle: int = 0  # reset each cycle
+        self._max_entries_per_cycle: int = 2  # cap scatter-shot entries
 
         # Account tier — re-computed whenever detect_account_tier() is called
         # Defaults match the medium-tier row of ACCOUNT_TIER_THRESHOLDS so that
@@ -425,12 +428,23 @@ class RiskManager:
                 return mult
         return 0.15  # never zero — 0.0× was a death spiral preventing recovery
 
+    def reset_cycle_entries(self):
+        """Reset per-cycle entry counter. Call at start of each cycle."""
+        self._entries_this_cycle = 0
+
+    def can_enter_this_cycle(self) -> tuple[bool, str]:
+        """Check if more entries are allowed this cycle. Max 2 per cycle prevents scatter-shot."""
+        if self._entries_this_cycle >= self._max_entries_per_cycle:
+            return False, f"max_entries_per_cycle ({self._entries_this_cycle}/{self._max_entries_per_cycle})"
+        return True, "ok"
+
     def record_entry(self):
         """Increment the daily entry counter. Call this once per new position open.
         Exits (TIME, momentum_died, stop_loss, etc.) must NOT count — only new entries do.
         Counting exits inflated the counter by 20-30 per day on volatile sessions, blocking
         all new trades while $12K sat idle."""
         self._day_trade_count += 1
+        self._entries_this_cycle += 1
 
     def record_trade(self, pnl_usd: float, pnl_pct: float, r_multiple: float):
         """Record trade outcome for Kelly and circuit breaker logic."""
@@ -452,19 +466,104 @@ class RiskManager:
             self._consecutive_wins = 0
             self._consecutive_losses += 1
             if self._consecutive_losses >= self.consecutive_loss_threshold:
-                new_pause = time.time() + self.consecutive_loss_pause_minutes * 60
-                # Only log + set on first trigger; subsequent hits in the same burst
-                # (e.g. 15 exchange_holdings closing at once) silently extend if needed.
+                # v7.3 Graduated cooldown: ramp up pause with more consecutive losses.
+                # 3 losses: 10min, 5 losses: 30min, 7+: 60min. Not binary.
+                _graduated_pause_min = {
+                    3: 10, 4: 20, 5: 30, 6: 45, 7: 60,
+                }.get(min(self._consecutive_losses, 7), 60)
+                new_pause = time.time() + _graduated_pause_min * 60
                 if not self._pause_until or new_pause > self._pause_until:
                     first_trigger = not self._pause_until
                     self._pause_until = new_pause
                     if first_trigger:
                         logger.warning(
-                            f"[Risk] {self.consecutive_loss_threshold} consecutive losses → "
-                            f"pause for {self.consecutive_loss_pause_minutes}min"
+                            f"[Risk] {self._consecutive_losses} consecutive losses → "
+                            f"graduated pause for {_graduated_pause_min}min"
                         )
 
         self._update_metrics()
+
+    # ── Dynamic Risk Guardrails (v7.3) ────────────────────────────────────────
+    # Risk params adapt per-trade to volatility, regime, and account health.
+    # Just like leverage and sizing are dynamic, stops/trails/hold times should be too.
+
+    def compute_dynamic_sl(self, atr_pct: float, regime: str = "sideways") -> float:
+        """ATR-based dynamic stop loss. Volatile coins get wider SL, stable coins tighter.
+
+        A fixed -4.5% SL on a coin that routinely swings 5%/hour guarantees stop-outs.
+        Using 1.5-2x ATR(1h) gives each coin room proportional to its actual volatility.
+
+        Returns negative percentage (e.g. -3.5).
+        """
+        # ATR multiplier by regime
+        _regime_atr_mult = {"bull": 2.0, "sideways": 1.8, "bear": 1.5, "choppy": 1.5}
+        mult = _regime_atr_mult.get(regime, 1.8)
+        dynamic_sl = -(atr_pct * mult)
+        # Clamp: never wider than -8% (blow-up risk), never tighter than -2% (noise)
+        dynamic_sl = max(dynamic_sl, -8.0)
+        dynamic_sl = min(dynamic_sl, -2.0)
+        return round(dynamic_sl, 2)
+
+    def compute_dynamic_exit_params(
+        self, atr_pct: float, regime: str = "sideways", drawdown: float = 0.0
+    ) -> dict:
+        """Compute per-trade exit parameters adapted to volatility, regime, and drawdown.
+
+        Returns dict with: stop_loss_pct, trailing_activate_pct, trailing_distance_pct, time_exit_hours
+        """
+        sl = self.compute_dynamic_sl(atr_pct, regime)
+
+        # Trail activation: should be > noise but < typical move
+        # ~0.7-1.0x ATR so normal moves activate trailing
+        _trail_act_base = max(0.5, min(3.0, atr_pct * 0.8))
+        _trail_dist_base = max(0.3, min(2.0, atr_pct * 0.5))
+
+        # Regime-scale trailing
+        _regime_trail_scale = {"bull": 1.3, "sideways": 1.0, "bear": 0.85, "choppy": 0.8}
+        _trail_scale = _regime_trail_scale.get(regime, 1.0)
+        trail_activate = round(_trail_act_base * _trail_scale, 2)
+        trail_dist = round(_trail_dist_base * _trail_scale, 2)
+
+        # Time exit: bull = patient (4.5h), choppy = fast (2h)
+        _regime_time = {"bull": 4.5, "sideways": 4.0, "bear": 3.0, "choppy": 2.5}
+        time_hours = _regime_time.get(regime, 4.0)
+
+        # Drawdown squeeze: when bleeding, tighten everything
+        if drawdown > 0.10:
+            trail_activate *= 0.8  # activate trail sooner
+            time_hours *= 0.8     # shorter hold
+
+        return {
+            "stop_loss_pct": sl,
+            "trailing_activate_pct": round(trail_activate, 2),
+            "trailing_distance_pct": round(trail_dist, 2),
+            "time_exit_hours": round(time_hours, 2),
+        }
+
+    def get_min_entry_score(self, drawdown: float = 0.0) -> float:
+        """Drawdown-scaled entry quality bar. Higher bar when account is bleeding.
+
+        Returns minimum ta_score required for entry.
+        """
+        base_score = 50.0  # healthy baseline
+        if drawdown > 0.15:
+            return 70.0  # only the best setups when deep in drawdown
+        elif drawdown > 0.10:
+            return 65.0
+        elif drawdown > 0.05:
+            return 55.0
+        return base_score
+
+    def get_min_posterior(self, drawdown: float = 0.0) -> float:
+        """Drawdown-scaled Bayesian posterior threshold."""
+        base = 0.50
+        if drawdown > 0.15:
+            return 0.65
+        elif drawdown > 0.10:
+            return 0.58
+        elif drawdown > 0.05:
+            return 0.52
+        return base
 
     def update_peak_equity(self, equity: float):
         if equity > self.peak_equity:

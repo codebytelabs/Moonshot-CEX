@@ -582,27 +582,48 @@ async def _run_cycle():
         STATE["_cb_day_date"] = _today_str
         STATE["_circuit_breaker_tripped"] = False
         logger.info(f"[CIRCUIT BREAKER] New day — start equity ${equity:.2f}")
+    # v7.3 Graduated circuit breaker: 3 levels instead of nuclear close-all.
+    # Old CB closed 72 positions at once (7% WR, -$988). Most were tiny losses.
+    # Level 1 (-8%):  close positions losing > 2%, block new entries
+    # Level 2 (-12%): close positions losing > 1%, block new entries
+    # Level 3 (-15%): close everything (true emergency)
     cb_start = STATE.get("_cb_day_start_equity", 0)
     day_pnl = equity - cb_start if cb_start > 0 else 0
-    if cycle > _CB_GRACE_CYCLES and equity > 0 and cb_start > 0 and day_pnl < 0 and abs(day_pnl) / cb_start > _CB_THRESHOLD:
-        if not STATE.get("_circuit_breaker_tripped"):
+    _cb_loss_pct = abs(day_pnl) / cb_start if cb_start > 0 and day_pnl < 0 else 0.0
+    _CB_L1 = 0.08   # 8% → graduated close (deep losers only)
+    _CB_L2 = 0.12   # 12% → close all losing positions
+    _CB_L3 = _CB_THRESHOLD  # 15% → nuclear close everything
+
+    if cycle > _CB_GRACE_CYCLES and equity > 0 and cb_start > 0 and _cb_loss_pct > _CB_L1:
+        _cb_level = 3 if _cb_loss_pct >= _CB_L3 else (2 if _cb_loss_pct >= _CB_L2 else 1)
+        _prev_level = STATE.get("_cb_level", 0)
+
+        if _cb_level > _prev_level:
+            STATE["_cb_level"] = _cb_level
             STATE["_circuit_breaker_tripped"] = True
             logger.warning(
-                f"[CIRCUIT BREAKER] Day loss ${day_pnl:.2f} exceeds {_CB_THRESHOLD:.0%} of equity ${equity:.2f}. "
-                f"Emergency closing all positions and pausing."
+                f"[CIRCUIT BREAKER] Level {_cb_level} — day loss ${day_pnl:.2f} ({_cb_loss_pct:.1%}). "
+                f"Graduated close (level {_cb_level})."
             )
             if _position_manager:
-                await _position_manager.emergency_close_all()
+                await _position_manager.emergency_close_all(level=_cb_level)
             if _alerts:
                 await _alerts.send(
-                    f"🚨 CIRCUIT BREAKER: Day loss ${day_pnl:.2f} ({day_pnl/equity*100:.1f}%). All positions closed.",
+                    f"🚨 CB Level {_cb_level}: Day loss ${day_pnl:.2f} ({_cb_loss_pct:.1%}%). "
+                    f"{'Deep losers closed' if _cb_level == 1 else 'All losers closed' if _cb_level == 2 else 'ALL positions closed'}.",
                     priority="critical",
                 )
-        trace["steps"].append("circuit_breaker_active")
-        await _tick_positions()  # still tick to clean up ghost-closes
-        return
+
+        trace["steps"].append(f"circuit_breaker_L{_cb_level}")
+        # Level 1-2: block entries but still tick positions (trails can exit winners)
+        if _cb_level < 3:
+            await _tick_positions()
+        else:
+            await _tick_positions()
+            return
     elif STATE.get("_circuit_breaker_tripped") and day_pnl >= 0:
         STATE["_circuit_breaker_tripped"] = False
+        STATE["_cb_level"] = 0
         logger.info("[CIRCUIT BREAKER] Reset — day PnL back to positive.")
 
     # ── Step 1: Watcher scan + Strategy Manager scan (PARALLEL) ────────────
@@ -915,9 +936,37 @@ async def _run_cycle():
         # When switch is ON, no size scaling — trade with full conviction
         # When switch is OFF, longs blocked entirely (handled per-setup below)
 
+    # v7.3: Reset per-cycle entry counter and compute dynamic entry quality bars
+    _risk_manager.reset_cycle_entries()
+    _dd_current = _risk_manager._compute_drawdown(equity)
+    _dynamic_min_ta = _risk_manager.get_min_entry_score(_dd_current)
+    _dynamic_min_posterior = _risk_manager.get_min_posterior(_dd_current)
+    if _dd_current > 0.05:
+        logger.info(
+            f"[Cycle {cycle}] Drawdown {_dd_current:.1%} → min_ta={_dynamic_min_ta:.0f} min_post={_dynamic_min_posterior:.2f}"
+        )
+
     for _slot_rank, setup in enumerate(approved if not _skip_entries else [], 1):
         symbol = setup["symbol"]
         _setup_rank_score = _rank_score(setup)
+
+        # v7.3: Per-cycle entry cap — max 2 entries per cycle prevents scatter-shot
+        _can_enter_cycle, _cycle_reason = _risk_manager.can_enter_this_cycle()
+        if not _can_enter_cycle:
+            trace["steps"].append(f"skip_cycle_cap:{symbol}:{_cycle_reason}")
+            break  # no point checking remaining setups this cycle
+
+        # v7.3: Drawdown-scaled entry quality gates
+        _setup_ta = float(setup.get("ta_score", 0.0))
+        _setup_posterior = float(setup.get("decision", {}).get("posterior", 0.0))
+        if _setup_ta < _dynamic_min_ta and not bool(setup.get("strategy", "")):
+            trace["steps"].append(f"skip_quality_ta:{symbol}:{_setup_ta:.0f}<{_dynamic_min_ta:.0f}")
+            logger.info(f"[Swarm] {symbol} skipped: ta_score {_setup_ta:.0f} < dynamic min {_dynamic_min_ta:.0f} (dd={_dd_current:.1%})")
+            continue
+        if _setup_posterior > 0 and _setup_posterior < _dynamic_min_posterior and not bool(setup.get("strategy", "")):
+            trace["steps"].append(f"skip_quality_post:{symbol}:{_setup_posterior:.2f}<{_dynamic_min_posterior:.2f}")
+            logger.info(f"[Swarm] {symbol} skipped: posterior {_setup_posterior:.2f} < dynamic min {_dynamic_min_posterior:.2f} (dd={_dd_current:.1%})")
+            continue
 
         # ── Pre-compute desired size (needed for both scale and new-entry paths) ──
         sl_pct = STATE.get("regime_params", {}).get("stop_loss_pct", cfg.stop_loss_pct)
@@ -1104,13 +1153,15 @@ async def _run_cycle():
             continue
 
         # v3.1: Choppy regime — additional ta_score gate (only high-quality breakouts)
-        if _choppy_min_ta > 0 and not _is_strategy_signal:
+        # v7.3: use max of choppy_min_ta and dynamic drawdown-scaled min
+        _effective_min_ta = max(_choppy_min_ta, _dynamic_min_ta) if _choppy_min_ta > 0 else _dynamic_min_ta
+        if _effective_min_ta > 0 and not _is_strategy_signal:
             ta_score_check = float(setup.get("ta_score", 0.0))
-            if ta_score_check < _choppy_min_ta:
-                trace["steps"].append(f"skip_choppy_ta:{symbol}:score={ta_score_check:.0f}<{_choppy_min_ta:.0f}")
+            if ta_score_check < _effective_min_ta:
+                trace["steps"].append(f"skip_ta_gate:{symbol}:score={ta_score_check:.0f}<{_effective_min_ta:.0f}")
                 logger.info(
-                    f"[Swarm] {symbol} skipped: choppy regime requires ta_score >= {_choppy_min_ta:.0f} "
-                    f"(got {ta_score_check:.0f})"
+                    f"[Swarm] {symbol} skipped: min ta_score {_effective_min_ta:.0f} "
+                    f"(got {ta_score_check:.0f}, regime={_current_regime}, dd={_dd_current:.1%})"
                 )
                 continue
 
@@ -1126,84 +1177,13 @@ async def _run_cycle():
             regime_max_exposure_pct=_regime_max_exposure,
         )
         if not can_open:
-            # ── Position rotation: replace worst performer with better opportunity ──
-            # When max_positions is the blocker and a strong signal appears,
-            # close the worst-performing losing position to make room.
-            # GUARD: only rotate in sideways regime — bull/bear/choppy rotation
-            # is pure churn (13 rotated_out trades lost -$691 in last 10h).
-            _rotated = False
-            _cur_regime = STATE.get("regime", "sideways")
-            _cur_bb_mode = STATE.get("bigbrother_mode", "normal")
-            _rotation_allowed = (
-                "max_positions" in gate_reason
-                and _setup_rank_score >= 45.0
-                and _cur_regime == "sideways"
-                and _cur_bb_mode != "volatile"
-            )
-            if _rotation_allowed:
-                try:
-                    _worst_pos = None
-                    _worst_pnl = float("inf")
-                    _worst_price = 0.0
-                    for _p in list(_position_manager._positions.values()):
-                        if _p.status != "open" or _p.setup_type in ("synced_holding", "exchange_holding"):
-                            continue
-                        if _p.hold_time_hours() * 60 < 15.0:
-                            continue
-                        try:
-                            _wp = await _execution.get_current_price(_p.symbol)
-                            if _wp <= 0:
-                                continue
-                            _wpnl = _p.current_pnl_pct(_wp)
-                            if _wpnl < _worst_pnl:
-                                _worst_pnl = _wpnl
-                                _worst_pos = _p
-                                _worst_price = _wp
-                        except Exception:
-                            continue
-
-                    if _worst_pos and _worst_pnl <= -2.5:
-                        logger.info(
-                            f"[ROTATION] Closing {_worst_pos.symbol} "
-                            f"(PnL={_worst_pnl:+.2f}% hold={_worst_pos.hold_time_hours():.1f}h) "
-                            f"→ making room for {symbol} (rank={_setup_rank_score:.1f})"
-                        )
-                        _rot_result = await _position_manager._execute_exit(
-                            _worst_pos, _worst_price, "rotated_out", _worst_pos.amount
-                        )
-                        if _rot_result and _rot_result.get("pnl_usd") is not None:
-                            _rot_pnl = float(_rot_result["pnl_usd"])
-                            _rot_pnl_pct = float(_rot_result.get("pnl_pct", 0))
-                            _risk_manager.record_trade(_rot_pnl, _rot_pnl_pct, 0)
-                            STATE["total_pnl_usd"] += _rot_pnl
-                            STATE["day_pnl_usd"] += _rot_pnl
-                            await _save_trade_to_db(_rot_result)
-                            if _db is not None:
-                                try:
-                                    await _db.positions.update_one(
-                                        {"id": _rot_result.get("id")},
-                                        {"$set": {"status": "closed", "close_reason": "rotated_out"}},
-                                    )
-                                except Exception:
-                                    pass
-                            _bayesian.update_prior(_rot_result.get("setup_type", "neutral"), _rot_pnl > 0)
-                            if _alerts:
-                                await _alerts.send(
-                                    f"🔄 ROTATED OUT {_worst_pos.symbol} (PnL=${_rot_pnl:+.2f} {_rot_pnl_pct:+.1f}%)\n"
-                                    f"Replaced by: {symbol} (rank={_setup_rank_score:.1f})",
-                                    priority="medium",
-                                )
-                            open_syms.discard(_worst_pos.symbol)
-                            _rotated = True
-                            trace["steps"].append(f"rotation:{_worst_pos.symbol}→{symbol}")
-                except Exception as _rot_err:
-                    logger.warning(f"[ROTATION] Failed for {symbol}: {_rot_err}")
-
-            if not _rotated:
-                trace["steps"].append(f"risk_block:{symbol}:{gate_reason}")
-                logger.info(f"[Swarm] {symbol} blocked: {gate_reason}")
-                asyncio.create_task(_save_rejected_setup_to_db(setup, gate_reason, "risk_gate"))
-                continue
+            # v7.3: Rotation DISABLED. 14 rotated_out trades = 0% win rate, -$839.
+            # Closing a loser to open another loser is paying fees twice.
+            # Let positions hit SL or trail naturally — don't prematurely kill them.
+            trace["steps"].append(f"risk_block:{symbol}:{gate_reason}")
+            logger.info(f"[Swarm] {symbol} blocked: {gate_reason}")
+            asyncio.create_task(_save_rejected_setup_to_db(setup, gate_reason, "risk_gate"))
+            continue
 
         # Cash sufficiency check for new entries
         if _uses_exchange_account_state() and size_usd < _MIN_POSITION_USD:
