@@ -909,9 +909,9 @@ async def _run_cycle():
     # ON (score >= 0.40): Full entries allowed, normal sizing
     # OFF (score < 0.40): ZERO new long entries. Shorts still allowed (profit from weakness).
     _btc_momentum = {"score": 0.7, "bullish": True}  # default: moderate
-    _btc_size_mult = 1.0  # v5.0: no graduated sizing — binary ON/OFF
-    _btc_trend_on = True   # master switch
-    _btc_threshold = 0.45  # default; overridden below per regime
+    _btc_size_scale = 1.0   # v7.4: graduated BTC sizing (replaces binary gate)
+    _btc_score = 0.7        # default score
+    _btc_trend_on = True    # master switch (True when _btc_size_scale > 0)
     if not _skip_entries:
         try:
             _btc_momentum = await _watcher.btc_momentum_score()
@@ -920,21 +920,28 @@ async def _run_cycle():
         except Exception as _btc_err:
             logger.warning(f"[Cycle {cycle}] BTC momentum check failed: {_btc_err}")
 
-        # v6.0 OVERHAUL: regime-aware BTC trend threshold
-        # Bear/choppy: require BTC score >= 0.55 (real momentum, not dead cat bounce)
-        # Bull/sideways: standard 0.45 threshold
-        _current_regime_for_btc = STATE.get("regime", "sideways")
-        _btc_threshold = 0.55 if _current_regime_for_btc in ("bear", "choppy") else 0.45
-        _btc_trend_on = _btc_momentum["score"] >= _btc_threshold
-        STATE["btc_trend_master_switch"] = _btc_trend_on
+        # v7.4: Graduated BTC sizing replaces binary gate.
+        # Binary gate blocked 36% of all cycles (BTC score 0.35-0.45 range is normal, not a crash).
+        # Now: BTC score → size multiplier. Only hard-block when BTC < 0.25 (genuine crash).
+        _btc_score = _btc_momentum.get("score", 0.5)
+        if _btc_score >= 0.55:
+            _btc_size_scale = 1.0
+        elif _btc_score >= 0.45:
+            _btc_size_scale = 0.80
+        elif _btc_score >= 0.35:
+            _btc_size_scale = 0.50
+        elif _btc_score >= 0.25:
+            _btc_size_scale = 0.25
+        else:
+            _btc_size_scale = 0.0  # hard block: BTC crash
+        STATE["btc_trend_master_switch"] = _btc_size_scale > 0
+        STATE["btc_size_scale"] = _btc_size_scale
 
-        if not _btc_trend_on:
+        if _btc_size_scale < 1.0:
             logger.info(
-                f"[Cycle {cycle}] 🔴 BTC TREND SWITCH OFF — score={_btc_momentum['score']:.2f} < {_btc_threshold:.2f} "
-                f"(regime={_current_regime_for_btc}). Blocking new long entries."
+                f"[Cycle {cycle}] BTC scale={_btc_size_scale:.0%} (score={_btc_score:.2f}) "
+                f"— {'HARD BLOCK' if _btc_size_scale == 0 else 'reduced sizing'}"
             )
-        # When switch is ON, no size scaling — trade with full conviction
-        # When switch is OFF, longs blocked entirely (handled per-setup below)
 
     # v7.3: Reset per-cycle entry counter and compute dynamic entry quality bars
     _risk_manager.reset_cycle_entries()
@@ -1023,6 +1030,20 @@ async def _run_cycle():
                 regime_size_mult=_regime_size_mult,
                 current_regime=_current_regime,
             )
+        # v7.4: Apply BTC graduated sizing to position size
+        if _btc_size_scale < 1.0 and _btc_size_scale > 0 and _direction == "long" and not _is_strategy_signal:
+            _effective_btc_scale = _btc_size_scale
+            # Quality override: strong signals get boosted BTC scale
+            _q_ta = float(setup.get("ta_score", 0.0))
+            _q_post = float(decision.get("posterior", 0.0))
+            if _q_ta >= 65 and _q_post >= 0.58:
+                _effective_btc_scale = min(1.0, _btc_size_scale * 1.4)
+            size_usd *= _effective_btc_scale
+            logger.info(
+                f"[Sizing] {symbol} BTC scale applied: {_effective_btc_scale:.0%} "
+                f"(btc={_btc_score:.2f} ta={_q_ta:.0f} post={_q_post:.2f})"
+            )
+
         # Cap: use regime-dynamic max_single_pct (from BigBrother) instead of static config.
         # For futures, size_usd is NOTIONAL so cap must be leverage-aware.
         # Margin cap = equity × regime_max_single_pct → notional cap = margin × leverage.
@@ -1108,17 +1129,18 @@ async def _run_cycle():
             trace["steps"].append(f"skip_short_disabled:{symbol}")
             continue
 
-        # ── BTC Trend Master Switch Gate (v5.0 Wave Rider) ──────────────────
-        # Binary: BTC trending → trade at full size. BTC NOT trending → block longs.
+        # ── BTC Graduated Sizing Gate (v7.4) ──────────────────────────────
+        # Replaces binary block with size scaling. Hard block only on BTC crash (<0.25).
+        # Quality override: strong signals get boosted BTC scale (up to 1.0x).
         _is_strategy_signal = bool(setup.get("strategy", ""))
         if _direction == "long" and not _is_strategy_signal:
             _base = symbol.replace("/USDT", "").replace(":USDT", "")
             _is_short_token = any(_base.endswith(sfx) for sfx in ("3S", "5S", "DOWN"))
-            if not _is_short_token and not _btc_trend_on:
-                trace["steps"].append(f"skip_btc_trend_off:{symbol}")
+            if not _is_short_token and _btc_size_scale == 0.0:
+                trace["steps"].append(f"skip_btc_crash:{symbol}")
                 logger.info(
-                    f"[Swarm] {symbol} BLOCKED: BTC trend switch OFF "
-                    f"(score={_btc_momentum['score']:.2f} < {_btc_threshold:.2f}). Waiting for uptrend."
+                    f"[Swarm] {symbol} HARD BLOCKED: BTC crash "
+                    f"(score={_btc_score:.2f} < 0.25). Protecting capital."
                 )
                 continue
 
