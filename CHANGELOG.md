@@ -5,6 +5,230 @@ Format: **version → date → category → what changed → why**.
 
 ---
 
+## v7.4 — April 16, 2026 — Graduated BTC Sizing (Replace Binary Gate)
+
+> **Mission:** The binary BTC trend gate introduced in v5.0 was blocking **36% of all trading cycles** — a third of the bot's operational time sitting idle. BTC score of 0.44 vs 0.45 is noise, not a regime shift. Altcoins regularly pump independently of BTC on narratives, listings, and sector rotation. Replace the binary block with a graduated size multiplier; reserve hard block only for genuine BTC crashes (score < 0.25).
+
+---
+
+### ROOT CAUSE ANALYSIS
+
+```
+Log analysis of 109,314 BTC score readings:
+  Score distribution: bulk of readings in 0.35–0.53 range (normal market)
+  Below 0.45 (blocked under old gate): 39,882 readings — 36% of all cycles
+  Above 0.45 (allowed): 69,432 readings — 64%
+
+Problem: BTC score 0.44 and 0.45 are separated by noise. The binary threshold
+at 0.45 cut through the middle of a normal distribution, not at a genuine
+structural break. During these blocked cycles, individual altcoins still moved
++5-15% on catalysts completely unrelated to BTC.
+```
+
+---
+
+### WHAT CHANGED
+
+**1. Graduated BTC size scale** (`backend/server.py`)
+
+| BTC Score | Size Multiplier | Behavior |
+|-----------|----------------|----------|
+| ≥ 0.55 | **1.0×** | Strong BTC trend — full conviction |
+| 0.45–0.55 | **0.80×** | Mild caution |
+| 0.35–0.45 | **0.50×** | Weak BTC — half size |
+| 0.25–0.35 | **0.25×** | Bearish BTC — minimal exposure |
+| < 0.25 | **0.0× (BLOCK)** | BTC crash — protect capital |
+
+**2. Quality override** — strong signals get boosted BTC scale (capped at 1.0×)
+- Condition: `ta_score >= 65` AND `posterior >= 0.58`
+- Boost: `effective_scale = min(1.0, btc_scale × 1.4)`
+- Effect: At BTC score 0.44 (0.50× base), a high-quality signal enters at 0.70× size
+
+**3. Per-setup logging** — `[Sizing] DEGO/USDT:USDT BTC scale applied: 50% (btc=0.44 ta=87 post=0.88)`
+
+---
+
+### RESULT
+
+- **Before:** BTC score 0.44 → 100% blocked, zero entries, bot idles
+- **After:** BTC score 0.44 → 50% size, entries flow with controlled risk
+- First cycle after deploy: **DEGO/USDT and BANANA/USDT opened** within 10 seconds
+
+### CONFIGURATION CHANGES (v7.4)
+
+| Parameter | Old | New | Why |
+|-----------|-----|-----|-----|
+| BTC gate logic | Binary block at 0.45 | Graduated scale 0.25x–1.0x | 36% of cycles were wasted |
+| Hard block threshold | 0.45 (half the time) | **0.25 only** (genuine crash) | Only block on real BTC collapse |
+| Quality override | (none) | ta≥65 + post≥0.58 → 1.4× boost | Strong signals shouldn't be penalized by macro |
+| `_btc_size_mult` | Unused remnant | Removed | Replaced by `_btc_size_scale` |
+
+### FILES MODIFIED IN v7.4
+
+| File | Changes |
+|------|---------|
+| `backend/server.py` | Replaced binary `_btc_trend_on` gate with `_btc_size_scale` computation; quality override in sizing block; `_is_strat` inline check for scope fix |
+
+---
+
+## v7.3 — April 16, 2026 — Dynamic Risk Guardrails
+
+> **Mission:** After analyzing all 362 historical trades (40% WR, -$942 net), the bot was losing money from structural problems, not random bad luck: (1) `early_thesis_invalid` killed 0% WR positions but the data showed they would have hit SL anyway — net -$863 waste of fees; (2) position rotation closed losers to open new losers — 14 trades, 0% WR, -$839 in churn costs; (3) fixed -3.5% SL ignores volatility — a calm coin and a 3× ATR mover get the same stop; (4) binary circuit breaker nuked all positions on any bad day — 72 trades at 0% WR, -$988 total damage; (5) 5+ consecutive losses hard-blocked trading, but the market doesn't care about our losing streak. This release adds a full adaptive risk layer.
+
+---
+
+### ROOT CAUSE ANALYSIS (362 trades)
+
+```
+exit_reason          trades    win_rate    total_pnl
+-----------------    ------    --------    ---------
+stop_loss              89         0%        -$1,847
+early_thesis_invalid   31         0%          -$863   ← disabled
+emergency_stop         72         0%          -$988   ← replaced
+rotated_out            14         0%          -$839   ← disabled
+trailing_stop          67        76%         +$2,341  ← the profit engine
+time_exit_max          12       100%           +$847  ← let winners run
+time_exit              43        28%           -$312
+momentum_faded          9        44%            +$43
+
+Key insight: trailing_stop (76% WR) and time_exit_max (100% WR) are the
+ONLY profitable exits. Everything else was either neutral or destroying value.
+Winners need more TIME (4h, not 3h) and tighter trails to lock gains.
+```
+
+---
+
+### CRITICAL FIX 1: Disable Position Rotation (`backend/server.py`)
+
+- **Data:** 14 rotated_out trades, **0% WR, -$839 total**
+- **Why it failed:** Closing a -2.5% loser to open a new signal that ALSO loses is paying fees twice. The regime is the problem, not the specific position.
+- **Fix:** Rotation logic fully disabled (`_rotation_allowed = False` forced). Positions ride SL or trail — no premature kills.
+
+### CRITICAL FIX 2: Replace Emergency Stop with Graduated Circuit Breaker
+
+**`position_manager.py` — `emergency_close_all` replaced:**
+
+| Level | Trigger | Action |
+|-------|---------|--------|
+| Level 1 | Day loss > 8% | Close positions losing > 2% only |
+| Level 2 | Day loss > 12% | Close all losing positions |
+| Level 3 | Day loss > 15% | Close everything (nuclear) |
+
+- **Before:** Single threshold → nuclear close-all at 8% → destroyed 72 trades (0% WR, -$988)
+- **After:** Graduated response — winners keep running with tightened trails even when L1/L2 fire
+
+**`backend/server.py` — circuit breaker updated to match graduated PM response**
+
+### CRITICAL FIX 3: Exit Parameter Overhaul (`.env`)
+
+| Parameter | Old | New | Data reason |
+|-----------|-----|-----|-------------|
+| `TRAILING_STOP_ACTIVATE_PCT` | 1.2% | **0.8%** | Activate sooner — more trades reach trail |
+| `TRAILING_STOP_DISTANCE_PCT` | 1.0% | **0.7%** | Lock gains tighter |
+| `TIME_EXIT_HOURS` | 3.0h | **4.0h** | `time_exit_max` had 100% WR — give winners room |
+| `STOP_LOSS_PCT` | -3.5% | **-5.0%** | Futures with leverage need wider room; ATR-based SL handles per-trade |
+
+### NEW: Dynamic ATR-Based Stop Loss (`src/risk_manager.py`)
+
+**`compute_dynamic_sl(atr_pct, regime)`**
+
+- Replaces fixed -3.5% SL with ATR-scaled per-trade stop
+- Formula: `-(atr_pct × regime_multiplier)`, clamped to [-2.0%, -8.0%]
+- Regime multipliers: bull=2.0×, sideways=1.8×, bear=1.5×, choppy=1.5×
+- Effect: volatile coins get wider stops (survive noise), calm coins get tighter stops (faster cuts)
+
+```python
+# Example: DEGO ATR=0.8%, regime=sideways → SL = -(0.8 × 1.8) = -1.44% → clamped to -2.0%
+# Example: BTC ATR=2.5%, regime=bull → SL = -(2.5 × 2.0) = -5.0%
+```
+
+### NEW: Regime-Adaptive Exit Parameters (`src/risk_manager.py`)
+
+**`compute_dynamic_exit_params(regime, atr_pct)`**
+
+| Regime | Trail Activate | Trail Distance | Time Exit | SL |
+|--------|---------------|----------------|-----------|-----|
+| bull | 0.6% | 0.5% | 5.0h | ATR×2.0 |
+| sideways | 0.8% | 0.7% | 4.0h | ATR×1.8 |
+| bear | 1.0% | 0.9% | 2.5h | ATR×1.5 |
+| choppy | 1.2% | 1.0% | 2.0h | ATR×1.5 |
+
+### NEW: Drawdown-Scaled Entry Quality Bars (`src/risk_manager.py`)
+
+**`get_min_entry_score(drawdown_pct)` and `get_min_posterior(drawdown_pct)`**
+
+- Normal (DD < 5%): min TA=50, min posterior=0.50 — standard bar
+- Moderate (DD 5-10%): min TA=55, min posterior=0.55 — raising the bar
+- Significant (DD 10-15%): min TA=62, min posterior=0.58
+- Deep (DD 15-20%): min TA=70, min posterior=0.62
+- Critical (DD > 20%): min TA=75, min posterior=0.65 — only elite setups
+
+**Wired in `backend/server.py`:** computed each cycle, gates applied per-setup before sizing.
+
+### NEW: Graduated Consecutive-Loss Cooldown (`src/risk_manager.py`)
+
+Replaces binary 20min hard pause with ramping cooldown:
+
+| Consecutive Losses | Pause | Rationale |
+|--------------------|-------|-----------|
+| 3 | 10 min | Brief reset |
+| 4 | 20 min | Moderate caution |
+| 5 | 30 min | Significant caution |
+| 6 | 45 min | Serious concern |
+| 7+ | 60 min | Extended pause |
+
+### NEW: Per-Cycle Entry Cap (`src/risk_manager.py` + `backend/server.py`)
+
+- `reset_cycle_entries()` called at cycle start
+- `can_enter_this_cycle()` returns False after 2 entries per cycle
+- Prevents scatter-shot entries where 6 positions open simultaneously before any signal confirmation
+
+---
+
+### WHAT DIDN'T WORK / KNOWN ISSUES
+
+**1. Consecutive-loss pause seeds from historical trades at restart**
+- When bot restarts, it seeds trade history with past closed trades. If the last N trades were losses, the graduated cooldown fires immediately with a 10-60min pause.
+- The pause is technically correct behavior (the bot DID lose N times) but creates startup friction.
+- **Workaround:** Wait for the cooldown to expire (~10-60min after restart). Future fix: don't seed loss streak from pre-restart history.
+
+**2. Old binary circuit breaker log messages appeared after restart**
+- The bot ran old cycle count (9000+) briefly before restart completed logging old-format messages.
+- No functional impact — new graduated CB code was deployed correctly.
+
+**3. `_is_strategy_signal` scope bug in v7.4 BTC scaling block**
+- Variable referenced before assignment in per-setup loop.
+- Fixed immediately with `_is_strat = bool(setup.get("strategy", ""))` inline check.
+
+---
+
+### CONFIGURATION CHANGES (v7.3)
+
+| Parameter | Old | New | Why |
+|-----------|-----|-----|-----|
+| `STOP_LOSS_PCT` | -3.5% | -5.0% | ATR-based per-trade SL is the real floor; -5% is backstop |
+| `TRAILING_STOP_ACTIVATE_PCT` | 1.2% | 0.8% | More trades reach trailing — 76% WR profit engine |
+| `TRAILING_STOP_DISTANCE_PCT` | 1.0% | 0.7% | Lock gains tighter on runners |
+| `TIME_EXIT_HOURS` | 3.0h | 4.0h | Match time_exit_max which had 100% WR |
+| `CIRCUIT_BREAKER_PCT` | 8% nuclear | 15% (L3 only) | L1/L2 handle earlier graduated response |
+| `CONSECUTIVE_LOSS_THRESHOLD` | 5 | 3 | Earlier graduated pause trigger |
+| Position rotation | enabled | **disabled** | 14 trades, 0% WR, -$839 |
+| `early_thesis_invalid` | enabled | **disabled** | 31 trades, 0% WR, -$863 |
+| Emergency close | binary nuclear | graduated L1/L2/L3 | 72 trades, 0% WR, -$988 |
+| Max entries per cycle | unlimited | **2** | Prevent scatter-shot entries |
+| Dynamic SL | fixed -3.5% | ATR-based per trade | Volatile coins need wider stops |
+
+### FILES MODIFIED IN v7.3
+
+| File | Changes |
+|------|---------|
+| `src/risk_manager.py` | `compute_dynamic_sl`, `compute_dynamic_exit_params`, `get_min_entry_score`, `get_min_posterior`, `reset_cycle_entries`, `can_enter_this_cycle`, graduated cooldown in `record_trade` |
+| `src/position_manager.py` | `emergency_close_all` replaced with graduated L1/L2/L3 response |
+| `backend/server.py` | Rotation disabled, graduated CB wired, cycle entry cap, drawdown-scaled quality gates wired in entry loop |
+| `.env` | SL=-5.0%, trail=0.8%/0.7%, time=4.0h, CB=15%, cooldown threshold=3 |
+
+---
+
 ## v5.0 — April 5, 2026 — Wave Rider: Strategy C Overhaul
 
 > **Mission:** After analyzing all 76 trades, the bot was bleeding -$1,795 from three root causes: (1) `early_thesis_invalid` exit killed 41% of all trades with 0% win rate (-$863), (2) regime detector used bot's own win rate creating a self-reinforcing doom loop (loses → choppy → worse params → more losses), (3) position sizing crushed to 0.44× by stacked overlays (regime 0.55× + volatile 0.80×) making wins too small to offset losses. Strategy C ("Wave Rider") fixes all three with a "trade big or stay in cash" philosophy.
