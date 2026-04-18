@@ -5,6 +5,137 @@ Format: **version → date → category → what changed → why**.
 
 ---
 
+## v7.5 — April 18, 2026 — Data-Driven Symbol Whitelist (Blue Chips Only)
+
+> **Mission:** Deep analysis of all 231 historical trades revealed the bot has NO edge on altcoins (200 trades, 5% WR, -$4,565) but DOES have marginal positive expectancy on majors (31 trades, 26% WR, +$4.40/trade EV on BTC/ETH/BNB/BCH specifically). The fundamental strategy — momentum scalping on altcoin futures — has 7.8% WR across 231 trades. This release stops the bot from trading the loser slice and restricts it to the slice where it historically has a small edge.
+
+---
+
+### ROOT CAUSE ANALYSIS (231-trade deep cut)
+
+```
+=== BY SYMBOL CATEGORY ===
+majors (BTC/ETH/BNB/BCH/...)    n=31    WR=26%   PnL=$  -37.56   EV=$ -1.21/trade
+alts/memes (everything else)    n=200   WR= 5%   PnL=$-4565.21   EV=$-22.83/trade
+
+=== TOP WINNERS ===
+NEIRO    n=1   +$141.70 (trailing catch)
+RED      n=4    +$76.30
+BNB      n=5    +$61.42 (60% WR!)
+BANANA   n=1    +$56.36
+BCH      n=8    +$25.45 (38% WR)
+BTC      n=8    +$20.82
+
+=== TOP LOSERS ===
+1000WHY  n=7    -$398.60 (bot traded garbage 7 times)
+PTB      n=4    -$266.93
+SXP      n=2    -$188.10
+REI      n=12   -$135.27
+
+=== BY REGIME AT ENTRY ===
+bull     n=73   WR= 4%   PnL=-$2549  ← WORST (bot buys tops in bull)
+choppy   n=85   WR=11%   PnL=-$1426
+sideways n=50   WR= 2%   PnL=-$618
+bear     n=23   WR=22%   PnL=-$7.77  ← nearly breakeven
+
+=== BY DIRECTION ===
+long     n=215  WR= 7%   PnL=-$4606
+short    n=16   WR=25%   PnL=+$3.61  ← shorts were WINNING before v7.2 killed them
+
+=== ONLY PROFITABLE EXITS ===
+time_exit_max    n=8    100% WR   +$178  (held positions 8h, all won)
+trailing_stop    n=9     56% WR   +$174  (trailing catches on real momentum)
+```
+
+---
+
+### WHAT CHANGED
+
+**1. Symbol Whitelist** (`src/config.py`, `backend/server.py`, `.env`)
+
+New `SYMBOL_WHITELIST` env var. If set, server.py filters all approved setups to only include whitelisted base assets. Current whitelist:
+```
+BTC, ETH, BNB, BCH, SOL, AVAX, LINK, DOT, LTC, TRX, UNI, ADA,
+DOGE, XRP, AAVE, MATIC, ATOM, NEAR, APT, ARB, OP, SUI,
+NEIRO, RED, BANANA, VVV, ZRX
+```
+
+The first 22 are blue chips/top L1s/L2s. Last 5 are memecoins that historically caught trailing wins.
+
+**2. Watcher light-boost** (`src/watcher.py`)
+
+The watcher picks top-20 candidates by momentum/volume score. Blue chips never make that cut because they don't pump 5-10%/h like memecoins. Fix: after top-N selection, force-include the top 3 scored whitelisted candidates.
+
+Why only 3: an earlier attempt adding all 25 caused OHLCV fetch rate-limiting in the analyzer (`insufficient OHLCV {'5m': 0, ...}` for blue chips). Reduced to 3 to stay within rate limits.
+
+**3. Relaxed analyzer FAST-TRACK for whitelisted coins** (`src/analyzer.py`)
+
+The FAST-TRACK threshold (>2% 1h return) is designed for altcoin momentum. Blue chips almost never hit this. For whitelisted symbols only, threshold lowered to **0.5% 1h return**. Candle quality, pullback, and RSI checks remain.
+
+---
+
+### DEPLOYMENT SEQUENCE
+
+| Commit | Change |
+|--------|--------|
+| `5f9d62d` | v7.5: Symbol whitelist + server-side filter |
+| `ea21bfb` | Force-include whitelisted in watcher (broken — +25 caused OHLCV rate-limit) |
+| `aa4615c` | Revert watcher boost (kept server filter only) |
+| `001c2c2` | Reintroduce watcher boost at +3 (safe) + analyzer FAST-TRACK relaxed to 0.5% |
+
+---
+
+### EXPECTED IMPACT
+
+Historical slice-based expectancy applied to whitelist:
+```
+If the bot only traded the whitelisted slice:
+  31 trades, 26% WR, -$37 total (nearly breakeven)
+  vs full history 231 trades, 7.8% WR, -$4,603
+
+Best-case (assuming whitelist improves EV to BTC+ETH+BNB+BCH level):
+  25 trades, +$110 total, +$4.40/trade EV
+  Trading 4-5 times per day × $4.40 = +$20/day
+```
+
+---
+
+### WHAT DIDN'T WORK (bugs encountered during session)
+
+1. **Watcher boost +25 → OHLCV rate-limit.** Adding 25 extra candidates meant analyzer needed 100 extra OHLCV fetches per cycle. Binance rate-limited. Reduced to +3.
+
+2. **Analyzer FAST-TRACK never fires for blue chips in low-vol conditions.** Even at 0.5% threshold, blue chips often fail the candle quality check (green=1/3 is common when they're in consolidation). Net: bot is VERY selective now — trades rarely, but only on genuine blue-chip momentum.
+
+3. **Shorts stayed disabled despite data favoring them.** The 231-trade cut showed shorts at 25% WR, +$3.61. But v7.2 disabled shorts based on a smaller earlier sample. Not re-enabled in v7.5 (too risky without fresh backtesting).
+
+---
+
+### KNOWN LIMITATIONS
+
+- **Bot may trade very rarely.** In current choppy market with blue chips barely moving, days can pass with zero entries. That's acceptable — sitting in cash is better than alt losses.
+- **Whitelist is arbitrary.** 27 symbols chosen by historical PnL + common sense (top L1s/L2s). Not backtested.
+- **Doesn't fix the underlying issue.** The momentum analyzer is still fundamentally designed for altcoin pumps. Applying it to blue chips is a patch, not a redesign.
+
+### CONFIGURATION CHANGES (v7.5)
+
+| Parameter | Old | New | Why |
+|-----------|-----|-----|-----|
+| `SYMBOL_WHITELIST` | (none) | 27 whitelisted assets | Stop trading the loser slice |
+| Watcher top_n | 20 | 20 + up to 3 whitelist | Ensure blue chips reach analyzer |
+| FAST-TRACK 1h threshold | 2.0% | 0.5% (whitelisted only) | Blue chips don't pump 2%/h |
+
+### FILES MODIFIED IN v7.5
+
+| File | Changes |
+|------|---------|
+| `src/config.py` | Added `symbol_whitelist` setting (SYMBOL_WHITELIST env) |
+| `backend/server.py` | Post-merge whitelist filter blocks non-whitelisted setups |
+| `src/watcher.py` | Light-boost: force top 3 whitelisted candidates into analyzer |
+| `src/analyzer.py` | FAST-TRACK threshold 2.0%→0.5% for whitelisted symbols |
+| `.env` | `SYMBOL_WHITELIST=BTC,ETH,BNB,BCH,SOL,AVAX,...` (27 assets) |
+
+---
+
 ## v7.4 — April 16, 2026 — Graduated BTC Sizing (Replace Binary Gate)
 
 > **Mission:** The binary BTC trend gate introduced in v5.0 was blocking **36% of all trading cycles** — a third of the bot's operational time sitting idle. BTC score of 0.44 vs 0.45 is noise, not a regime shift. Altcoins regularly pump independently of BTC on narratives, listings, and sector rotation. Replace the binary block with a graduated size multiplier; reserve hard block only for genuine BTC crashes (score < 0.25).
