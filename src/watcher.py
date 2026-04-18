@@ -298,8 +298,8 @@ class WatcherAgent:
         ticker = candidate["ticker"]
         direction = candidate.get("direction", "long")
 
-        candles = await self._fetch_ohlcv_cached(symbol, "5m", 60)
-        if candles is None or len(candles) < 30:
+        candles = await self._fetch_ohlcv_cached(symbol, "1h", 200)
+        if candles is None or len(candles) < 200:
             return None
 
         candles_np = np.array(candles)
@@ -309,291 +309,86 @@ class WatcherAgent:
         score = 0.0
         score_breakdown = {}
 
-        # ── Volume spike (same for both directions — momentum is momentum) ─
-        avg_vol = float(np.mean(volumes[-20:])) if len(volumes) >= 20 else float(np.mean(volumes))
+        price = ticker.get("last") or float(closes[-1])
+
+        # ── EMA Ribbon Alignment (1H) ──────────────────────────────────────
+        ema5 = _ema(closes, 5)
+        ema20 = _ema(closes, 20)
+        ema50 = _ema(closes, 50)
+        ema100 = _ema(closes, 100)
+        ema200 = _ema(closes, 200)
+        
+        ema_pts = 0.0
+        ema_fully_aligned = False
+        
+        if for_short:
+            # Bearish stack: EMA5 < EMA20 < EMA50 < EMA100 < EMA200
+            if ema5 < ema20 < ema50:
+                ema_pts += 20.0
+                if ema50 < ema100: ema_pts += 10.0
+                if ema100 < ema200: ema_pts += 10.0
+            if ema_pts >= 40.0: ema_fully_aligned = True
+        else:
+            # Bullish stack: EMA5 > EMA20 > EMA50 > EMA100 > EMA200
+            if ema5 > ema20 > ema50:
+                ema_pts += 20.0
+                if ema50 > ema100: ema_pts += 10.0
+                if ema100 > ema200: ema_pts += 10.0
+            if ema_pts >= 40.0: ema_fully_aligned = True
+
+        score += ema_pts
+        score_breakdown["ema_ribbon"] = ema_pts
+
+        # ── Pullback Penalty / Bonus ──────────────────────────────────────
+        pullback_pts = 0.0
+        if for_short:
+            # Wait for price to bounce BACK UP into the EMAs
+            if ema5 > price > ema20: pullback_pts = 25.0     # shallow pullback
+            elif ema20 >= price > ema50: pullback_pts = 35.0 # deep pullback (ideal)
+            elif price < ema5 * 0.97: pullback_pts = -30.0   # overextended dump, don't chase
+        else:
+            # Wait for price to pull BACK DOWN into the EMAs
+            if ema5 < price < ema20: pullback_pts = 25.0     # shallow pullback
+            elif ema20 <= price < ema50: pullback_pts = 35.0 # deep pullback (ideal)
+            elif price > ema5 * 1.03: pullback_pts = -30.0   # overextended pump, don't chase
+
+        score += pullback_pts
+        score_breakdown["pullback"] = pullback_pts
+
+        # ── Volume Spike ──────────────────────────────────────────────────
+        avg_vol = float(np.mean(volumes[-24:])) if len(volumes) >= 24 else float(np.mean(volumes))
         curr_vol = float(volumes[-1])
         vol_ratio = curr_vol / avg_vol if avg_vol > 0 else 1.0
-        if vol_ratio >= 10.0:
-            vol_pts = 40.0
-        elif vol_ratio >= 5.0:
-            vol_pts = 30.0 + (vol_ratio - 5.0) * 2.0
-        elif vol_ratio >= 3.0:
-            vol_pts = 20.0 + (vol_ratio - 3.0) * 5.0
-        elif vol_ratio >= 2.0:
-            vol_pts = 10.0 + (vol_ratio - 2.0) * 10.0
-        elif vol_ratio >= 1.5:
-            vol_pts = 3.0 + (vol_ratio - 1.5) * 14.0
-        else:
-            vol_pts = 0.0
-        vol_pts = min(40.0, vol_pts)
+        
+        vol_pts = 0.0
+        if vol_ratio >= 2.0: vol_pts = 20.0
+        elif vol_ratio >= 1.5: vol_pts = 10.0
+        elif vol_ratio >= 1.2: vol_pts = 5.0
+        
         score += vol_pts
-        score_breakdown["volume_spike"] = vol_pts
+        score_breakdown["volume"] = vol_pts
 
-        # ── RSI ───────────────────────────────────────────────────────────
+        # ── RSI Pullback Reset ────────────────────────────────────────────
         rsi = _compute_rsi(closes, 14)
+        rsi_pts = 0.0
         if for_short:
-            # FUTURES SHORT: reward bearish RSI zone 25-45 (downward momentum,
-            # not yet oversold/bouncing). RSI > 55 = bullish = bad for short.
-            if 25 <= rsi <= 45:
-                rsi_pts = 15.0
-            elif 45 < rsi <= 50:
-                rsi_pts = 8.0
-            elif 20 <= rsi < 25:
-                rsi_pts = 5.0  # too oversold, bounce risk
-            elif rsi < 20:
-                rsi_pts = 0.0  # heavily oversold, don't short
-            else:
-                rsi_pts = max(0.0, 15.0 * (55.0 - rsi) / 15.0)  # fade as RSI rises
-        elif not inverted:
-            # LONG: favour upward momentum zone 55-75
-            if 55 <= rsi <= 75:
-                rsi_pts = 15.0
-            elif 50 <= rsi < 55:
-                rsi_pts = 10.0
-            elif rsi > 75:
-                rsi_pts = max(0.0, 15.0 * (90.0 - rsi) / 15.0)
-            else:
-                rsi_pts = max(0.0, 15.0 * (rsi - 35.0) / 20.0)
-        else:
-            # SHORT token: these tokens rise when underlying falls.
-            # Score highest when RSI of the SHORT TOKEN itself is in bullish zone 55-75
-            if 55 <= rsi <= 75:
-                rsi_pts = 15.0
-            elif 50 <= rsi < 55:
-                rsi_pts = 10.0
-            elif rsi > 75:
-                rsi_pts = max(0.0, 15.0 * (90.0 - rsi) / 15.0)
-            else:
-                rsi_pts = max(0.0, 15.0 * (rsi - 35.0) / 20.0)
+            # Want RSI to have bounced up a bit, but still in bearish territory
+            if 42 <= rsi <= 60: rsi_pts = 15.0
+            elif 35 <= rsi < 42: rsi_pts = 5.0
+            elif rsi < 30: rsi_pts = -20.0  # severely oversold dump
+            elif rsi > 70: rsi_pts = -20.0  # no longer bearish
+        else: 
+            # Want RSI to have cooled off but still in bullish territory
+            if 40 <= rsi <= 58: rsi_pts = 15.0
+            elif 58 < rsi <= 65: rsi_pts = 5.0
+            elif rsi > 70: rsi_pts = -20.0  # overbought, chasing
+            elif rsi < 30: rsi_pts = -20.0  # severely oversold, trend dead
+
         score += rsi_pts
-        score_breakdown["rsi"] = rsi_pts
-
-        # ── MACD histogram ────────────────────────────────────────────────
+        score_breakdown["rsi_pullback"] = rsi_pts
+        
         macd_hist = _compute_macd_hist(closes, 12, 26, 9)
-        if for_short:
-            # FUTURES SHORT: reward negative MACD histogram (bearish momentum)
-            macd_pts = min(20.0, max(0.0, abs(macd_hist) * 60.0)) if macd_hist < 0 else 0.0
-        elif not inverted:
-            macd_pts = min(20.0, max(0.0, macd_hist * 60.0)) if macd_hist > 0 else 0.0
-        else:
-            # Short token: MACD > 0 means the short token is trending up = good
-            macd_pts = min(20.0, max(0.0, macd_hist * 60.0)) if macd_hist > 0 else 0.0
-        score += macd_pts
-        score_breakdown["macd"] = macd_pts
-
-        # ── Candle direction ──────────────────────────────────────────────
-        if len(closes) >= 4:
-            if for_short:
-                # FUTURES SHORT: consecutive RED candles = selling pressure
-                momentum_count = sum(1 for i in range(-3, 0) if closes[i] < closes[i - 1])
-            elif not inverted:
-                # LONG: consecutive green candles
-                momentum_count = sum(1 for i in range(-3, 0) if closes[i] > closes[i - 1])
-            else:
-                # SHORT TOKEN: consecutive green candles on the token itself
-                momentum_count = sum(1 for i in range(-3, 0) if closes[i] > closes[i - 1])
-            momentum_pts = momentum_count * 6.0
-        else:
-            momentum_pts = 0.0
-        score += momentum_pts
-        score_breakdown["momentum"] = momentum_pts
-
-        # ── OBV trend (10-bar slope) ──────────────────────────────────────
-        obv = _compute_obv(closes, volumes)
-        if len(obv) >= 10:
-            obv_slope = (obv[-1] - obv[-10]) / (abs(obv[-10]) + 1e-9)
-            if for_short:
-                # FUTURES SHORT: negative OBV = money flowing OUT = selling pressure
-                obv_pts = min(15.0, max(0.0, abs(obv_slope) * 15.0)) if obv_slope < 0 else 0.0
-            elif not inverted:
-                obv_pts = min(15.0, max(0.0, obv_slope * 15.0))
-            else:
-                # Short token: positive OBV on the token = money flowing into it = good
-                obv_pts = min(15.0, max(0.0, obv_slope * 15.0))
-        else:
-            obv_pts = 0.0
-        score += obv_pts
-        score_breakdown["obv"] = obv_pts
-
-        # ── Rate of Change (12-bar) ───────────────────────────────────────
-        if len(closes) >= 13:
-            roc = (closes[-1] - closes[-13]) / closes[-13] * 100
-            if for_short:
-                # FUTURES SHORT: reward negative ROC (price falling)
-                if roc <= -3.0:
-                    roc_pts = min(20.0, abs(roc) * 2.5)
-                elif roc < 0:
-                    roc_pts = abs(roc) * 3.0
-                else:
-                    roc_pts = 0.0
-            elif not inverted:
-                if roc >= 3.0:
-                    roc_pts = min(20.0, roc * 2.5)
-                elif roc > 0:
-                    roc_pts = roc * 3.0
-                else:
-                    roc_pts = 0.0
-            else:
-                if roc >= 3.0:
-                    roc_pts = min(20.0, roc * 2.5)
-                elif roc > 0:
-                    roc_pts = roc * 3.0
-                else:
-                    roc_pts = 0.0
-        else:
-            roc_pts = 0.0
-        score += roc_pts
-        score_breakdown["roc"] = roc_pts
-
-        # ── EMA alignment ─────────────────────────────────────────────────
-        ema9 = _ema(closes, 9)
-        ema21 = _ema(closes, 21)
-        ema50 = _ema(closes, 50) if len(closes) >= 50 else None
-        if for_short:
-            # FUTURES SHORT: reward bearish EMA alignment (death cross)
-            ema_aligned = ema9 < ema21
-            ema_fully_aligned = (ema9 < ema21 < ema50) if ema50 is not None else False
-        elif not inverted:
-            ema_aligned = ema9 > ema21
-            ema_fully_aligned = (ema9 > ema21 > ema50) if ema50 is not None else False
-        else:
-            ema_aligned = ema9 > ema21
-            ema_fully_aligned = (ema9 > ema21 > ema50) if ema50 is not None else False
-        ema_pts = 15.0 if ema_fully_aligned else (8.0 if ema_aligned else 0.0)
-        score += ema_pts
-        score_breakdown["ema"] = ema_pts
-
-        # ── 1h price return (from 5m candles) — THE momentum signal ─────────
-        # This directly captures "SOL just pumped 5%". If close now > close 12 bars
-        # ago (= 1 hour on 5m) the token is ACTUALLY moving, not just noisy.
-        if len(closes) >= 13:
-            return_1h = (closes[-1] - closes[-13]) / closes[-13] * 100.0
-        else:
-            return_1h = 0.0
-        if for_short:
-            # FUTURES SHORT: reward negative 1h return (token is DUMPING)
-            abs_ret = abs(return_1h)
-            if return_1h <= -5.0:
-                ret1h_pts = 35.0
-            elif return_1h <= -3.0:
-                ret1h_pts = 25.0
-            elif return_1h <= -2.0:
-                ret1h_pts = 18.0
-            elif return_1h <= -1.0:
-                ret1h_pts = 10.0
-            elif return_1h <= -0.5:
-                ret1h_pts = 5.0
-            else:
-                ret1h_pts = 0.0
-        elif not inverted:
-            if return_1h >= 5.0:
-                ret1h_pts = 35.0
-            elif return_1h >= 3.0:
-                ret1h_pts = 25.0
-            elif return_1h >= 2.0:
-                ret1h_pts = 18.0
-            elif return_1h >= 1.0:
-                ret1h_pts = 10.0
-            elif return_1h >= 0.5:
-                ret1h_pts = 5.0
-            else:
-                ret1h_pts = 0.0
-        else:
-            if return_1h >= 5.0:
-                ret1h_pts = 35.0
-            elif return_1h >= 3.0:
-                ret1h_pts = 25.0
-            elif return_1h >= 1.0:
-                ret1h_pts = 10.0
-            else:
-                ret1h_pts = 0.0
-        score += ret1h_pts
-        score_breakdown["return_1h"] = ret1h_pts
-
-        # ── 24h trend bonus — momentum requires strong daily price action ───
         pct_change_24h = float(ticker.get("percentage") or 0.0)
-        if for_short:
-            # FUTURES SHORT: reward negative 24h trend (sustained selling)
-            abs_24h = abs(pct_change_24h)
-            if pct_change_24h <= -10.0:
-                trend_pts = 25.0
-            elif pct_change_24h <= -5.0:
-                trend_pts = 18.0
-            elif pct_change_24h <= -2.0:
-                trend_pts = 10.0
-            elif pct_change_24h <= -1.0:
-                trend_pts = 5.0
-            else:
-                trend_pts = 0.0
-        else:
-            if pct_change_24h >= 10.0:
-                trend_pts = 25.0
-            elif pct_change_24h >= 5.0:
-                trend_pts = 18.0
-            elif pct_change_24h >= 2.0:
-                trend_pts = 10.0
-            elif pct_change_24h >= 1.0:
-                trend_pts = 5.0
-            else:
-                trend_pts = 0.0
-        score += trend_pts
-        score_breakdown["trend_24h"] = trend_pts
-
-        # ── ANTI-CHASE penalty ───────────────────────────────────────────
-        if for_short:
-            # FUTURES SHORT anti-chase: if price bounced >2% from recent LOW,
-            # the dump is OVER and it's recovering — don't short a reversal.
-            if len(candles_np) >= 12:
-                recent_lows = candles_np[-12:, 3].astype(float)  # column 3 = low
-                recent_low = float(np.min(recent_lows))
-                if recent_low > 0 and closes[-1] > 0:
-                    bounce_pct = (closes[-1] - recent_low) / recent_low * 100.0
-                    if bounce_pct >= 5.0:
-                        chase_penalty = -35.0
-                    elif bounce_pct >= 3.0:
-                        chase_penalty = -25.0
-                    elif bounce_pct >= 2.0:
-                        chase_penalty = -15.0
-                    elif bounce_pct >= 1.0:
-                        chase_penalty = -8.0
-                    else:
-                        chase_penalty = 0.0
-                    score += chase_penalty
-                    score_breakdown["anti_chase"] = chase_penalty
-            # Penalty for GREEN candle sequence (momentum reversing UP)
-            if len(closes) >= 5:
-                green_count = sum(1 for i in range(-4, 0) if closes[i] > closes[i - 1])
-                if green_count >= 3:
-                    green_penalty = -12.0
-                    score += green_penalty
-                    score_breakdown["bullish_candles_penalty"] = green_penalty
-        else:
-            # LONG anti-chase: pullback from recent high
-            if len(candles_np) >= 12:
-                recent_highs = candles_np[-12:, 2].astype(float)  # column 2 = high
-                recent_high = float(np.max(recent_highs))
-                if recent_high > 0 and closes[-1] > 0:
-                    pullback_pct = (recent_high - closes[-1]) / recent_high * 100.0
-                    if pullback_pct >= 5.0:
-                        chase_penalty = -35.0
-                    elif pullback_pct >= 3.0:
-                        chase_penalty = -25.0
-                    elif pullback_pct >= 2.0:
-                        chase_penalty = -15.0
-                    elif pullback_pct >= 1.0:
-                        chase_penalty = -8.0
-                    else:
-                        chase_penalty = 0.0
-                    score += chase_penalty
-                    score_breakdown["anti_chase"] = chase_penalty
-
-            # Penalty for RED candle sequence (bearish) on longs
-            if len(closes) >= 5 and not inverted:
-                red_count = sum(1 for i in range(-4, 0) if closes[i] < closes[i - 1])
-                if red_count >= 3:
-                    red_penalty = -12.0
-                    score += red_penalty
-                    score_breakdown["bearish_candles"] = red_penalty
         price = ticker.get("last") or 0.0
         vol_usd = candidate["vol_usd"]
         setup_type = "momentum_short" if (inverted or for_short) else "momentum"

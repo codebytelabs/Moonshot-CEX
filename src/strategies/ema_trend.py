@@ -54,7 +54,7 @@ class EMATrendStrategy(BaseStrategy):
         # Need both 1H and 4H data
         data_1h = tf_data.get("1h")
         data_4h = tf_data.get("4h")
-        if data_1h is None or len(data_1h) < 60:
+        if data_1h is None or len(data_1h) < 200:
             return None
         if data_4h is None or len(data_4h) < 55:
             return None
@@ -79,42 +79,44 @@ class EMATrendStrategy(BaseStrategy):
         elif price_4h < ema50_4h and ema50_4h < ema50_4h_prev:
             trend_4h = "bear"
 
-        # In bull regime, only take longs. In bear, only shorts.
-        if regime == "bull" and trend_4h == "bear":
+        # In bull regime, only take longs. Overhaul blocked shorts.
+        if regime == "bear":
             return None
-        if regime == "bear" and trend_4h == "bull":
+        if trend_4h == "bear":
+            return None
+            
+        direction = "long"
+
+        # ── 1H Signal: Multi-EMA Ribbon Pullback ─────────────────────────────
+        ema5 = self.ema(closes_1h, 5)
+        ema20 = self.ema(closes_1h, 20)
+        ema50 = self.ema(closes_1h, 50)
+        ema100 = self.ema(closes_1h, 100)
+        ema200 = self.ema(closes_1h, 200)
+        
+        if not ema200 or len(ema200) < 3:
             return None
 
-        # ── 1H Signal: EMA12/50 crossover ────────────────────────────────────
-        ema_fast = self.ema(closes_1h, self.EMA_FAST)
-        ema_slow = self.ema(closes_1h, self.EMA_SLOW)
-        if not ema_fast or not ema_slow or len(ema_fast) < 3 or len(ema_slow) < 3:
+        # 1. EMAs must be stacked (bullish trend)
+        if not (ema5[-1] > ema20[-1] > ema50[-1] > ema100[-1]):
             return None
-
-        # Crossover detection: fast crossed above/below slow in last 3 bars
-        direction = None
-        for i in range(-3, 0):
-            if (ema_fast[i - 1] <= ema_slow[i - 1] and ema_fast[i] > ema_slow[i]):
-                direction = "long"
+            
+        # 2. Check if price is in the pullback zone (has touched near/below EMA20 recently)
+        # But not broken below EMA50
+        price = closes_1h[-1]
+        if price > ema5[-1] * 1.02: 
+            return None # Overextended
+        if price < ema50[-1] * 0.99:
+            return None # Broken structure
+            
+        # Was it above EMA5 recently, and now pulled back?
+        pulled_back = False
+        for i in range(-5, -1):
+            if closes_1h[i] > ema5[i]:
+                pulled_back = True
                 break
-            elif (ema_fast[i - 1] >= ema_slow[i - 1] and ema_fast[i] < ema_slow[i]):
-                direction = "short"
-                break
-
-        if direction is None:
-            # No recent crossover — check if already in trend (riding)
-            if ema_fast[-1] > ema_slow[-1] * 1.002 and trend_4h == "bull":
-                direction = "long"
-            elif ema_fast[-1] < ema_slow[-1] * 0.998 and trend_4h == "bear":
-                direction = "short"
-            else:
-                return None
-
-        # Block shorts in bull regime, longs in bear
-        if direction == "long" and regime == "bear":
-            return None
-        if direction == "short" and regime == "bull":
-            return None
+        if not pulled_back and price > ema20[-1]:
+            return None # Currently just drifting, not a clean pullback
 
         # ── ADX filter: only trade strong trends ─────────────────────────────
         adx = self._compute_adx(highs_1h, lows_1h, closes_1h, self.ADX_PERIOD)
@@ -123,53 +125,37 @@ class EMATrendStrategy(BaseStrategy):
 
         # ── RSI confirmation ─────────────────────────────────────────────────
         rsi_1h = self.rsi(closes_1h, 14)
-        if direction == "long" and rsi_1h > 78:
-            return None  # overbought
-        if direction == "short" and rsi_1h < 22:
-            return None  # oversold
-
+        
+        # We want the RSI to be in the pullback bounce zone
+        if not (40 <= rsi_1h <= 60):
+            return None
+            
         # ── ATR-based stops ──────────────────────────────────────────────────
         atr_val = self.atr(highs_1h, lows_1h, closes_1h, 14)
         if atr_val <= 0:
             return None
 
-        price = closes_1h[-1]
-        if direction == "long":
-            sl = price - atr_val * self.ATR_SL_MULT
-            tp1 = price + atr_val * self.ATR_TP_MULT
-            tp2 = price + atr_val * self.ATR_TP_MULT * 1.5
-            sl_pct = -abs((price - sl) / price * 100)
-        else:
-            sl = price + atr_val * self.ATR_SL_MULT
-            tp1 = price - atr_val * self.ATR_TP_MULT
-            tp2 = price - atr_val * self.ATR_TP_MULT * 1.5
-            sl_pct = -abs((sl - price) / price * 100)
+        sl = price - atr_val * self.ATR_SL_MULT
+        tp1 = price + atr_val * self.ATR_TP_MULT
+        tp2 = price + atr_val * self.ATR_TP_MULT * 1.5
+        sl_pct = -abs((price - sl) / price * 100)
 
         # ── Hard cap SL at MAX_SL_PCT ──────────────────────────────────────
         if sl_pct < self.MAX_SL_PCT:
             sl_pct = self.MAX_SL_PCT
-            if direction == "long":
-                sl = price * (1 + sl_pct / 100)
-            else:
-                sl = price * (1 - sl_pct / 100)
+            sl = price * (1 + sl_pct / 100)
 
         # ── Score ────────────────────────────────────────────────────────────
-        score = 40.0  # base
+        score = 60.0  # High base confidence for this setup
         # ADX strength bonus (25-50 maps to 0-20 pts)
         score += min(20.0, max(0.0, (adx - self.ADX_THRESHOLD) * 0.8))
-        # RSI in trend zone bonus
-        if direction == "long" and 50 <= rsi_1h <= 70:
-            score += 15.0
-        elif direction == "short" and 30 <= rsi_1h <= 50:
-            score += 15.0
-        # 4H trend alignment bonus
-        if (direction == "long" and trend_4h == "bull") or \
-           (direction == "short" and trend_4h == "bear"):
-            score += 15.0
+        # Deep pullback bonus (price closer to EMA50)
+        if price < ema20[-1]:
+            score += 10.0
         # Volume confirmation
         avg_vol = np.mean(volumes_1h[-20:]) if len(volumes_1h) >= 20 else np.mean(volumes_1h)
         vol_ratio = volumes_1h[-1] / avg_vol if avg_vol > 0 else 1.0
-        if vol_ratio > 1.5:
+        if vol_ratio > 1.2:
             score += 10.0
 
         score = min(100.0, score)
@@ -187,8 +173,8 @@ class EMATrendStrategy(BaseStrategy):
             tp1_pct=abs((tp1 - price) / price * 100),
             tp2_pct=abs((tp2 - price) / price * 100),
             confidence=score / 100.0,
-            setup_type="ema_trend_follow",
-            reason=f"EMA{self.EMA_FAST}/{self.EMA_SLOW} cross {direction} ADX={adx:.0f} RSI={rsi_1h:.0f} 4H={trend_4h}",
+            setup_type="ema_ribbon_pullback",
+            reason=f"Multi-EMA Stack Pullback {direction} ADX={adx:.0f} RSI={rsi_1h:.0f} 4H={trend_4h}",
             timeframe="1h",
             trail_activate_pct=self.TRAIL_ACTIVATE_PCT,
             trail_distance_pct=self.TRAIL_DISTANCE_PCT,

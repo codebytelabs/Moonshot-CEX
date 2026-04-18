@@ -226,177 +226,57 @@ class AnalyzerAgent:
                         f"pump exhausting, applying normal gates"
                     )
 
-        # ── EMA alignment ────────────────────────────────────────────────────
-        # Momentum tokens breaking out on 15m may not yet show 1h EMA9>EMA21 (lagging).
-        # Accept either timeframe — catches early breakouts before 1h confirms.
-        # SKIPPED if fast-track (price already confirmed momentum).
+        # ── Multi-EMA Ribbon Pullback Logic (1H) ──────────────────────────────
+        # Instead of lagging EMA9/21 crosses, we check for a structural trend + pullback.
         if direction == "long" and not _fast_track:
-            _ema_ok = False
-            if "1h" in tf_data:
-                _c1h = tf_data["1h"][:, 4]
-                if len(_c1h) >= 21 and _ema(_c1h, 9) > _ema(_c1h, 21):
-                    _ema_ok = True
-            if not _ema_ok and "15m" in tf_data:
-                _c15m = tf_data["15m"][:, 4]
-                if len(_c15m) >= 21 and _ema(_c15m, 9) > _ema(_c15m, 21) * 1.001:
-                    _ema_ok = True
-            if not _ema_ok:
-                logger.debug(f"[Analyzer] {symbol} filtered: neither 1h nor 15m EMA9>EMA21")
+            if "1h" not in tf_data:
+                logger.debug(f"[Analyzer] {symbol} filtered: missing 1h data for EMA ribbon")
                 return None
-        # ── SHORT: bearish EMA alignment: 1h OR 15m EMA9 < EMA21 ─────────────
-        elif direction == "short" and not _fast_track:
-            _ema_ok = False
-            if "1h" in tf_data:
-                _c1h = tf_data["1h"][:, 4]
-                if len(_c1h) >= 21 and _ema(_c1h, 9) < _ema(_c1h, 21):
-                    _ema_ok = True
-            if not _ema_ok and "15m" in tf_data:
-                _c15m = tf_data["15m"][:, 4]
-                if len(_c15m) >= 21 and _ema(_c15m, 9) < _ema(_c15m, 21) * 0.999:
-                    _ema_ok = True
-            if not _ema_ok:
-                logger.debug(f"[Analyzer] {symbol} SHORT filtered: neither 1h nor 15m EMA9<EMA21")
+            _c1h = tf_data["1h"][:, 4]
+            if len(_c1h) < 200:
+                logger.debug(f"[Analyzer] {symbol} filtered: insufficient 1h data for EMA200")
                 return None
 
-        # ── RSI gate: 40-82, block overbought entries ─────────────────────────
-        # RSI 70-82 = strong momentum (still OK to enter).
-        # RSI >82 = overbought — entering here is chasing completed moves.
-        # 78 cap was too aggressive — blocked CHR(80), ALT(79), JCT(78) which
-        # were valid momentum entries with 0% pullback and 2/3 green candles.
-        # Dying-pump protection comes from pullback gate + candle check, not RSI.
-        if direction == "long" and "1h" in tf_data:
-            _c1h_rsi = tf_data["1h"][:, 4]
-            if len(_c1h_rsi) >= 14:
-                rsi_1h = _compute_rsi(_c1h_rsi, 14)
-                _rsi_cap = 88.0
-                if rsi_1h > _rsi_cap:
-                    logger.info(f"[Analyzer] {symbol} filtered: 1h RSI {rsi_1h:.1f} > {_rsi_cap:.0f} (overbought)")
-                    return None
-                if rsi_1h < 40 and not _fast_track:
-                    logger.debug(f"[Analyzer] {symbol} filtered: 1h RSI {rsi_1h:.1f} < 40 (no momentum)")
-                    return None
-                # Check for declining RSI from overbought: distribution signal
-                if len(_c1h_rsi) >= 16 and not _fast_track:
-                    _rsi_prev = _compute_rsi(_c1h_rsi[:-2], 14)
-                    if _rsi_prev > 75 and rsi_1h < _rsi_prev - 3:
-                        logger.info(
-                            f"[Analyzer] {symbol} filtered: 1h RSI declining from overbought "
-                            f"({_rsi_prev:.1f} → {rsi_1h:.1f}) — distribution"
-                        )
-                        return None
-        # ── SHORT: RSI gate — block oversold (bounce risk) entries ────────────
-        elif direction == "short" and "1h" in tf_data:
-            _c1h_rsi = tf_data["1h"][:, 4]
-            if len(_c1h_rsi) >= 14:
-                rsi_1h = _compute_rsi(_c1h_rsi, 14)
-                if rsi_1h < 20:
-                    logger.info(f"[Analyzer] {symbol} SHORT filtered: 1h RSI {rsi_1h:.1f} < 20 (oversold — bounce risk)")
-                    return None
-                if rsi_1h > 60 and not _fast_track:
-                    logger.debug(f"[Analyzer] {symbol} SHORT filtered: 1h RSI {rsi_1h:.1f} > 60 (not bearish enough)")
-                    return None
-                # Check for rising RSI from oversold: accumulation signal
-                if len(_c1h_rsi) >= 16 and not _fast_track:
-                    _rsi_prev = _compute_rsi(_c1h_rsi[:-2], 14)
-                    if _rsi_prev < 30 and rsi_1h > _rsi_prev + 3:
-                        logger.info(
-                            f"[Analyzer] {symbol} SHORT filtered: 1h RSI rising from oversold "
-                            f"({_rsi_prev:.1f} → {rsi_1h:.1f}) — accumulation"
-                        )
-                        return None
+            _ema5 = _ema(_c1h, 5)
+            _ema20 = _ema(_c1h, 20)
+            _ema50 = _ema(_c1h, 50)
+            _ema100 = _ema(_c1h, 100)
+            _ema200 = _ema(_c1h, 200)
 
-        # ── MACD confirmation: hist > 0 OR rising ─────────────────────────────
-        # hist > 0 = confirmed momentum. hist rising (crossing from below) = momentum STARTING.
-        # Old gate (hist > 0 only) fired too late — move was 50% done by confirmation.
-        # SKIPPED if fast-track (price already confirmed momentum).
-        if direction == "long" and "1h" in tf_data and not _fast_track:
-            _c1h_macd = tf_data["1h"][:, 4]
-            if len(_c1h_macd) >= 36:
-                hist_now = _compute_macd_hist(_c1h_macd, 12, 26, 9)
-                hist_prev = _compute_macd_hist(_c1h_macd[:-1], 12, 26, 9)
-                if hist_now <= 0 and hist_now <= hist_prev:
-                    logger.debug(
-                        f"[Analyzer] {symbol} filtered: 1h MACD {hist_now:.6f} ≤0 and not rising"
-                    )
-                    return None
-        # ── SHORT: MACD confirmation — hist < 0 OR declining ─────────────────
-        elif direction == "short" and "1h" in tf_data and not _fast_track:
-            _c1h_macd = tf_data["1h"][:, 4]
-            if len(_c1h_macd) >= 36:
-                hist_now = _compute_macd_hist(_c1h_macd, 12, 26, 9)
-                hist_prev = _compute_macd_hist(_c1h_macd[:-1], 12, 26, 9)
-                if hist_now >= 0 and hist_now >= hist_prev:
-                    logger.debug(
-                        f"[Analyzer] {symbol} SHORT filtered: 1h MACD {hist_now:.6f} ≥0 and not falling"
-                    )
-                    return None
+            # 1. Structural Trend: EMAs must be stacked or very close to stacked
+            # EMA200 is used for macro trend check
+            if not (_ema5 > _ema20 > _ema50 > _ema100) or _c1h[-1] < _ema200:
+                logger.debug(f"[Analyzer] {symbol} filtered: 1H EMA ribbon not strictly stacked or below EMA200")
+                return None
 
-        # ── SHORT-TERM DIRECTION GATES ─────────────────────────────────────────
-        # These catch entries AGAINST active short-term price direction.
-        # KERNEL entered long while chart was clearly dumping — red candles, RSI declining.
-        # All skipped for fast-track (which has its own exhaustion checks).
-        if not _fast_track:
-            # Gate 1: 5m candle direction — are recent candles going our way?
-            # If 4+ of last 6 candles are against direction, momentum is wrong.
-            if len(_closes_5m) >= 7:
-                if direction == "long":
-                    _red_count = sum(1 for i in range(-6, 0) if _closes_5m[i] < _closes_5m[i - 1])
-                    if _red_count >= 4:
-                        logger.info(
-                            f"[Analyzer] {symbol} BLOCKED: {_red_count}/6 recent 5m candles are RED "
-                            f"— price actively falling, don't go long"
-                        )
-                        return None
-                elif direction == "short":
-                    _green_count = sum(1 for i in range(-6, 0) if _closes_5m[i] > _closes_5m[i - 1])
-                    if _green_count >= 4:
-                        logger.info(
-                            f"[Analyzer] {symbol} SHORT BLOCKED: {_green_count}/6 recent 5m candles are GREEN "
-                            f"— price actively rising, don't go short"
-                        )
-                        return None
+            # 2. Pullback Zone: Price must be in the pullback zone (bounded roughly by EMA5 and EMA50)
+            # We don't want price > EMA5 * 1.025 (overextended) or < EMA50 * 0.99 (broken structure)
+            _current_price = _c1h[-1]
+            if _current_price > _ema5 * 1.025:
+                logger.info(f"[Analyzer] {symbol} BLOCKED: Price {_current_price:.6f} > EMA5 {_ema5:.6f} * 1.025 (overextended)")
+                return None
+            if _current_price < _ema50 * 0.99:
+                logger.info(f"[Analyzer] {symbol} BLOCKED: Price {_current_price:.6f} < EMA50 {_ema50:.6f} * 0.99 (structure broken)")
+                return None
 
-            # Gate 2: 15m RSI slope — is momentum fading on the 15m timeframe?
-            # RSI declining >5pts over last 3 bars = momentum is dying, not starting.
-            if "15m" in tf_data:
-                _c15m_rsi = tf_data["15m"][:, 4]
-                if len(_c15m_rsi) >= 18:
-                    _rsi_15m_now = _compute_rsi(_c15m_rsi, 14)
-                    _rsi_15m_prev = _compute_rsi(_c15m_rsi[:-3], 14)
-                    _rsi_15m_delta = _rsi_15m_now - _rsi_15m_prev
-                    if direction == "long" and _rsi_15m_delta <= -5.0:
-                        logger.info(
-                            f"[Analyzer] {symbol} BLOCKED: 15m RSI declining "
-                            f"({_rsi_15m_prev:.0f} → {_rsi_15m_now:.0f}, Δ={_rsi_15m_delta:+.0f}) "
-                            f"— momentum fading"
-                        )
-                        return None
-                    elif direction == "short" and _rsi_15m_delta >= 5.0:
-                        logger.info(
-                            f"[Analyzer] {symbol} SHORT BLOCKED: 15m RSI rising "
-                            f"({_rsi_15m_prev:.0f} → {_rsi_15m_now:.0f}, Δ={_rsi_15m_delta:+.0f}) "
-                            f"— bounce forming"
-                        )
-                        return None
+            # 3. RSI Reset to 40-58 (Momentum reset, not exhaustion)
+            _rsi_1h = _compute_rsi(_c1h, 14)
+            if not (40 <= _rsi_1h <= 60):
+                logger.info(f"[Analyzer] {symbol} BLOCKED: 1H RSI {_rsi_1h:.1f} not in pullback zone (40-60)")
+                return None
 
-            # Gate 3: 5m RSI direction — block entries with significant RSI reversal
-            # Tightened from -15 to -10: catches sustained drops like KERNEL.
-            if len(_closes_5m) >= 21:
-                _rsi_5m_now = _compute_rsi(_closes_5m, 14)
-                _rsi_5m_prev = _compute_rsi(_closes_5m[:-6], 14)
-                _rsi_5m_delta = _rsi_5m_now - _rsi_5m_prev
-                if direction == "long" and _rsi_5m_delta <= -10.0:
-                    logger.info(
-                        f"[Analyzer] {symbol} BLOCKED: 5m RSI crashed "
-                        f"({_rsi_5m_prev:.0f} → {_rsi_5m_now:.0f}, Δ={_rsi_5m_delta:+.0f}) — momentum dead"
-                    )
-                    return None
-                elif direction == "short" and _rsi_5m_delta >= 10.0:
-                    logger.info(
-                        f"[Analyzer] {symbol} SHORT BLOCKED: 5m RSI surging "
-                        f"({_rsi_5m_prev:.0f} → {_rsi_5m_now:.0f}, Δ={_rsi_5m_delta:+.0f}) — strong bounce"
-                    )
-                    return None
+            # 4. RSI Direction: Needs to be turning up or stabilizing (not crashing)
+            _rsi_1h_prev = _compute_rsi(_c1h[:-3], 14)
+            if _rsi_1h < _rsi_1h_prev - 3.0:
+                logger.info(f"[Analyzer] {symbol} BLOCKED: 1H RSI actively falling ({_rsi_1h_prev:.1f} -> {_rsi_1h:.1f})")
+                return None
+
+            # 5. Confirmation: 5M candles checking for short-term bounce
+            # At least 2 of the last 5 candles must be green, meaning the pullback is stabilizing/bouncing
+            _green_count = sum(1 for i in range(-5, 0) if _closes_5m[i] > _closes_5m[i - 1])
+            if _green_count < 2:
+                logger.info(f"[Analyzer] {symbol} BLOCKED: 5m candles not showing bounce (only {_green_count}/5 green)")
+                return None
 
         # Setup classification
         setup_type = self._classify_setup(tf_data, ta_scores)
