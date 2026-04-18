@@ -36,6 +36,7 @@ class BBSqueezeStrategy(BaseStrategy):
     TRAIL_ACTIVATE_PCT = 2.0     
     TRAIL_DISTANCE_PCT = 1.5
     MAX_HOLD_MINUTES = 300      # 5h — squeeze breakouts can run
+    SQUEEZE_MIN_BARS = 3        # Require at least 3 bars of squeeze
 
     async def analyze(
         self, symbol_data: dict[str, dict[str, np.ndarray]], regime: str = "sideways"
