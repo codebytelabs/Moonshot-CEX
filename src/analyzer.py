@@ -75,18 +75,6 @@ class AnalyzerAgent:
             logger.debug(f"[Analyzer] {symbol} skip: price={price}")
             return None
 
-        # v7.5: Check if this symbol is whitelisted (blue chip) — relaxed gates apply
-        _is_whitelisted = False
-        try:
-            from src.config import get_settings as _get_cfg
-            _cfg = _get_cfg()
-            _wl_raw = getattr(_cfg, "symbol_whitelist", "") or ""
-            _wl = {s.strip().upper() for s in _wl_raw.split(",") if s.strip()}
-            _base = symbol.split("/")[0].upper() if "/" in symbol else symbol.upper()
-            _is_whitelisted = _base in _wl
-        except Exception:
-            pass
-
         tf_data = {}
         tf_counts = {}
         for tf in self.timeframes:
@@ -200,7 +188,7 @@ class AnalyzerAgent:
                         f"but bounce={_ft_bounce:.1f}% red={_ft_red_count}/3 RSI={_ft_rsi:.0f} — "
                         f"dump exhausting, applying normal gates"
                     )
-            elif direction != "short" and _return_1h >= (0.5 if _is_whitelisted else 2.0):
+            elif direction != "short" and _return_1h >= 2.0:
                 # Exhaustion check 1: price must be within 2.5% of recent 1h high
                 # If it's already pulled back more, the move is dying
                 _ft_high = float(np.max(_highs_5m[-12:])) if len(_highs_5m) >= 12 else _closes_5m[-1]

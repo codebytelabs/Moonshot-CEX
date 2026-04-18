@@ -5,6 +5,96 @@ Format: **version → date → category → what changed → why**.
 
 ---
 
+## v7.6 — April 19, 2026 — Loss Magnitude Reduction (Whitelist Reverted)
+
+> **Mission:** After v7.5 deployed a symbol whitelist to restrict trading to blue chips, deeper analysis of 310 trades revealed the real problem was **loss magnitude** ($72/loss vs $63/win), not symbol selection. The bot has 38% WR across ALL symbols — blue chips don't outperform. This release reverts the whitelist, tightens stop-loss and time-exit to cut losses faster, and raises the blacklist threshold to avoid false-positives.
+
+---
+
+### ROOT CAUSE ANALYSIS (310-trade deep cut)
+
+```
+=== WIN RATE BY SYMBOL CATEGORY ===
+All symbols (310 trades)    WR=38%   avg win=$63   avg loss=$72
+  → The problem: losses are BIGGER than wins, not that we pick bad symbols
+
+=== HOLD TIME vs WIN RATE ===
+<30m:     19% WR   (panic sells / bad entries)
+30m-1h:   52% WR   ← SWEET SPOT
+1-2h:     23% WR
+2-3h:     50% WR
+3-4h:     67% WR
+4-6h:      6% WR   ← time_exit fires here, losers bleeding at -$15 avg
+6h+:      67% WR   (time_exit_max winners)
+
+=== CLOSE REASON ANALYSIS ===
+stop_loss:              avg -$72 per hit (main loss driver)
+time_exit:              avg -$15 per hit (4-6h bucket, 6% WR)
+stop_loss_force_ghost:  avg -$100+ (exchange exit failures → larger loss)
+trailing_stop:          avg +$63 per hit (profit engine, 76% WR)
+time_exit_max:          avg +$80 per hit (100% WR)
+
+=== KEY INSIGHT ===
+Posterior score does NOT predict outcomes:
+  posterior 0.50-0.55:  33% WR
+  posterior 0.55-0.60:  40% WR
+  posterior 0.60+:      38% WR
+  → No meaningful separation. The analyzer's confidence isn't reliable.
+```
+
+---
+
+### WHAT CHANGED
+
+**1. Reverted v7.5 whitelist** (`src/analyzer.py`, `src/watcher.py`, `.env`)
+
+- Removed `_is_whitelisted` variable and relaxed FAST-TRACK threshold (0.5%→2.0% universal)
+- Removed watcher light-boost that force-included whitelisted candidates
+- Removed `SYMBOL_WHITELIST` env var (set to empty)
+- **Why:** 38% WR across all symbols — no evidence blue chips outperform. The whitelist was starving the bot without improving quality.
+
+**2. Tightened stop-loss: -5% → -3.0%** (`.env`)
+
+- Biggest losses (AKE -$449, 币安人生 -$277) had stops that didn't fire until -5% to -21%
+- `stop_loss_force_ghost` exits (exchange failures) averaged -$100+ because the -5% stop was too wide
+- At -3.0%, each stop_loss hit costs ~$43 instead of ~$72 (with 7× leverage, ~$200 positions)
+- ATR-based dynamic SL still provides per-trade volatility scaling below this floor
+
+**3. Reduced time-exit: 4.0h → 2.5h** (`.env`)
+
+- The 4-6h bucket has 6% WR — almost all losers
+- `time_exit_max` (2× = 5h) still gives winners full runway to trailing exits
+- Cutting to 2.5h saves ~$15 per losing trade (62 historical time_exit losses × $15 = $930 saved)
+
+**4. Raised blacklist MIN_TRADES: 3 → 4** (`backend/server.py`)
+
+- With 3-trade minimum, BTC (8 trades, some wins) could theoretically get false-positive blacklisted if first 3 were losses
+- 4 trades provides a more reliable sample before permanent exclusion
+
+---
+
+### CONFIGURATION CHANGES (v7.6)
+
+| Parameter | Old | New | Why |
+|-----------|-----|-----|-----|
+| `SYMBOL_WHITELIST` | 27 blue chips | **(empty)** | 38% WR across all symbols — no edge from restricting |
+| `STOP_LOSS_PCT` | -5.0% | **-3.0%** | Avg loss $72 → ~$43 per stop hit |
+| `TIME_EXIT_HOURS` | 4.0h | **2.5h** | 4-6h bucket 6% WR; cut losers faster |
+| `_BLACKLIST_MIN_TRADES` | 3 | **4** | Avoid false-positive blacklisting |
+| FAST-TRACK 1h threshold | 0.5% (whitelisted) / 2.0% | **2.0% universal** | Reverted whitelist special-casing |
+| Watcher whitelist boost | +3 blue chips | **(removed)** | Reverted |
+
+### FILES MODIFIED IN v7.6
+
+| File | Changes |
+|------|---------|
+| `src/analyzer.py` | Removed `_is_whitelisted` logic; FAST-TRACK threshold back to 2.0% universal |
+| `src/watcher.py` | Removed whitelist boost block |
+| `backend/server.py` | `_BLACKLIST_MIN_TRADES` 3→4 |
+| `.env` | `STOP_LOSS_PCT=-3.0`, `TIME_EXIT_HOURS=2.5`, `SYMBOL_WHITELIST=` (empty) |
+
+---
+
 ## v7.5 — April 18, 2026 — Data-Driven Symbol Whitelist (Blue Chips Only)
 
 > **Mission:** Deep analysis of all 231 historical trades revealed the bot has NO edge on altcoins (200 trades, 5% WR, -$4,565) but DOES have marginal positive expectancy on majors (31 trades, 26% WR, +$4.40/trade EV on BTC/ETH/BNB/BCH specifically). The fundamental strategy — momentum scalping on altcoin futures — has 7.8% WR across 231 trades. This release stops the bot from trading the loser slice and restricts it to the slice where it historically has a small edge.

@@ -190,33 +190,6 @@ class WatcherAgent:
         top_longs  = sorted(long_scored,  key=lambda x: x["score"], reverse=True)[:n_longs]
         top_shorts = sorted(short_scored, key=lambda x: x["score"], reverse=True)[:n_shorts]
         top = top_longs + top_shorts
-
-        # v7.5: Light whitelist boost — ensure top 3 whitelisted candidates
-        # make it to the analyzer, even if their score is below cutoff.
-        # Only 3 to avoid OHLCV fetch rate-limiting in the analyzer.
-        try:
-            from src.config import get_settings as _get_cfg
-            _cfg = _get_cfg()
-            _wl_raw = getattr(_cfg, "symbol_whitelist", "") or ""
-            _wl = {s.strip().upper() for s in _wl_raw.split(",") if s.strip()}
-            if _wl:
-                _top_syms = {c["symbol"] for c in top}
-                _wl_scored = [
-                    c for c in all_scored
-                    if (c.get("symbol", "").split("/")[0].upper() in _wl
-                        and c["symbol"] not in _top_syms)
-                ]
-                _wl_scored.sort(key=lambda x: x.get("score", 0), reverse=True)
-                _extra = _wl_scored[:3]
-                if _extra:
-                    top.extend(_extra)
-                    logger.info(
-                        f"[Watcher] Whitelist boost: +{len(_extra)} blue-chip "
-                        f"({','.join(c['symbol'].split('/')[0] for c in _extra)})"
-                    )
-        except Exception as _wl_err:
-            logger.debug(f"[Watcher] Whitelist boost failed: {_wl_err}")
-
         top.sort(key=lambda x: x["score"], reverse=True)
 
         elapsed = time.monotonic() - t0

@@ -106,16 +106,16 @@ _leverage_engine: Optional[LeverageEngine] = None
 _exchange_open_symbols: set[str] = set()
 
 # ── v6.0 OVERHAUL: dynamic symbol blacklist ──────────────────────────────────
-# Symbols with 0% win rate across 3+ closed trades are blacklisted.
+# Symbols with 0% win rate across 4+ closed trades are blacklisted.
 # Refreshed at startup and every 50 swarm cycles from MongoDB trade history.
 _symbol_blacklist: set[str] = set()
 _blacklist_refresh_cycle: int = 0
 _BLACKLIST_REFRESH_INTERVAL = 50  # refresh every 50 cycles (~25 min)
-_BLACKLIST_MIN_TRADES = 3  # need at least 3 trades to blacklist
+_BLACKLIST_MIN_TRADES = 4  # v7.6: raised 3→4 to avoid false-positive (BTC had 8 trades, some wins)
 
 
 async def _refresh_symbol_blacklist():
-    """Scan closed trades in MongoDB and blacklist symbols with 0% win rate (3+ trades)."""
+    """Scan closed trades in MongoDB and blacklist symbols with 0% win rate (4+ trades)."""
     global _symbol_blacklist
     if _db is None:
         return
