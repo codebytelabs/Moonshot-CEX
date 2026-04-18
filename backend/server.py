@@ -950,14 +950,10 @@ async def _run_cycle():
         _btc_score = _btc_momentum.get("score", 0.5)
         if _btc_score >= 0.55:
             _btc_size_scale = 1.0
-        elif _btc_score >= 0.45:
+        elif _btc_score >= 0.50:
             _btc_size_scale = 0.80
-        elif _btc_score >= 0.35:
-            _btc_size_scale = 0.50
-        elif _btc_score >= 0.25:
-            _btc_size_scale = 0.25
         else:
-            _btc_size_scale = 0.0  # hard block: BTC crash
+            _btc_size_scale = 0.0  # HARD BLOCK: BTC crash or weak momentum (< 0.5)
         STATE["btc_trend_master_switch"] = _btc_size_scale > 0
         STATE["btc_size_scale"] = _btc_size_scale
 

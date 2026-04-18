@@ -848,6 +848,9 @@ class PositionManager:
             return None
         self._positions_being_exited.add(pos.id)
         try:
+            # Cancel exchange-side SL order BEFORE exiting so Binance ReduceOnly orders aren't rejected (-2022)
+            await self._cancel_exchange_sl(pos)
+
             fill = await self.execution.exit_position(pos.symbol, amount, price, reason, direction=pos.side)
             filled_amount = float(fill.get("filled_amount") or 0.0)  # type: ignore[arg-type]
             if filled_amount < amount * 0.999:
@@ -890,8 +893,6 @@ class PositionManager:
             pos.closed_at = int(time.time())
             pos.close_reason = reason
 
-            # Cancel exchange-side SL order (no longer needed)
-            await self._cancel_exchange_sl(pos)
 
             pnl_usd = pos.realized_pnl_usd  # cumulative: tier1 + tier2 + final tranche
             if pos.side == "short":
