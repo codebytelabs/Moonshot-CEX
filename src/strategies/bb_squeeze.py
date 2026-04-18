@@ -301,3 +301,29 @@ class BBSqueezeStrategy(BaseStrategy):
             return "bb_squeeze_time"
 
         return None
+
+    def check_falsification(self, position: dict, tf_data: dict[str, list]) -> tuple[bool, str]:
+        """Falsify if the breakout completely fails and collapses across the Middle Bollinger Band."""
+        data_1h = tf_data.get("1h")
+        if data_1h is None or len(data_1h) < self.BB_PERIOD:
+            return False, ""
+            
+        closes = [c[4] for c in data_1h[-self.BB_PERIOD:]]
+        current_price = closes[-1]
+        
+        try:
+            _, bb_mid, _ = self.bollinger_bands(closes, self.BB_PERIOD, self.BB_STD)
+        except Exception:
+            return False, ""
+            
+        if not bb_mid:
+            return False, ""
+            
+        direction = position.get("side", "long")
+        # Breakout fakeout: longs falling significantly below the midline (0.5% buffer)
+        if direction == "long" and current_price < bb_mid * 0.995:
+            return True, "thesis_falsified_squeeze_fakeout_down"
+        elif direction == "short" and current_price > bb_mid * 1.005:
+            return True, "thesis_falsified_squeeze_fakeout_up"
+            
+        return False, ""

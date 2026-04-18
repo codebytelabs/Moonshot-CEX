@@ -209,3 +209,28 @@ class BBMeanRevStrategy(BaseStrategy):
             return "bb_meanrev_time"
 
         return None
+
+    def check_falsification(self, position: dict, tf_data: dict[str, list]) -> tuple[bool, str]:
+        """Falsify if a strong trend establishes destroying the mean reversion thesis."""
+        data_1h = tf_data.get("1h")
+        if data_1h is None or len(data_1h) < 15:
+            return False, ""
+            
+        h = [c[2] for c in data_1h]
+        l = [c[3] for c in data_1h]
+        c = [c[4] for c in data_1h]
+        
+        adx = self._compute_adx(h, l, c, 14)
+        
+        direction = position.get("side", "long")
+        # If ADX breaks above 35 while we are losing, we are fighting a strong trending wave
+        if adx > 35:
+            # We must be losing for the trend to be against us
+            entry = float(position.get("entry_price", 0))
+            current = c[-1]
+            if entry > 0:
+                pnl_pct = ((current - entry) / entry * 100) if direction == "long" else ((entry - current) / entry * 100)
+                if pnl_pct < -0.5:
+                    return True, "thesis_falsified_adx_trend_formed"
+                    
+        return False, ""

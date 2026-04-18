@@ -232,3 +232,33 @@ class VWAPMomentumStrategy(BaseStrategy):
             return "vwap_momentum_time"
 
         return None
+
+    def check_falsification(self, position: dict, tf_data: dict[str, list]) -> tuple[bool, str]:
+        """Falsify if the VWAP breakout reverses significantly and momentum dies."""
+        data_1h = tf_data.get("1h")
+        if data_1h is None or len(data_1h) < 24:
+            return False, ""
+        
+        # Calculate VWAP
+        h = [c[2] for c in data_1h[-24:]]
+        l = [c[3] for c in data_1h[-24:]]
+        c = [c[4] for c in data_1h[-24:]]
+        v = [c[5] for c in data_1h[-24:]]
+        
+        cum_tp_vol = sum((h[i] + l[i] + c[i]) / 3 * v[i] for i in range(len(c)))
+        cum_vol = sum(v)
+        vwap_val = cum_tp_vol / cum_vol if cum_vol > 0 else c[-1]
+        
+        current_price = c[-1]
+        vwap_distance_pct = (current_price - vwap_val) / vwap_val * 100 if vwap_val > 0 else 0
+        
+        direction = position.get("side", "long")
+        # If we broke out long, but price falls -0.5% below VWAP, thesis is broken
+        if direction == "long" and vwap_distance_pct < -0.5:
+            return True, "thesis_falsified_vwap_breakdown"
+            
+        # If we broke out short, but price climbs +0.5% above VWAP, thesis is broken
+        elif direction == "short" and vwap_distance_pct > 0.5:
+            return True, "thesis_falsified_vwap_breakup"
+            
+        return False, ""

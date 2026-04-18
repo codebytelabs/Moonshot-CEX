@@ -138,10 +138,23 @@ class BaseStrategy(ABC):
             current_price: current market price
             regime: current market regime
             
-        Returns:
-            None if hold, or exit reason string (e.g., "scalp_tp", "scalp_sl")
         """
         ...
+
+    def check_falsification(self, position: dict, tf_data: dict[str, list]) -> tuple[bool, str]:
+        """Check if the structural thesis for the position is irreparably broken based on live candles.
+        
+        This is an aggressive mechanism to kill bad trades early (before hitting stop loss or time exits).
+        Override this in subclasses to provide setup-specific validation.
+
+        Args:
+            position: dict representing the open position.
+            tf_data: dict mapping timeframe ("5m", "1h") to lists of CCXT candles [TS, O, H, L, C, V].
+
+        Returns:
+            (thesis_dead: bool, reason: str) - E.g., (True, "thesis_falsified_vwap_break")
+        """
+        return False, ""
 
     def should_scan(self) -> bool:
         """Rate-limit scanning."""

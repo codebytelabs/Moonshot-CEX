@@ -1496,47 +1496,60 @@ async def _check_position_health():
             continue
 
         try:
-            candles = await _watcher._fetch_ohlcv_cached(pos.symbol, "5m", 60)
-            if not candles or len(candles) < 30:
+            candles_5m = await _watcher._fetch_ohlcv_cached(pos.symbol, "5m", 60)
+            candles_1h = await _watcher._fetch_ohlcv_cached(pos.symbol, "1h", 60)
+            if not candles_5m or len(candles_5m) < 30:
                 continue
 
-            closes = np.array([c[4] for c in candles], dtype=float)
+            tf_data = {"5m": candles_5m, "1h": candles_1h or []}
+            closes = np.array([c[4] for c in candles_5m], dtype=float)
             current_price = closes[-1]
+            pnl_pct = pos.current_pnl_pct(current_price)
 
-            # ── EMA alignment check ──
+            # ── 1. Proactive Falsification via Strategy Overlay ──
+            if _strategy_manager is not None:
+                strat_name = _strategy_manager.get_position_strategy(pos.symbol)
+                if strat_name:
+                    strat = _strategy_manager.get_strategy(strat_name)
+                    if strat:
+                        is_dead, kill_reason = strat.check_falsification(pos.to_dict(), tf_data)
+                        if is_dead:
+                            logger.error(
+                                f"[HealthCheck] THESIS FALSIFIED for {pos.symbol} [{strat_name}] "
+                                f"Reason: {kill_reason} — Force exiting early at {pnl_pct:+.1f}%!"
+                            )
+                            # Create an async task to execute exit without blocking the check loop
+                            asyncio.create_task(
+                                _position_manager._execute_exit(pos, current_price, kill_reason, pos.amount)
+                            )
+                            continue
+
+            # ── 2. Standard Health Checks (Trailing Tightening) ──
             ema9 = _ema(closes, 9)
             ema21 = _ema(closes, 21)
             ema_gap_pct = (ema9 - ema21) / ema21 * 100 if ema21 > 0 else 0.0
 
-            # ── RSI check ──
             rsi = _compute_rsi(closes, 14)
-
-            # ── MACD histogram check ──
             macd_hist = _compute_macd_hist(closes)
 
-            # ── Compute health score ──
             health = 0.0
 
             if pos.side == "long":
-                # EMA: bullish alignment = good for longs
                 if ema_gap_pct > 0.3:
                     health += 0.4
                 elif ema_gap_pct > -0.1:
                     health += 0.2
-                # RSI: 40-70 is healthy for longs, < 35 is weak
                 if 40 <= rsi <= 70:
                     health += 0.3
                 elif rsi > 70:
-                    health += 0.2  # overbought but still momentum
+                    health += 0.2
                 elif rsi > 35:
                     health += 0.1
-                # MACD: positive histogram = momentum increasing
                 if macd_hist > 0:
                     health += 0.3
                 elif macd_hist > -0.0001:
                     health += 0.1
-            else:  # short
-                # Inverted: bearish EMA = good for shorts
+            else:
                 if ema_gap_pct < -0.3:
                     health += 0.4
                 elif ema_gap_pct < 0.1:
@@ -1552,9 +1565,6 @@ async def _check_position_health():
                 elif macd_hist < 0.0001:
                     health += 0.1
 
-            pnl_pct = pos.current_pnl_pct(current_price)
-
-            # ── Take action based on health ──
             if health < 0.3 and pnl_pct > 0.3:
                 # Momentum reversed but we're green — lock gains with tight trail
                 if pos.side == "long":
@@ -1579,19 +1589,16 @@ async def _check_position_health():
                         await _position_manager._update_exchange_sl(pos, tight_trail)
 
             elif health < 0.3 and pnl_pct <= 0.3:
-                # Momentum reversed AND we're red/flat — log warning, let SL handle it
                 logger.info(
                     f"[HealthCheck] {pos.symbol} WEAK health={health:.2f} pnl={pnl_pct:+.1f}% "
                     f"(EMA={ema_gap_pct:+.2f}% RSI={rsi:.0f} MACD={'+'if macd_hist>0 else ''}{macd_hist:.6f}) "
-                    f"— SL will protect"
+                    f"— SL/Falsification will protect"
                 )
-
             elif health >= 0.6:
                 logger.info(
                     f"[HealthCheck] {pos.symbol} HEALTHY health={health:.2f} pnl={pnl_pct:+.1f}% "
                     f"EMA={ema_gap_pct:+.2f}% RSI={rsi:.0f}"
                 )
-
             else:
                 logger.info(
                     f"[HealthCheck] {pos.symbol} NEUTRAL health={health:.2f} pnl={pnl_pct:+.1f}% "

@@ -211,6 +211,32 @@ class EMATrendStrategy(BaseStrategy):
 
         return None
 
+    def check_falsification(self, position: dict, tf_data: dict[str, list]) -> tuple[bool, str]:
+        """Falsify if the EMA stack structural support completely breaks."""
+        data_1h = tf_data.get("1h")
+        if data_1h is None or len(data_1h) < 50:
+            return False, ""
+            
+        closes = [c[4] for c in data_1h]
+        current_price = closes[-1]
+        
+        # Calculate EMA50 (the institutional support level)
+        ema50 = self.ema(closes, 50)
+        if not ema50:
+            return False, ""
+            
+        direction = position.get("side", "long")
+        
+        # If long and price closes below EMA50, the trend is fundamentally broken
+        if direction == "long" and current_price < ema50[-1]:
+            return True, "thesis_falsified_ema50_breakdown"
+            
+        # If short and price breaks up over EMA50, the trend is fundamentally broken
+        elif direction == "short" and current_price > ema50[-1]:
+            return True, "thesis_falsified_ema50_breakup"
+            
+        return False, ""
+
     @staticmethod
     def _compute_adx(highs: list, lows: list, closes: list, period: int = 14) -> float:
         """Compute ADX (Average Directional Index)."""
