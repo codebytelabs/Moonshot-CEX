@@ -190,33 +190,6 @@ class WatcherAgent:
         top_longs  = sorted(long_scored,  key=lambda x: x["score"], reverse=True)[:n_longs]
         top_shorts = sorted(short_scored, key=lambda x: x["score"], reverse=True)[:n_shorts]
         top = top_longs + top_shorts
-
-        # v7.5: Force-include whitelisted symbols even if they didn't make the score cut.
-        # Blue chips (BTC/ETH/BNB/...) rarely top the volume-spike ranking but are the
-        # only coins with positive expectancy in our 231-trade analysis.
-        try:
-            from src.config import get_settings as _get_cfg
-            _cfg = _get_cfg()
-            _wl_raw = getattr(_cfg, "symbol_whitelist", "") or ""
-            _wl = {s.strip().upper() for s in _wl_raw.split(",") if s.strip()}
-            if _wl:
-                _top_syms = {c["symbol"] for c in top}
-                _extra = []
-                for c in all_scored:
-                    _sym = c.get("symbol", "")
-                    _base = _sym.split("/")[0].upper() if "/" in _sym else _sym.upper()
-                    if _base in _wl and _sym not in _top_syms:
-                        _extra.append(c)
-                        _top_syms.add(_sym)
-                if _extra:
-                    top.extend(_extra)
-                    logger.info(
-                        f"[Watcher] Whitelist boost: +{len(_extra)} blue-chip candidates "
-                        f"({','.join(c['symbol'].split('/')[0] for c in _extra[:6])})"
-                    )
-        except Exception as _wl_err:
-            logger.debug(f"[Watcher] Whitelist boost failed: {_wl_err}")
-
         top.sort(key=lambda x: x["score"], reverse=True)
 
         elapsed = time.monotonic() - t0
