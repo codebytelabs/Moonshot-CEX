@@ -44,6 +44,7 @@ class StrategySignal:
     # Strategy-specific exit parameters (override global defaults in position_manager)
     trail_activate_pct: float = 0.0    # 0 = use global default
     trail_distance_pct: float = 0.0    # 0 = use global default
+    trail_distance_price: float = 0.0  # absolute dollar distance for ATR-based trails
     max_hold_minutes: float = 0.0      # 0 = use global default
 
     @property
@@ -89,6 +90,7 @@ class StrategySignal:
                 "stop_loss_pct": self.stop_loss_pct,
                 "trail_activate_pct": self.trail_activate_pct,
                 "trail_distance_pct": self.trail_distance_pct,
+                "trail_distance_price": self.trail_distance_price,
                 "max_hold_minutes": self.max_hold_minutes,
                 "tp1_pct": self.tp1_pct,
                 "tp2_pct": self.tp2_pct,

@@ -28,12 +28,12 @@ class BBSqueezeStrategy(BaseStrategy):
     BB_PERIOD = 20
     BB_STD = 2.0
     KC_PERIOD = 20
-    KC_ATR_MULT = 1.5           # Keltner Channel ATR multiplier
-    SQUEEZE_MIN_BARS = 3        # minimum bars in squeeze before valid
-    ATR_SL_MULT = 2.5
-    ATR_TP_MULT = 5.0           # asymmetric — big moves from squeezes
-    MAX_SL_PCT = -5.0           # hard cap — never risk more than 5%
-    TRAIL_ACTIVATE_PCT = 2.0
+    KC_ATR_MULT = 1.5           
+    ATR_SL_MULT = 1.5           
+    ATR_TP_MULT = 2.5           
+    ATR_TRAIL_MULT = 1.0        # Trailing distance = 1.0x ATR
+    MAX_SL_PCT = -5.0           
+    TRAIL_ACTIVATE_PCT = 2.0     
     TRAIL_DISTANCE_PCT = 1.5
     MAX_HOLD_MINUTES = 300      # 5h — squeeze breakouts can run
 
@@ -212,6 +212,7 @@ class BBSqueezeStrategy(BaseStrategy):
             timeframe="1h",
             trail_activate_pct=self.TRAIL_ACTIVATE_PCT,
             trail_distance_pct=self.TRAIL_DISTANCE_PCT,
+            trail_distance_price=atr_val * self.ATR_TRAIL_MULT,
             max_hold_minutes=self.MAX_HOLD_MINUTES,
         )
 

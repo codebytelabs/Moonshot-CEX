@@ -27,9 +27,9 @@ class VWAPMomentumStrategy(BaseStrategy):
     # ── Parameters ───────────────────────────────────────────────────────────
     VOL_THRESHOLD = 1.5         # volume must be 1.5x average
     VWAP_BUFFER_PCT = 0.3       # price must be 0.3%+ above/below VWAP
-    ATR_SL_MULT = 2.0           # stop loss = 2 × ATR (tighter for momentum)
-    ATR_TP_MULT = 4.0           # take profit = 4 × ATR (2:1 R:R)
-    MAX_SL_PCT = -5.0           # hard cap — never risk more than 5%
+    ATR_SL_MULT = 1.3           # Tight stop since it's a breakout
+    ATR_TP_MULT = 2.0           # take profit = 2 × ATR
+    ATR_TRAIL_MULT = 1.0        # Trailing distance = 1.0x ATR
     TRAIL_ACTIVATE_PCT = 1.5    # activate trailing early — catch momentum
     TRAIL_DISTANCE_PCT = 1.2    # tight trail to lock in gains
     MAX_HOLD_MINUTES = 180      # 3h max — momentum trades are fast
@@ -113,7 +113,7 @@ class VWAPMomentumStrategy(BaseStrategy):
             if price < recent_high * 0.985:
                 return None  # already pulled back from high — momentum dead
         else:
-            recent_low = min(lows_1h[-6:]) if len(lows_1h) >= 6 else price
+            recent_low = min(lows_1h[-6:]) if len(highs_1h) >= 6 else price
             if price > recent_low * 1.015:
                 return None  # already bounced from low
 
@@ -148,8 +148,8 @@ class VWAPMomentumStrategy(BaseStrategy):
             sl_pct = -abs((sl - price) / price * 100)
 
         # ── Hard cap SL at MAX_SL_PCT ──────────────────────────────────────
-        if sl_pct < self.MAX_SL_PCT:
-            sl_pct = self.MAX_SL_PCT
+        if sl_pct < -5.0:
+            sl_pct = -5.0
             if direction == "long":
                 sl = price * (1 + sl_pct / 100)
             else:
@@ -198,10 +198,11 @@ class VWAPMomentumStrategy(BaseStrategy):
             tp2_pct=abs((tp2 - price) / price * 100),
             confidence=score / 100.0,
             setup_type="vwap_momentum_breakout",
-            reason=f"VWAP breakout {direction} vol={vol_ratio:.1f}x VWAP_dist={vwap_distance_pct:+.1f}% RSI={rsi_val:.0f}",
+            reason=f"VWAP breakout: {vwap_distance_pct:.2f}%, Vol: {vol_ratio:.1f}x",
             timeframe="1h",
             trail_activate_pct=self.TRAIL_ACTIVATE_PCT,
             trail_distance_pct=self.TRAIL_DISTANCE_PCT,
+            trail_distance_price=atr_val * self.ATR_TRAIL_MULT,
             max_hold_minutes=self.MAX_HOLD_MINUTES,
         )
 

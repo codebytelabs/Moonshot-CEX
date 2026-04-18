@@ -29,9 +29,10 @@ class EMATrendStrategy(BaseStrategy):
     EMA_FAST = 12
     EMA_SLOW = 50
     ADX_PERIOD = 14
-    ADX_THRESHOLD = 25          # minimum ADX for trend confirmation
-    ATR_SL_MULT = 2.5           # stop loss = 2.5 × ATR
-    ATR_TP_MULT = 5.0           # take profit = 5.0 × ATR (2:1 R:R)
+    ADX_THRESHOLD = 20.0
+    ATR_SL_MULT = 1.5
+    ATR_TP_MULT = 2.5
+    ATR_TRAIL_MULT = 1.0        # Trailing distance = 1.0x ATR
     MAX_SL_PCT = -5.0           # hard cap — never risk more than 5%
     TRAIL_ACTIVATE_PCT = 2.0    # activate trailing at +2%
     TRAIL_DISTANCE_PCT = 1.5    # trail distance 1.5%
@@ -178,6 +179,7 @@ class EMATrendStrategy(BaseStrategy):
             timeframe="1h",
             trail_activate_pct=self.TRAIL_ACTIVATE_PCT,
             trail_distance_pct=self.TRAIL_DISTANCE_PCT,
+            trail_distance_price=atr_val * self.ATR_TRAIL_MULT,
             max_hold_minutes=self.MAX_HOLD_MINUTES,
         )
 

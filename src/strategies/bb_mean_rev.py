@@ -32,6 +32,7 @@ class BBMeanRevStrategy(BaseStrategy):
     ADX_MAX = 25                # only trade when ADX < 25 (no trend)
     ATR_SL_MULT = 2.0           # tighter stops for mean rev
     ATR_TP_MULT = 2.5           # target middle BB (~1.25:1 R:R)
+    ATR_TRAIL_MULT = 1.0  
     MAX_SL_PCT = -5.0           # hard cap — never risk more than 5%
     TRAIL_ACTIVATE_PCT = 1.5
     TRAIL_DISTANCE_PCT = 1.0
@@ -178,6 +179,7 @@ class BBMeanRevStrategy(BaseStrategy):
             timeframe="1h",
             trail_activate_pct=self.TRAIL_ACTIVATE_PCT,
             trail_distance_pct=self.TRAIL_DISTANCE_PCT,
+            trail_distance_price=atr_val * self.ATR_TRAIL_MULT,
             max_hold_minutes=self.MAX_HOLD_MINUTES,
         )
 

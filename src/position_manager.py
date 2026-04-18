@@ -685,29 +685,44 @@ class PositionManager:
         trail_activate = regime_params.get("trailing_activate_pct", self.trailing_activate_pct) if regime_params else self.trailing_activate_pct
         trail_dist = regime_params.get("trailing_distance_pct", self.trailing_distance_pct) if regime_params else self.trailing_distance_pct
         effective_time_exit_hours = regime_params.get("time_exit_hours", self.time_exit_hours) if regime_params else self.time_exit_hours
+        trail_price_dist = 0.0
 
-        # Strategy-specific exit params override global/regime defaults.
-        # Strategies define tight, fast exits (scalper: SL -0.5%, 15min hold;
-        # mean_reversion: SL -1.2%, 60min hold) but position_manager was using
-        # global SL -3.5% and 2h hold for everything — causing strategy positions
-        # to bleed 3-6x more than intended before exiting.
         _sep = getattr(pos, "strategy_exit_params", {})
         if _sep:
             _s_sl = float(_sep.get("stop_loss_pct", 0))
             if _s_sl < 0:
-                sl_pct = _s_sl  # e.g., -1.2 for mean_reversion
+                sl_pct = _s_sl  
             _s_trail_act = float(_sep.get("trail_activate_pct", 0))
             if _s_trail_act > 0:
                 trail_activate = _s_trail_act
             _s_trail_dist = float(_sep.get("trail_distance_pct", 0))
             if _s_trail_dist > 0:
                 trail_dist = _s_trail_dist
+            _s_trail_p_dist = float(_sep.get("trail_distance_price", 0))
+            if _s_trail_p_dist > 0:
+                trail_price_dist = _s_trail_p_dist
             _s_hold_min = float(_sep.get("max_hold_minutes", 0))
             if _s_hold_min > 0:
                 effective_time_exit_hours = _s_hold_min / 60.0
 
         pnl_pct = pos.current_pnl_pct(current_price)
         r_multiple = pos.current_r_multiple(current_price)
+        
+        # ── Breakeven Ratchet ────────────────────────────────────────────────
+        # Once we achieve +1.5R profit, lock the Stop Loss slightly ahead of Entry.
+        if r_multiple >= 1.5:
+            if pos.side == "long":
+                be_stop = pos.entry_price * 1.002
+                if be_stop > pos.stop_loss:
+                    logger.info(f"[PM] Ratcheting SL to Breakeven for {pos.symbol} (R={r_multiple:.2f})")
+                    pos.stop_loss = be_stop
+                    await self._update_exchange_sl(pos, pos.stop_loss)
+            elif pos.side == "short":
+                be_stop = pos.entry_price * 0.998
+                if be_stop < pos.stop_loss and pos.stop_loss > 0:
+                    logger.info(f"[PM] Ratcheting SL to Breakeven for {pos.symbol} (R={r_multiple:.2f})")
+                    pos.stop_loss = be_stop
+                    await self._update_exchange_sl(pos, pos.stop_loss)
 
         # Update dynamic stop loss — always ensure SL reflects configured percentage minimum
         abs_sl_pct = abs(sl_pct) / 100.0
@@ -727,13 +742,19 @@ class PositionManager:
         if pnl_pct >= trail_activate:
             _old_trail = pos.trailing_stop
             if pos.side == "short":
-                # Short: trail ABOVE lowest price — if price rises past this, exit
-                trail_price = pos.lowest_price * (1 + trail_dist / 100.0)
+                # Short: trail ABOVE lowest price
+                if trail_price_dist > 0:
+                    trail_price = pos.lowest_price + trail_price_dist
+                else:
+                    trail_price = pos.lowest_price * (1 + trail_dist / 100.0)
                 if pos.trailing_stop is None or trail_price < pos.trailing_stop:
                     pos.trailing_stop = trail_price
             else:
-                # Long: trail BELOW highest price — if price drops past this, exit
-                trail_price = pos.highest_price * (1 - trail_dist / 100.0)
+                # Long: trail BELOW highest price
+                if trail_price_dist > 0:
+                    trail_price = pos.highest_price - trail_price_dist
+                else:
+                    trail_price = pos.highest_price * (1 - trail_dist / 100.0)
                 if pos.trailing_stop is None or trail_price > pos.trailing_stop:
                     pos.trailing_stop = trail_price
             # Update exchange-side SL to follow the trailing stop
