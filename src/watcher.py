@@ -421,7 +421,7 @@ class WatcherAgent:
             "vol_usd": vol_usd,
             "macd_hist": round(macd_hist, 6),
             "vol_ratio": round(vol_ratio, 2),
-            "ema_aligned": ema_fully_aligned,
+            "ema_aligned": ema5 > ema20 > ema50 if not for_short else ema5 < ema20 < ema50,
             "direction": direction,
             "setup_type": setup_type,
             "timestamp": int(time.time()),
