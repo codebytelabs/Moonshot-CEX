@@ -226,56 +226,26 @@ class AnalyzerAgent:
                         f"pump exhausting, applying normal gates"
                     )
 
-        # ── Multi-EMA Ribbon Pullback Logic (1H) ──────────────────────────────
-        # Instead of lagging EMA9/21 crosses, we check for a structural trend + pullback.
+        # ── Global Safety Filters (Replaced strict EMA gates to support multi-strategy) ──
         if direction == "long" and not _fast_track:
             if "1h" not in tf_data:
-                logger.debug(f"[Analyzer] {symbol} filtered: missing 1h data for EMA ribbon")
+                logger.debug(f"[Analyzer] {symbol} filtered: missing 1h data")
                 return None
             _c1h = tf_data["1h"][:, 4]
-            if len(_c1h) < 200:
-                logger.debug(f"[Analyzer] {symbol} filtered: insufficient 1h data for EMA200")
+            if len(_c1h) < 30:
+                logger.debug(f"[Analyzer] {symbol} filtered: insufficient 1h data")
                 return None
-
-            _ema5 = _ema(_c1h, 5)
-            _ema20 = _ema(_c1h, 20)
-            _ema50 = _ema(_c1h, 50)
-            _ema100 = _ema(_c1h, 100)
-            _ema200 = _ema(_c1h, 200)
-
-            # 1. Structural Trend: EMAs must be stacked or very close to stacked
-            # EMA200 is used for macro trend check
-            if not (_ema5 > _ema20 > _ema50 > _ema100) or _c1h[-1] < _ema200:
-                logger.debug(f"[Analyzer] {symbol} filtered: 1H EMA ribbon not strictly stacked or below EMA200")
-                return None
-
-            # 2. Pullback Zone: Price must be in the pullback zone (bounded roughly by EMA5 and EMA50)
-            # We don't want price > EMA5 * 1.025 (overextended) or < EMA50 * 0.99 (broken structure)
-            _current_price = _c1h[-1]
-            if _current_price > _ema5 * 1.025:
-                logger.info(f"[Analyzer] {symbol} BLOCKED: Price {_current_price:.6f} > EMA5 {_ema5:.6f} * 1.025 (overextended)")
-                return None
-            if _current_price < _ema50 * 0.99:
-                logger.info(f"[Analyzer] {symbol} BLOCKED: Price {_current_price:.6f} < EMA50 {_ema50:.6f} * 0.99 (structure broken)")
-                return None
-
-            # 3. RSI Reset to 40-58 (Momentum reset, not exhaustion)
-            _rsi_1h = _compute_rsi(_c1h, 14)
-            if not (40 <= _rsi_1h <= 60):
-                logger.info(f"[Analyzer] {symbol} BLOCKED: 1H RSI {_rsi_1h:.1f} not in pullback zone (40-60)")
-                return None
-
-            # 4. RSI Direction: Needs to be turning up or stabilizing (not crashing)
-            _rsi_1h_prev = _compute_rsi(_c1h[:-3], 14)
-            if _rsi_1h < _rsi_1h_prev - 3.0:
-                logger.info(f"[Analyzer] {symbol} BLOCKED: 1H RSI actively falling ({_rsi_1h_prev:.1f} -> {_rsi_1h:.1f})")
-                return None
-
-            # 5. Confirmation: 5M candles checking for short-term bounce
-            # At least 2 of the last 5 candles must be green, meaning the pullback is stabilizing/bouncing
+                
+            # Basic Safety 1: No active dump catching (free-falling knives)
             _green_count = sum(1 for i in range(-5, 0) if _closes_5m[i] > _closes_5m[i - 1])
-            if _green_count < 2:
-                logger.info(f"[Analyzer] {symbol} BLOCKED: 5m candles not showing bounce (only {_green_count}/5 green)")
+            if _green_count < 1:
+                logger.info(f"[Analyzer] {symbol} BLOCKED: 5m candles actively dumping (0/5 green)")
+                return None
+                
+            # Basic Safety 2: Market hasn't completely died (RSI > 30)
+            _rsi_1h = _compute_rsi(_c1h, 14)
+            if _rsi_1h < 30:
+                logger.info(f"[Analyzer] {symbol} BLOCKED: 1H RSI {_rsi_1h:.1f} severely oversold, trend structure broken")
                 return None
 
         # Setup classification

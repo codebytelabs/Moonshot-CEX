@@ -303,15 +303,15 @@ class WatcherAgent:
             return None
 
         candles_np = np.array(candles)
+        highs = candles_np[:, 2].astype(float)
+        lows = candles_np[:, 3].astype(float)
         closes = candles_np[:, 4].astype(float)
         volumes = candles_np[:, 5].astype(float)
 
-        score = 0.0
         score_breakdown = {}
-
         price = ticker.get("last") or float(closes[-1])
 
-        # ── EMA Ribbon Alignment (1H) ──────────────────────────────────────
+        # ── Setup Path 1: EMA Ribbon Pullback ────────────────────────────────
         ema5 = _ema(closes, 5)
         ema20 = _ema(closes, 20)
         ema50 = _ema(closes, 50)
@@ -319,43 +319,79 @@ class WatcherAgent:
         ema200 = _ema(closes, 200)
         
         ema_pts = 0.0
-        ema_fully_aligned = False
         
         if for_short:
-            # Bearish stack: EMA5 < EMA20 < EMA50 < EMA100 < EMA200
             if ema5 < ema20 < ema50:
                 ema_pts += 20.0
                 if ema50 < ema100: ema_pts += 10.0
                 if ema100 < ema200: ema_pts += 10.0
-            if ema_pts >= 40.0: ema_fully_aligned = True
         else:
-            # Bullish stack: EMA5 > EMA20 > EMA50 > EMA100 > EMA200
             if ema5 > ema20 > ema50:
                 ema_pts += 20.0
                 if ema50 > ema100: ema_pts += 10.0
                 if ema100 > ema200: ema_pts += 10.0
-            if ema_pts >= 40.0: ema_fully_aligned = True
 
-        score += ema_pts
-        score_breakdown["ema_ribbon"] = ema_pts
-
-        # ── Pullback Penalty / Bonus ──────────────────────────────────────
         pullback_pts = 0.0
         if for_short:
-            # Wait for price to bounce BACK UP into the EMAs
-            if ema5 > price > ema20: pullback_pts = 25.0     # shallow pullback
-            elif ema20 >= price > ema50: pullback_pts = 35.0 # deep pullback (ideal)
-            elif price < ema5 * 0.97: pullback_pts = -30.0   # overextended dump, don't chase
+            if ema5 > price > ema20: pullback_pts = 25.0
+            elif ema20 >= price > ema50: pullback_pts = 35.0
+            elif price < ema5 * 0.97: pullback_pts = -30.0  # overextended dump
         else:
-            # Wait for price to pull BACK DOWN into the EMAs
-            if ema5 < price < ema20: pullback_pts = 25.0     # shallow pullback
-            elif ema20 <= price < ema50: pullback_pts = 35.0 # deep pullback (ideal)
-            elif price > ema5 * 1.03: pullback_pts = -30.0   # overextended pump, don't chase
+            if ema5 < price < ema20: pullback_pts = 25.0
+            elif ema20 <= price < ema50: pullback_pts = 35.0
+            elif price > ema5 * 1.03: pullback_pts = -30.0  # overextended pump
+            
+        rsi = _compute_rsi(closes, 14)
+        rsi_pts = 0.0
+        if for_short:
+            if 42 <= rsi <= 60: rsi_pts = 15.0
+            elif 35 <= rsi < 42: rsi_pts = 5.0
+            elif rsi < 30: rsi_pts = -20.0 
+            elif rsi > 70: rsi_pts = -20.0 
+        else: 
+            if 40 <= rsi <= 58: rsi_pts = 15.0
+            elif 58 < rsi <= 65: rsi_pts = 5.0
+            elif rsi > 70: rsi_pts = -20.0 
+            elif rsi < 30: rsi_pts = -20.0 
 
-        score += pullback_pts
-        score_breakdown["pullback"] = pullback_pts
+        ema_setup_score = ema_pts + pullback_pts + rsi_pts
 
-        # ── Volume Spike ──────────────────────────────────────────────────
+        # ── Setup Path 2: Bollinger Band Squeeze ─────────────────────────────
+        bb_width = 1.0
+        if len(closes) >= 20:
+            window = closes[-20:]
+            sma = np.mean(window)
+            std = np.std(window)
+            if sma > 0:
+                bb_width = (4 * std) / sma
+                
+        squeeze_score = 0.0
+        if bb_width < 0.03: squeeze_score += 50.0  # Extremely tight
+        elif bb_width < 0.06: squeeze_score += 25.0 # Tight
+        
+        # ── Setup Path 3: VWAP Momentum Breakout ─────────────────────────────
+        vwap_score = 0.0
+        if len(closes) >= 24:
+            h_v = highs[-24:]
+            l_v = lows[-24:]
+            c_v = closes[-24:]
+            v_v = volumes[-24:]
+            cum_tp_vol = sum((h_v[i] + l_v[i] + c_v[i]) / 3 * v_v[i] for i in range(len(c_v)))
+            cum_vol = sum(v_v)
+            vwap = cum_tp_vol / cum_vol if cum_vol > 0 else price
+            
+            vwap_dist = (price - vwap) / vwap * 100
+            if (not for_short and vwap_dist > 0.5) or (for_short and vwap_dist < -0.5):
+                vwap_score += 30.0
+
+        # We take the best setup score among the three
+        best_setup_score = max(ema_setup_score, squeeze_score, vwap_score)
+        
+        score_breakdown["ema_setup"] = ema_setup_score
+        score_breakdown["squeeze_setup"] = squeeze_score
+        score_breakdown["vwap_setup"] = vwap_score
+
+        # ── Global Modifier: Volume Profile ──────────────────────────────────
         avg_vol = float(np.mean(volumes[-24:])) if len(volumes) >= 24 else float(np.mean(volumes))
         curr_vol = float(volumes[-1])
         vol_ratio = curr_vol / avg_vol if avg_vol > 0 else 1.0
@@ -365,33 +401,15 @@ class WatcherAgent:
         elif vol_ratio >= 1.5: vol_pts = 10.0
         elif vol_ratio >= 1.2: vol_pts = 5.0
         
-        score += vol_pts
         score_breakdown["volume"] = vol_pts
 
-        # ── RSI Pullback Reset ────────────────────────────────────────────
-        rsi = _compute_rsi(closes, 14)
-        rsi_pts = 0.0
-        if for_short:
-            # Want RSI to have bounced up a bit, but still in bearish territory
-            if 42 <= rsi <= 60: rsi_pts = 15.0
-            elif 35 <= rsi < 42: rsi_pts = 5.0
-            elif rsi < 30: rsi_pts = -20.0  # severely oversold dump
-            elif rsi > 70: rsi_pts = -20.0  # no longer bearish
-        else: 
-            # Want RSI to have cooled off but still in bullish territory
-            if 40 <= rsi <= 58: rsi_pts = 15.0
-            elif 58 < rsi <= 65: rsi_pts = 5.0
-            elif rsi > 70: rsi_pts = -20.0  # overbought, chasing
-            elif rsi < 30: rsi_pts = -20.0  # severely oversold, trend dead
+        # Final Score is Base Setup + Global Modifiers
+        score = max(0.0, best_setup_score) + vol_pts
 
-        score += rsi_pts
-        score_breakdown["rsi_pullback"] = rsi_pts
-        
         macd_hist = _compute_macd_hist(closes, 12, 26, 9)
         pct_change_24h = float(ticker.get("percentage") or 0.0)
-        price = ticker.get("last") or 0.0
         vol_usd = candidate["vol_usd"]
-        setup_type = "momentum_short" if (inverted or for_short) else "momentum"
+        setup_type = "multi_strategy" if score > 30 else "neutral"
 
         return {
             "symbol": symbol,
