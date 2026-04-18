@@ -767,6 +767,30 @@ async def _run_cycle():
             f"{_old_strat_added} old_strat + {_legacy_added} legacy = {len(approved)} total"
         )
 
+    # ── v7.5 Symbol Whitelist (profitability-data-driven) ─────────────────
+    # 231-trade analysis: majors (BTC/ETH/BNB/BCH/...) = 26% WR, -$37 total.
+    # Alts/memes = 5% WR, -$4,565 total. Alts destroy capital.
+    # If SYMBOL_WHITELIST is set, keep only setups whose base asset is on the list.
+    _whitelist_raw = getattr(cfg, "symbol_whitelist", "") or ""
+    _whitelist = {s.strip().upper() for s in _whitelist_raw.split(",") if s.strip()}
+    if _whitelist and approved:
+        _pre_wl = len(approved)
+        _filtered = []
+        _blocked_syms = []
+        for _s in approved:
+            _sym_full = _s.get("symbol", "")
+            _base = _sym_full.split("/")[0].upper() if "/" in _sym_full else _sym_full.upper()
+            if _base in _whitelist:
+                _filtered.append(_s)
+            else:
+                _blocked_syms.append(_base)
+        approved = _filtered
+        if _blocked_syms:
+            logger.info(
+                f"[Cycle {cycle}] Whitelist: {_pre_wl}→{len(approved)} "
+                f"(blocked: {','.join(_blocked_syms[:8])}{'...' if len(_blocked_syms)>8 else ''})"
+            )
+
     # ── Unified quality ranking — best opportunities fill limited slots first ──
     # Composite rank = posterior (Bayesian confidence) × ta_score (TA quality).
     # Without this sort, slots were filled first-come-first-served: if 12 signals

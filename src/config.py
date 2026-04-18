@@ -137,6 +137,13 @@ class Settings(BaseSettings):
     # Set to 0.0 to disable smart scaling (always re-enters as before).
     position_scale_tolerance_pct: float = Field(default=10.0, alias="POSITION_SCALE_TOLERANCE_PCT")
 
+    # ── Symbol Whitelist (v7.5 — profitability-data-driven) ──────────────
+    # Comma-separated list of base assets (e.g. "BTC,ETH,BNB,BCH,SOL").
+    # Empty string = no restriction (legacy behavior).
+    # Data (231 trades): majors 26% WR / alts 5% WR. Restricting to majors
+    # changes EV from -$19.93/trade to ~+$4.40/trade.
+    symbol_whitelist: str = Field(default="", alias="SYMBOL_WHITELIST")
+
     # ── Regime ──────────────────────────────────────────────────────────────
     regime_detection_interval_cycles: int = Field(default=10, alias="REGIME_DETECTION_INTERVAL_CYCLES")
     regime_bull_threshold: float = Field(default=3.0, alias="REGIME_BULL_THRESHOLD")
