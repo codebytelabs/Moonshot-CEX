@@ -920,7 +920,9 @@ class PositionManager:
             # TP / trailing → 5-10 min: profitable exit, fresh signal may re-enter.
             # momentum_faded is the only momentum exit now (full close, not scale-down).
             r = reason.lower()
-            if any(x in r for x in ("stop_loss", "regime_shift", "emergency")):
+            if "btc_crash_sweep" in r:
+                cooldown_m = self.symbol_cooldown_minutes * 3.0    # 90 min: BTC crash — don't re-enter anything
+            elif any(x in r for x in ("stop_loss", "regime_shift", "emergency")):
                 cooldown_m = self.symbol_cooldown_minutes * 1.5   # 45 min
             elif any(x in r for x in ("no_traction", "time_exit")):
                 cooldown_m = self.symbol_cooldown_minutes          # 30 min

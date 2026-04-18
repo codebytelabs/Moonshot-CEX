@@ -963,6 +963,37 @@ async def _run_cycle():
                 f"— {'HARD BLOCK' if _btc_size_scale == 0 else 'reduced sizing'}"
             )
 
+        # v7.5: BTC CRASH SWEEP — when BTC score drops to critical level (≤ 0.30),
+        # proactively close ALL open losing positions rather than waiting for the
+        # time_exit clock to hit. Data: ARKM, FIL, POPCAT, LDO, AXL all bled for
+        # 4 full hours before time_exit while BTC score was 0.28-0.33. This swept
+        # an estimated -$300+ in slow-bleed losses that could have been -$80.
+        _BTC_CRASH_SWEEP_THRESHOLD = 0.30
+        if _btc_score <= _BTC_CRASH_SWEEP_THRESHOLD and _position_manager:
+            _open_positions = list(_position_manager.get_all_positions())
+            if _open_positions:
+                logger.warning(
+                    f"[Cycle {cycle}] BTC CRASH SWEEP: score={_btc_score:.2f} ≤ {_BTC_CRASH_SWEEP_THRESHOLD} "
+                    f"— proactively closing all {len(_open_positions)} losing open positions"
+                )
+                for _crash_pos in _open_positions:
+                    try:
+                        _crash_price = await _execution.get_current_price(_crash_pos.symbol)
+                        if _crash_price <= 0:
+                            continue
+                        _crash_pnl = _crash_pos.current_pnl_pct(_crash_price)
+                        # Only sweep positions that are losing — let winners ride their trailing stop
+                        if _crash_pnl < -0.5:
+                            logger.warning(
+                                f"[Cycle {cycle}] BTC CRASH SWEEP closing {_crash_pos.symbol} "
+                                f"pnl={_crash_pnl:+.1f}% (btc_score={_btc_score:.2f})"
+                            )
+                            await _position_manager._execute_exit(
+                                _crash_pos, _crash_price, "btc_crash_sweep", _crash_pos.amount
+                            )
+                    except Exception as _cse:
+                        logger.warning(f"[Cycle {cycle}] BTC crash sweep failed for {_crash_pos.symbol}: {_cse}")
+
     # v7.3: Reset per-cycle entry counter and compute dynamic entry quality bars
     _risk_manager.reset_cycle_entries()
     _dd_current = _risk_manager._compute_drawdown(equity)

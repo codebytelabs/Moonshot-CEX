@@ -34,10 +34,18 @@ REGIME_SCALE = {
     # v5.0 Wave Rider: SL is FLAT at 1.0× across all regimes.
     # Data: choppy SL×0.65 = -2.28% was too tight for 7x leverage (0.33% noise triggers it).
     # The stop-loss is a hard floor, not a knob to turn. Trail and time still scale.
-    "bull":     {"sl": 1.0,  "trail": 1.2,  "time": 1.5},   # wider trail/time, SL flat
-    "sideways": {"sl": 1.0,  "trail": 1.0,  "time": 1.0},   # default: SL=-3.5%, trail=1.2%/1%, time=3h
-    "bear":     {"sl": 1.0,  "trail": 0.9,  "time": 0.75},  # SL=-3.5% flat, tighter trail, shorter time
-    "choppy":   {"sl": 1.0,  "trail": 0.85, "time": 0.75},  # SL=-3.5% flat, trail=1.02%/0.85%, time=2.25h
+    #
+    # v7.5 TIME EXIT TIGHTENING (2026-04-18 data-driven):
+    # 7/14 losses were time_exit bleeds — positions held 4h then ejected at -2~5%.
+    # Root cause: time limits were too generous for choppy/bear markets. Fix:
+    #   bull:    1.0× (4h) — dropped from 1.5× (6h was reckless, alts drift in bull too)
+    #   sideways:1.0× (4h) — no change
+    #   bear:    0.50× (2h) — dropped from 0.75×. If not moving in 2h in bear, it won't.
+    #   choppy:  0.35× (1.4h) — hard cutoff. Choppy positions don't recover, they bleed.
+    "bull":     {"sl": 1.0,  "trail": 1.2,  "time": 1.0},
+    "sideways": {"sl": 1.0,  "trail": 1.0,  "time": 1.0},
+    "bear":     {"sl": 1.0,  "trail": 0.9,  "time": 0.50},
+    "choppy":   {"sl": 1.0,  "trail": 0.85, "time": 0.35},
 }
 
 # ── Per-regime capital deployment limits ───────────────────────────────────────
@@ -82,19 +90,21 @@ REGIME_SETUP_ALLOWLIST = {
 }
 
 # Minimum ta_score required for bear/choppy regime entries.
-# 50 gates low-quality noise but allows real momentum reversals through.
-# Old value 82 was unreachable — blocked SOL(52), TAO(58), BTC(47) during
-# reversal bounces, causing the bot to sit fully in cash.
-CHOPPY_MIN_TA_SCORE = 50.0
+# v7.5 DATA: Raising from 50 → 72. Live trades show even TA>80 setups
+# bleed in choppy markets due to BTC beta drag. This gates out marginal
+# altcoin signals and requires near-perfect technical confluence.
+CHOPPY_MIN_TA_SCORE = 72.0
 
 # ── Per-regime max concurrent positions ───────────────────────────────────────
 REGIME_MAX_POSITIONS = {
     # v6.0 OVERHAUL: max 4 positions across all regimes. Fewer, higher-quality trades.
     # Data: over-diversification with 6-8 slots = weak conviction per position.
+    # v7.5: choppy→1 (not 2). 36% WR means each extra position is likely a loss.
+    #        bear→2 (down from 3). Concentrated, high-conviction entries only.
     "bull":     4,
     "sideways": 4,
-    "bear":     3,
-    "choppy":   2,
+    "bear":     2,
+    "choppy":   1,
 }
 
 # ── Volatile mode overlay ──────────────────────────────────────────────────────
@@ -112,13 +122,15 @@ VOLATILE_MODE_OVERLAY = {
 # BigBrother RAISES the bar in dangerous regimes (more selective, not less).
 # CRITICAL: volatile/bear threshold must be HIGHER than normal (0.45),
 # not lower. Lower threshold = easier to enter in a bear market = bleeding.
+# v7.5: choppy raised to 0.65 (was 0.55). Live data shows 36% WR — the
+# Bayesian engine was too permissive. Only extremely high-conviction entries.
 REGIME_BAYESIAN_THRESHOLD = {
     "bull":     None,    # leave as QuantMutator / mode-computed value
     "sideways": None,    # leave as default (0.45)
-    # BEAR: only the highest-conviction short-token setups pass
-    "bear":     0.52,
-    # CHOPPY: most restrictive — exceptional setups only
-    "choppy":   0.55,
+    # BEAR: only the highest-conviction setups pass (raised from 0.52)
+    "bear":     0.60,
+    # CHOPPY: most restrictive — only truly exceptional setups (raised from 0.55)
+    "choppy":   0.65,
 }
 
 
