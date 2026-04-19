@@ -1021,8 +1021,12 @@ async def _run_cycle():
             _btc_size_scale = 1.0
         elif _btc_score >= 0.50:
             _btc_size_scale = 0.80
+        elif _btc_score >= 0.40:
+            _btc_size_scale = 0.50  # Weak but not crashed — allow half-size entries
+        elif _btc_score >= 0.25:
+            _btc_size_scale = 0.25  # Struggling — allow quarter-size entries
         else:
-            _btc_size_scale = 0.0  # HARD BLOCK: BTC crash or weak momentum (< 0.5)
+            _btc_size_scale = 0.0  # HARD BLOCK: genuine BTC crash (< 0.25)
         STATE["btc_trend_master_switch"] = _btc_size_scale > 0
         STATE["btc_size_scale"] = _btc_size_scale
 
