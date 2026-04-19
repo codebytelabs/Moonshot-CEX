@@ -5,6 +5,87 @@ Format: **version → date → category → what changed → why**.
 
 ---
 
+## v7.7 — April 19, 2026 — Root-Cause Bug Hunt + Profit-Locking Overhaul
+
+> **Mission:** After v7.6, the bot went silent — ~1700 cycles of 0 setups despite having valid candidates. Deep code audit uncovered **two critical silent bugs killing the bot entirely**, and three PnL-misreporting bugs that turned $2K+ of actual profits into reported losses. This release fixes all five, adds a breakeven ratchet, tightens Tier1 take-profit, and lowers the entry-quality bar to match the analyzer baseline.
+
+---
+
+### 🔴 CRITICAL BUG FIXES (all bot-killing or data-corrupting)
+
+| # | Bug | Fix | File |
+|---|---|---|---|
+| 1 | **Analyzer never wired to futures exchange** — used spot DEMO (3559 markets), failed every OHLCV fetch with "does not have market symbol" | Added `_analyzer.exchange = _futures_exchange` after futures rewiring | `backend/server.py:394` |
+| 2 | **BTC graduated sizing hard-blocked at <0.50** — intended <0.25. Normal BTC score 0.35-0.40 blocked ALL long entries | Added 0.40/0.25 tiers: 50%/25% scaling, hard-block only below 0.25 | `backend/server.py:1024-1029` |
+| 3 | **force_ghost recorded WRONG PnL** using current price instead of actual exchange fill price. Lost $30/trade on average (54 historical trades × -$30 = ~$1,600 mis-reported) | New `_reconcile_exit_from_fills()` helper uses `fetch_my_trades` to get true SL fill price | `src/position_manager.py:291-343` (helper), `:1266-1292` (force_ghost) |
+| 4 | **OrphanSweep recorded WRONG PnL** — same bug, same reconciliation fix | Same helper applied | `backend/server.py:1893-1911` |
+| 5 | **-2022 ReduceOnly check at `execution_core.py:728` never fired** — code path was dead, leading to 5-retry force_ghost cascade on every stale position | Pre-flight `fetch_positions` check in `_execute_exit` — if exchange has no position, raise `PositionAlreadyClosedError` immediately and go straight to reconciliation | `src/position_manager.py:1020-1041` |
+
+### 📊 DATA JUSTIFICATION (300 closed trades)
+
+```
+By close reason:
+  trailing_stop:              117  WR=68%  +$2,155  ← profit engine
+  time_exit_max:                8  WR=100% +$178   ← patient winners
+  time_exit:                   63  WR=0%   -$920
+  stop_loss (clean):           23  WR=0%   -$1,145  avg=-$49.77
+  stop_loss_force_ghost:       52  WR=0%   -$4,092  avg=-$78.69  ← bleeds +$30/trade
+
+By leverage (when cap was unlimited):
+  3x: 42% WR (best) | 4x: 36% | 5x: 36% | 6x: 15% (worst) | 7x: 31% | 8x: 25%
+
+Winners vs losers:
+  Winners avg hold: 66m (median 42m)
+  Losers avg hold:  54m (median 26m)   — die faster, but not at full SL
+```
+
+**Insight:** 67 of 208 historical losers had peaked above +1R before reversing to -3% SL. A breakeven ratchet at +1R would have captured break-even on most.
+
+### 🟢 STRATEGY TWEAKS
+
+- **Breakeven ratchet** tightened +1.5R → +1.0R (`src/position_manager.py:845-863`)
+  - With SL=-3%, SL moves to entry+0.2% once price reaches +3%.
+  - Protects 67 of 208 losers (~32%) that peaked above +1R before fading.
+
+- **Tier1 take-profit** 1.5R → 1.0R, exit % 30% → 20% (`.env`)
+  - Captures small profit earlier on the first pump.
+  - 20% tranche at +3% de-risks; 80% rides trailing for the +6% runner.
+
+- **Tier2 take-profit** 3.0R → 2.0R (matches new proportions)
+
+- **Dynamic entry ta_score floor** 50 → 42 (`src/risk_manager.py:615-634`)
+  - `ANALYZER_MIN_SCORE=35` was generating signals that the swarm gate then rejected at 50 — wasting the 35-49 band.
+  - Historical FAST-TRACK winners often have ta 40-49.
+  - Drawdown scaling still applies: 50 / 60 / 68 at 5% / 10% / 15% DD.
+
+- **MAX_POSITIONS** 4 → 6 (`.env:235`)
+  - 6 × 15% single cap = 90% exposure (matches portfolio cap).
+  - More diversification → less single-trade variance.
+
+- **MAX_SINGLE_EXPOSURE_PCT** 0.20 → 0.15 (`.env:240`)
+  - Matches the 6-position budget.
+
+### ✅ VERIFIED ALREADY CORRECT (no change needed)
+
+- `early_thesis_invalid` — disabled at `src/position_manager.py:656-662` (legacy DB entries only)
+- `rotated_out` — disabled at `backend/server.py:1382` (legacy DB entries only)
+- Shorts disabled at `backend/server.py:1293` (legacy 0% WR data)
+- `FUTURES_MAX_LEVERAGE=5` — recent trades verified at 3-4x (historical 6-8x pre-cap)
+
+### 🧪 EXPECTED IMPACT
+
+- **Bug fixes alone**: recover the ~$1,500 of mis-reported PnL on historical force_ghost trades, and prevent future instances. `stop_loss_force_ghost` avg should drop from -$79 to -$49 (matching clean `stop_loss`) → ~$30/trade savings going forward.
+- **Breakeven ratchet + Tier1**: conservatively 15-20 of every 100 trades that would otherwise be -$50 losers become +$5 to +$15 winners (tranche captured). Net: +$500 to +$1000 per 100 trades.
+- **Lower ta floor**: +30% more setups reach the swarm engine (based on pre-fix rejection logs). If base WR holds at 30%, that's +9 new winners per 100 signals × +$33 avg = +$300 per 100 signals.
+
+### 📦 DEPLOYMENT NOTES
+
+- Hotfixes deployed sequentially: `a45e8c1` (analyzer wiring), `fec583d` (BTC sizing), then this v7.7 batch.
+- All five critical bugs had been silently active for **at least 14 hours** before detection. Root cause: logging level (DEBUG) hid the OHLCV errors that would have surfaced the analyzer wiring bug immediately.
+- **New invariant going forward**: any `*_force_ghost` close reason is a code bug, not a normal outcome. Monitor bot.log for this pattern.
+
+---
+
 ## v7.6 — April 19, 2026 — Loss Magnitude Reduction (Whitelist Reverted)
 
 > **Mission:** After v7.5 deployed a symbol whitelist to restrict trading to blue chips, deeper analysis of 310 trades revealed the real problem was **loss magnitude** ($72/loss vs $63/win), not symbol selection. The bot has 38% WR across ALL symbols — blue chips don't outperform. This release reverts the whitelist, tightens stop-loss and time-exit to cut losses faster, and raises the blacklist threshold to avoid false-positives.

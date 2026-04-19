@@ -1890,15 +1890,32 @@ async def _sweep_orphan_algo_orders_and_positions():
                         )
                         if current_price <= 0:
                             current_price = pos.entry_price
+                        # v7.7: Reconcile PnL from actual exchange fill history
+                        # instead of current price. Exchange-side algo SL/TP fires
+                        # at a specific price that's usually DIFFERENT from the
+                        # current tick price by the time orphan-sweep runs.
+                        (
+                            pnl_usd,
+                            exit_price,
+                            _os_fees,
+                            _os_from_fills,
+                        ) = await _position_manager._reconcile_exit_from_fills(
+                            pos, current_price
+                        )
+                        if _os_from_fills:
+                            pos.total_fees_usd += _os_fees
+                            current_price = exit_price
+                            logger.info(
+                                f"[OrphanSweep] {pos.symbol} reconciled: "
+                                f"exit=${exit_price:.6f} PnL=${pnl_usd:+.2f}"
+                            )
                         if pos.side == "short":
-                            pnl_usd = (pos.entry_price - current_price) * pos.amount
                             pnl_pct = (
                                 (pos.entry_price - current_price)
                                 / pos.entry_price
                                 * 100.0
                             )
                         else:
-                            pnl_usd = (current_price - pos.entry_price) * pos.amount
                             pnl_pct = (
                                 (current_price - pos.entry_price)
                                 / pos.entry_price

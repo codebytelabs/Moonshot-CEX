@@ -22,6 +22,7 @@ v3.1 — Adaptive sizing:
 
   • Conviction × liquidity × TA quality multipliers unchanged from v3.0
 """
+
 import time
 import math
 from typing import Optional
@@ -36,8 +37,20 @@ from .metrics import current_drawdown, win_rate, avg_r_multiple
 #   max_single   — per-position ceiling as fraction of equity
 #   max_risk     — risk-based floor fallback when trade history is thin
 ACCOUNT_TIER_THRESHOLDS = [
-    (2_000,  "small",  0.50, 0.12, 0.05),   # (max_equity, tier, kelly_mult, max_single, max_risk)
-    (20_000, "medium", 0.75, 0.18, 0.08),   # 15-18% per position × 6-8 slots ≈ 90-144% deployed (leveraged)
+    (
+        2_000,
+        "small",
+        0.50,
+        0.12,
+        0.05,
+    ),  # (max_equity, tier, kelly_mult, max_single, max_risk)
+    (
+        20_000,
+        "medium",
+        0.75,
+        0.18,
+        0.08,
+    ),  # 15-18% per position × 6-8 slots ≈ 90-144% deployed (leveraged)
     (float("inf"), "large", 0.90, 0.20, 0.10),
 ]
 
@@ -54,9 +67,9 @@ DRAWDOWN_SCALE = [
 
 # ── Win-streak bonus table ─────────────────────────────────────────────────────
 WIN_STREAK_BONUS = [
-    (5, 1.25),   # 5+ consecutive wins → +25%
-    (3, 1.15),   # 3+ consecutive wins → +15%
-    (0, 1.00),   # baseline
+    (5, 1.25),  # 5+ consecutive wins → +25%
+    (3, 1.15),  # 3+ consecutive wins → +15%
+    (0, 1.00),  # baseline
 ]
 
 
@@ -105,7 +118,9 @@ class RiskManager:
         self._pause_until: Optional[float] = None
         self._trade_history: list[dict] = []
         self._day_trade_count: int = 0
-        self._drawdown_halt_cycles: int = 0  # consecutive cycles blocked by drawdown_halt
+        self._drawdown_halt_cycles: int = (
+            0  # consecutive cycles blocked by drawdown_halt
+        )
         self._entries_this_cycle: int = 0  # reset each cycle
         self._max_entries_per_cycle: int = 2  # cap scatter-shot entries
 
@@ -131,7 +146,9 @@ class RiskManager:
                 self._tier_max_single = max_single
                 self._tier_max_risk = max_risk
                 # Respect original constructor caps — take the more conservative
-                self.max_risk_per_trade_pct = max(self.max_risk_per_trade_pct, max_risk * 0.5)
+                self.max_risk_per_trade_pct = max(
+                    self.max_risk_per_trade_pct, max_risk * 0.5
+                )
                 logger.info(
                     f"[Risk] Account tier: {tier} (equity=${equity:,.0f}) → "
                     f"kelly_mult={k_mult:.2f}× max_single={max_single:.0%} max_risk={max_risk:.0%}"
@@ -159,19 +176,28 @@ class RiskManager:
         # Use regime limit when provided (it handles both up/down: bull=10, bear=4).
         # Config max_positions is only the fallback when no regime data exists.
         eff_max_positions = (
-            regime_max_positions if regime_max_positions is not None else self.max_positions
+            regime_max_positions
+            if regime_max_positions is not None
+            else self.max_positions
         )
         eff_max_exposure = min(
             self.max_portfolio_exposure_pct,
-            regime_max_exposure_pct if regime_max_exposure_pct is not None else self.max_portfolio_exposure_pct,
+            regime_max_exposure_pct
+            if regime_max_exposure_pct is not None
+            else self.max_portfolio_exposure_pct,
         )
 
         if open_count >= eff_max_positions:
             return False, f"max_positions reached ({open_count}/{eff_max_positions})"
 
-        exposure_pct = current_exposure_usd / current_equity if current_equity > 0 else 0.0
+        exposure_pct = (
+            current_exposure_usd / current_equity if current_equity > 0 else 0.0
+        )
         if exposure_pct >= eff_max_exposure:
-            return False, f"max_exposure reached ({exposure_pct:.1%} >= {eff_max_exposure:.1%})"
+            return (
+                False,
+                f"max_exposure reached ({exposure_pct:.1%} >= {eff_max_exposure:.1%})",
+            )
 
         # Drawdown recovery: if halted for N consecutive cycles, the peak is
         # likely stale/inflated (unrealized PnL pumped it up, then positions
@@ -192,7 +218,10 @@ class RiskManager:
                 )
                 drawdown = 0.0  # allow this cycle through
             else:
-                return False, f"drawdown_halt ({drawdown:.1%} > 30%) [{self._drawdown_halt_cycles}/{_DRAWDOWN_RECOVERY_CYCLES} cycles]"
+                return (
+                    False,
+                    f"drawdown_halt ({drawdown:.1%} > 30%) [{self._drawdown_halt_cycles}/{_DRAWDOWN_RECOVERY_CYCLES} cycles]",
+                )
         elif drawdown >= self.max_drawdown_pct:
             # Soft drawdown halt: same recovery mechanism but with shorter window.
             # Peak equity often inflated by unrealized gains that evaporated.
@@ -207,7 +236,10 @@ class RiskManager:
                 )
                 drawdown = 0.0
             else:
-                return False, f"max_drawdown hit ({drawdown:.1%}) [{self._drawdown_halt_cycles}/{_DRAWDOWN_RECOVERY_CYCLES} cycles]"
+                return (
+                    False,
+                    f"max_drawdown hit ({drawdown:.1%}) [{self._drawdown_halt_cycles}/{_DRAWDOWN_RECOVERY_CYCLES} cycles]",
+                )
         else:
             self._drawdown_halt_cycles = 0  # reset counter when not halted
 
@@ -216,14 +248,18 @@ class RiskManager:
             return False, f"consecutive_loss_pause ({remaining}s remaining)"
 
         self._refresh_day_stats(current_equity)
-        day_pnl_pct = (current_equity - self._day_start_equity) / self._day_start_equity if self._day_start_equity > 0 else 0.0
+        day_pnl_pct = (
+            (current_equity - self._day_start_equity) / self._day_start_equity
+            if self._day_start_equity > 0
+            else 0.0
+        )
         if day_pnl_pct <= -self.daily_loss_limit_pct:
             return False, f"daily_loss_limit hit ({day_pnl_pct:.1%})"
 
         # Rolling win-rate gate: if last N trades have abysmal win rate,
         # trigger a 60-min cooldown then resume (avoids permanent deadlock).
         if len(self._trade_history) >= self.rolling_wr_window:
-            recent = self._trade_history[-self.rolling_wr_window:]
+            recent = self._trade_history[-self.rolling_wr_window :]
             wins = sum(1 for t in recent if t.get("won"))
             wr = wins / len(recent)
             if wr < self.rolling_wr_floor:
@@ -234,7 +270,10 @@ class RiskManager:
                         f"→ 60min cooldown"
                     )
                 remaining = int(self._pause_until - time.time())
-                return False, f"rolling_winrate_cooldown ({wins}/{len(recent)} = {wr:.0%}, {remaining}s left)"
+                return (
+                    False,
+                    f"rolling_winrate_cooldown ({wins}/{len(recent)} = {wr:.0%}, {remaining}s left)",
+                )
 
         return True, "ok"
 
@@ -283,7 +322,7 @@ class RiskManager:
         base_size = min(kelly_size, max_single, risk_based)
 
         # ── 1. Account-tier Kelly multiplier ─────────────────────────────────
-        tier_mult = self._tier_kelly_mult / 0.75   # normalise so medium=1.0×
+        tier_mult = self._tier_kelly_mult / 0.75  # normalise so medium=1.0×
         # small=0.67×, medium=1.0×, large=1.20×
         base_size *= tier_mult
 
@@ -305,8 +344,10 @@ class RiskManager:
         # Normalise over the full range (threshold → 1.0) so the multiplier
         # scales smoothly with real posterior values (0.45–0.90).
         # Floor raised to 0.75 so a barely-passing setup still gets 75% of base.
-        conviction_norm = max(0.0, min(1.0, (posterior - threshold) / max(1.0 - threshold, 0.01)))
-        conviction_mult = 0.75 + conviction_norm * 0.65   # 0.75 – 1.40
+        conviction_norm = max(
+            0.0, min(1.0, (posterior - threshold) / max(1.0 - threshold, 0.01))
+        )
+        conviction_mult = 0.75 + conviction_norm * 0.65  # 0.75 – 1.40
 
         # ── 5. Liquidity multiplier ───────────────────────────────────────────
         if vol_usd <= 0:
@@ -326,13 +367,19 @@ class RiskManager:
         ta_mult = 0.90 + (ta_score / 100.0) * 0.20
 
         # ── 7. Regime size multiplier (from BigBrother) ───────────────────────
-        reg_mult = max(0.30, min(1.20, regime_size_mult))   # guard rails
+        reg_mult = max(0.30, min(1.20, regime_size_mult))  # guard rails
 
         # ── Final size ────────────────────────────────────────────────────────
         size = base_size * conviction_mult * liq_mult * ta_mult * reg_mult
-        size = min(size, max_single)   # hard cap (% of equity)
-        size = min(size, 5000.0)       # absolute hard cap — no single position > $5000
-        size = max(size, 50.0)         # minimum order floor — never open a sub-$50 position
+        size = min(size, max_single)  # hard cap (% of equity)
+        size = min(size, 5000.0)  # absolute hard cap — no single position > $5000
+        # v8.0: $150 margin floor (was $50). Rationale from live data: positions
+        # sized at $50-$100 generated trailing-stop wins averaging only $0.30-$0.80
+        # — meaningful PnL requires enough skin in the game. Only apply when the
+        # equity-percentage cap allows it (never exceed max_single).
+        _floor = 150.0 if max_single >= 150.0 else 50.0
+        size = max(size, _floor)
+        size = min(size, max_single)  # final safety: respect equity cap after floor
 
         logger.info(
             f"[Risk] {symbol} size=${size:.2f} "
@@ -409,10 +456,21 @@ class RiskManager:
         notional = margin_size * leverage
 
         # Hard caps for futures
-        max_notional = current_equity * 0.80 * leverage  # deploy up to 80% equity as margin across positions
+        max_notional = (
+            current_equity * 0.80 * leverage
+        )  # deploy up to 80% equity as margin across positions
         notional = min(notional, max_notional)
         notional = min(notional, 50_000.0)  # absolute hard cap for futures notional
-        notional = max(notional, 50.0)
+        # v8.0: $150 MARGIN floor (was $50 notional). Tiny positions produced
+        # trailing wins averaging $0.30 — not worth the fee drag. Only lift
+        # to $150 if the per-position equity-percentage cap headroom allows it.
+        _min_margin = (
+            150.0 if current_equity * self.max_single_exposure_pct >= 150.0 else 50.0
+        )
+        notional = max(notional, _min_margin * leverage)
+        # Re-apply ALL ceilings after floor lift (order matters: the floor can
+        # raise notional above any of the caps when equity is small).
+        notional = min(notional, max_notional, 50_000.0)
 
         logger.info(
             f"[Risk] {symbol} FUTURES size: notional=${notional:.2f} "
@@ -435,7 +493,10 @@ class RiskManager:
     def can_enter_this_cycle(self) -> tuple[bool, str]:
         """Check if more entries are allowed this cycle. Max 2 per cycle prevents scatter-shot."""
         if self._entries_this_cycle >= self._max_entries_per_cycle:
-            return False, f"max_entries_per_cycle ({self._entries_this_cycle}/{self._max_entries_per_cycle})"
+            return (
+                False,
+                f"max_entries_per_cycle ({self._entries_this_cycle}/{self._max_entries_per_cycle})",
+            )
         return True, "ok"
 
     def record_entry(self):
@@ -449,13 +510,15 @@ class RiskManager:
     def record_trade(self, pnl_usd: float, pnl_pct: float, r_multiple: float):
         """Record trade outcome for Kelly and circuit breaker logic."""
         won = pnl_usd > 0
-        self._trade_history.append({
-            "pnl_usd": pnl_usd,
-            "pnl_pct": pnl_pct,
-            "r_multiple": r_multiple,
-            "won": won,
-            "timestamp": int(time.time()),
-        })
+        self._trade_history.append(
+            {
+                "pnl_usd": pnl_usd,
+                "pnl_pct": pnl_pct,
+                "r_multiple": r_multiple,
+                "won": won,
+                "timestamp": int(time.time()),
+            }
+        )
         if len(self._trade_history) > 500:
             self._trade_history = self._trade_history[-500:]
 
@@ -469,7 +532,11 @@ class RiskManager:
                 # v7.3 Graduated cooldown: ramp up pause with more consecutive losses.
                 # 3 losses: 10min, 5 losses: 30min, 7+: 60min. Not binary.
                 _graduated_pause_min = {
-                    3: 10, 4: 20, 5: 30, 6: 45, 7: 60,
+                    3: 10,
+                    4: 20,
+                    5: 30,
+                    6: 45,
+                    7: 60,
                 }.get(min(self._consecutive_losses, 7), 60)
                 new_pause = time.time() + _graduated_pause_min * 60
                 if not self._pause_until or new_pause > self._pause_until:
@@ -519,7 +586,12 @@ class RiskManager:
         _trail_dist_base = max(0.3, min(2.0, atr_pct * 0.5))
 
         # Regime-scale trailing
-        _regime_trail_scale = {"bull": 1.3, "sideways": 1.0, "bear": 0.85, "choppy": 0.8}
+        _regime_trail_scale = {
+            "bull": 1.3,
+            "sideways": 1.0,
+            "bear": 0.85,
+            "choppy": 0.8,
+        }
         _trail_scale = _regime_trail_scale.get(regime, 1.0)
         trail_activate = round(_trail_act_base * _trail_scale, 2)
         trail_dist = round(_trail_dist_base * _trail_scale, 2)
@@ -531,7 +603,7 @@ class RiskManager:
         # Drawdown squeeze: when bleeding, tighten everything
         if drawdown > 0.10:
             trail_activate *= 0.8  # activate trail sooner
-            time_hours *= 0.8     # shorter hold
+            time_hours *= 0.8  # shorter hold
 
         return {
             "stop_loss_pct": sl,
@@ -544,14 +616,21 @@ class RiskManager:
         """Drawdown-scaled entry quality bar. Higher bar when account is bleeding.
 
         Returns minimum ta_score required for entry.
+
+        v7.7: Base lowered 50 → 42. The analyzer approves setups at ta >= 35
+        (ANALYZER_MIN_SCORE) but the swarm gate was rejecting everything below 50,
+        wasting 15 points of signal. Winning FAST-TRACK signals routinely have
+        ta 40-49 (e.g. INIT ta=42 post=0.68 was rejected — exactly the kind of
+        mid-quality trade where trailing stop earns its keep).
+        Still scales up strictly in drawdown to preserve capital.
         """
-        base_score = 50.0  # healthy baseline
+        base_score = 42.0  # healthy baseline
         if drawdown > 0.15:
-            return 70.0  # only the best setups when deep in drawdown
+            return 68.0  # only the best setups when deep in drawdown
         elif drawdown > 0.10:
-            return 65.0
+            return 60.0
         elif drawdown > 0.05:
-            return 55.0
+            return 50.0
         return base_score
 
     def get_min_posterior(self, drawdown: float = 0.0) -> float:
@@ -666,6 +745,9 @@ def _avg_r(trades: list[dict]) -> float:
 
 def _today_start() -> float:
     import datetime
+
     now = datetime.datetime.now(datetime.timezone.utc)
-    today = datetime.datetime(now.year, now.month, now.day, tzinfo=datetime.timezone.utc)
+    today = datetime.datetime(
+        now.year, now.month, now.day, tzinfo=datetime.timezone.utc
+    )
     return today.timestamp()

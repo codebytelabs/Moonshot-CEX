@@ -9,6 +9,7 @@ v3.1 — Regime-adaptive strategy:
   • Per-regime: size multiplier, max exposure, setup allowlist, exit params
   • Choppy = deadliest regime for momentum bots → minimal trading mode
 """
+
 import time
 import collections
 from typing import Optional
@@ -42,10 +43,10 @@ REGIME_SCALE = {
     #   sideways:1.0× (4h) — no change
     #   bear:    0.50× (2h) — dropped from 0.75×. If not moving in 2h in bear, it won't.
     #   choppy:  0.35× (1.4h) — hard cutoff. Choppy positions don't recover, they bleed.
-    "bull":     {"sl": 1.0,  "trail": 1.2,  "time": 1.0},
-    "sideways": {"sl": 1.0,  "trail": 1.0,  "time": 1.0},
-    "bear":     {"sl": 1.0,  "trail": 0.9,  "time": 0.50},
-    "choppy":   {"sl": 1.0,  "trail": 0.85, "time": 0.35},
+    "bull": {"sl": 1.0, "trail": 1.2, "time": 1.0},
+    "sideways": {"sl": 1.0, "trail": 1.0, "time": 1.0},
+    "bear": {"sl": 1.0, "trail": 0.9, "time": 0.50},
+    "choppy": {"sl": 1.0, "trail": 0.85, "time": 0.35},
 }
 
 # ── Per-regime capital deployment limits ───────────────────────────────────────
@@ -62,10 +63,10 @@ REGIME_CAPITAL = {
     # a death spiral where wins shrank to $5-20 and couldn't offset losses.
     # The BTC trend master switch now controls ENTRY gating, not position sizing.
     # When we trade, we trade with MEANINGFUL size. When we don't, we're in cash.
-    "bull":     {"max_exposure_pct": 0.90, "size_mult": 1.00, "max_single_pct": 0.15},
+    "bull": {"max_exposure_pct": 0.90, "size_mult": 1.00, "max_single_pct": 0.15},
     "sideways": {"max_exposure_pct": 0.80, "size_mult": 0.90, "max_single_pct": 0.13},
-    "bear":     {"max_exposure_pct": 0.65, "size_mult": 0.80, "max_single_pct": 0.12},
-    "choppy":   {"max_exposure_pct": 0.60, "size_mult": 0.75, "max_single_pct": 0.10},
+    "bear": {"max_exposure_pct": 0.65, "size_mult": 0.80, "max_single_pct": 0.12},
+    "choppy": {"max_exposure_pct": 0.60, "size_mult": 0.75, "max_single_pct": 0.10},
 }
 
 # ── Per-regime setup allowlist ─────────────────────────────────────────────────
@@ -78,15 +79,40 @@ REGIME_CAPITAL = {
 # CHOPPY: breakout longs only (cleanest signal) + short tokens.
 # pullback/mean_reversion are dangerous in bear/choppy (dip-buying in a downtrend).
 REGIME_SETUP_ALLOWLIST = {
-    "bull":     {"breakout", "momentum", "momentum_short", "pullback", "consolidation_breakout", "mean_reversion"},
-    "sideways": {"breakout", "momentum", "momentum_short", "pullback", "consolidation_breakout"},
+    # v8.0 DATA-DRIVEN: pulled from live VM2 trade-log PnL-by-setup.
+    # Winners (positive PnL or WR >= 50%): vwap_momentum_breakout, consolidation_breakout, breakout_orb.
+    # Losers: mean_reversion (-$308, 20% WR).
+    # NOTE: this allowlist only gates LEGACY analyzer setups. Strategy-engine
+    # signals (ema_trend, bb_mean_rev, vwap_momentum, bb_squeeze) bypass this
+    # filter via the `_is_strategy_signal` exemption in server.py; to actually
+    # disable a strategy globally, zero its weight in
+    # src/strategies/regime_engine.py::REGIME_WEIGHTS. The current EMA-trend
+    # strategy emits setup_type="ema_ribbon_pullback" (not "ema_trend_follow").
+    "bull": {
+        "breakout",
+        "breakout_orb",
+        "momentum",
+        "momentum_short",
+        "pullback",
+        "consolidation_breakout",
+        "vwap_momentum_breakout",
+    },
+    "sideways": {
+        "breakout",
+        "breakout_orb",
+        "momentum",
+        "momentum_short",
+        "pullback",
+        "consolidation_breakout",
+        "vwap_momentum_breakout",
+    },
     # BEAR: momentum longs + shorts. The BTC trend gate (EMA9 >= EMA21*0.997, RSI>40)
     # blocks longs when BTC is genuinely dropping. Regime-level blanket ban was
     # redundant — it sat in 100% cash while alts pumped +11% (TAO, C, HUMA).
-    "bear":     {"momentum", "momentum_short"},
+    "bear": {"momentum", "momentum_short"},
     # CHOPPY: allow momentum longs. The BTC trend gate already blocks longs when BTC is genuinely bearish.
     # Choppy just means volatility, and alts can still pump +9% in choppy markets.
-    "choppy":   {"momentum", "momentum_short"},
+    "choppy": {"momentum", "momentum_short"},
 }
 
 # Minimum ta_score required for bear/choppy regime entries.
@@ -101,10 +127,10 @@ REGIME_MAX_POSITIONS = {
     # Data: over-diversification with 6-8 slots = weak conviction per position.
     # v7.5: choppy→1 (not 2). 36% WR means each extra position is likely a loss.
     #        bear→2 (down from 3). Concentrated, high-conviction entries only.
-    "bull":     4,
+    "bull": 4,
     "sideways": 4,
-    "bear":     2,
-    "choppy":   1,
+    "bear": 2,
+    "choppy": 1,
 }
 
 # ── Volatile mode overlay ──────────────────────────────────────────────────────
@@ -113,9 +139,9 @@ REGIME_MAX_POSITIONS = {
 # spiral. The BTC trend master switch now handles risk by blocking entries
 # entirely when BTC is weak — no need to also shrink positions.
 VOLATILE_MODE_OVERLAY = {
-    "max_positions_mult": 1.0,    # no reduction
-    "size_mult":          1.0,    # no reduction (was 0.80 — caused death spiral)
-    "exposure_mult":      1.0,    # no reduction (was 0.80)
+    "max_positions_mult": 1.0,  # no reduction
+    "size_mult": 1.0,  # no reduction (was 0.80 — caused death spiral)
+    "exposure_mult": 1.0,  # no reduction (was 0.80)
 }
 
 # ── Per-regime Bayesian threshold override ────────────────────────────────────
@@ -125,12 +151,12 @@ VOLATILE_MODE_OVERLAY = {
 # v7.5: choppy raised to 0.65 (was 0.55). Live data shows 36% WR — the
 # Bayesian engine was too permissive. Only extremely high-conviction entries.
 REGIME_BAYESIAN_THRESHOLD = {
-    "bull":     None,    # leave as QuantMutator / mode-computed value
-    "sideways": None,    # leave as default (0.45)
+    "bull": None,  # leave as QuantMutator / mode-computed value
+    "sideways": None,  # leave as default (0.45)
     # BEAR: only the highest-conviction setups pass (raised from 0.52)
-    "bear":     0.60,
+    "bear": 0.60,
     # CHOPPY: most restrictive — only truly exceptional setups (raised from 0.55)
-    "choppy":   0.65,
+    "choppy": 0.65,
 }
 
 
@@ -182,21 +208,25 @@ class BigBrotherAgent:
         # track how many cycles we've held a given regime to avoid flapping
         self._regime_cycles: int = 0
         # LLM macro sentiment: cached score in [-1, +1], updated every 30 cycles
-        self._llm_macro_score: float = 0.0   # 0 = neutral (default until first LLM call)
+        self._llm_macro_score: float = 0.0  # 0 = neutral (default until first LLM call)
         self._llm_macro_label: str = "unknown"
-        self._llm_macro_updated: int = 0      # cycle number of last LLM update
-        self._llm_macro_interval: int = 30    # query LLM every 30 cycles (≈7.5 min)
-        self._last_equity: float = 0.0        # last known equity for status summary drawdown
+        self._llm_macro_updated: int = 0  # cycle number of last LLM update
+        self._llm_macro_interval: int = 30  # query LLM every 30 cycles (≈7.5 min)
+        self._last_equity: float = 0.0  # last known equity for status summary drawdown
 
         # ── Supervisor loop state ────────────────────────────────────────────
-        self._sv_interval: int = 8          # run every 8 cycles (≈2 min at 15s/cycle)
-        self._sv_last_run: int = 0          # last cycle the supervisor ran
+        self._sv_interval: int = 8  # run every 8 cycles (≈2 min at 15s/cycle)
+        self._sv_last_run: int = 0  # last cycle the supervisor ran
         # Rolling agent stats (last 20 cycles for trend detection)
-        self._sv_agent_history: list[dict] = []   # [{watcher, analyzer, errors, ts}]
-        self._sv_exchange_errors: int = 0    # cumulative exchange errors since last SV run
+        self._sv_agent_history: list[dict] = []  # [{watcher, analyzer, errors, ts}]
+        self._sv_exchange_errors: int = (
+            0  # cumulative exchange errors since last SV run
+        )
         self._sv_exchange_latency: list[float] = []  # recent API latencies
         # Position PnL snapshots for stagnation detection
-        self._sv_pos_snapshots: dict[str, list[float]] = {}  # symbol → [pnl_pct history]
+        self._sv_pos_snapshots: dict[
+            str, list[float]
+        ] = {}  # symbol → [pnl_pct history]
         # Last supervisor report (exposed via get_status_summary)
         self._sv_last_report: dict = {}
 
@@ -205,12 +235,14 @@ class BigBrotherAgent:
         self._hm_rsi_snapshots: dict[str, list[float]] = {}  # symbol → [rsi history]
 
         # ── Self-Improvement Loop state ───────────────────────────────────────
-        self._learning_log: list[dict] = []           # in-memory learning log
-        self._learning_log_max: int = 200             # keep last 200 entries
-        self._pattern_interval: int = 120             # run pattern detector every 120 cycles (~30 min)
-        self._pattern_last_run: int = 0               # last cycle pattern detector ran
-        self._confirmed_issues: list[dict] = []       # issues surfaced to dashboard
-        self._confirmed_issues_max: int = 10          # max concurrent issues
+        self._learning_log: list[dict] = []  # in-memory learning log
+        self._learning_log_max: int = 200  # keep last 200 entries
+        self._pattern_interval: int = (
+            120  # run pattern detector every 120 cycles (~30 min)
+        )
+        self._pattern_last_run: int = 0  # last cycle pattern detector ran
+        self._confirmed_issues: list[dict] = []  # issues surfaced to dashboard
+        self._confirmed_issues_max: int = 10  # max concurrent issues
 
     async def supervise(
         self,
@@ -237,7 +269,8 @@ class BigBrotherAgent:
             if (
                 self._llm_macro_enabled
                 and self.api_key
-                and (self._cycle_count - self._llm_macro_updated) >= self._llm_macro_interval
+                and (self._cycle_count - self._llm_macro_updated)
+                >= self._llm_macro_interval
             ):
                 try:
                     llm_signal = await self._fetch_llm_macro_sentiment()
@@ -254,7 +287,9 @@ class BigBrotherAgent:
 
             new_regime = self._detect_regime(btc_ticker, closed_trades)
             if new_regime != self.regime:
-                events.append(self._record_event("regime_change", f"{self.regime} → {new_regime}"))
+                events.append(
+                    self._record_event("regime_change", f"{self.regime} → {new_regime}")
+                )
                 logger.info(f"[BigBrother] Regime: {self.regime} → {new_regime}")
                 self._regime_cycles = 0
                 if self.alerts:
@@ -279,7 +314,9 @@ class BigBrotherAgent:
         # Mode management
         new_mode = self._compute_mode(current_equity, closed_trades)
         if new_mode != self.mode:
-            events.append(self._record_event("mode_change", f"{self.mode} → {new_mode}"))
+            events.append(
+                self._record_event("mode_change", f"{self.mode} → {new_mode}")
+            )
             logger.warning(f"[BigBrother] Mode: {self.mode} → {new_mode}")
             if self.alerts:
                 await self.alerts.send(
@@ -295,7 +332,9 @@ class BigBrotherAgent:
         current_drawdown.set(drawdown)
 
         if drawdown >= self.max_drawdown_pct * 0.8:
-            events.append(self._record_event("drawdown_warning", f"drawdown={drawdown:.1%}"))
+            events.append(
+                self._record_event("drawdown_warning", f"drawdown={drawdown:.1%}")
+            )
             if self.alerts:
                 await self.alerts.send(
                     f"⚠️ Drawdown warning: {drawdown:.1%} (limit: {self.max_drawdown_pct:.0%})",
@@ -310,8 +349,12 @@ class BigBrotherAgent:
             "mode": self.mode,
             "regime_params": regime_params,
             "regime_capital": regime_capital,
-            "regime_setup_allowlist": list(REGIME_SETUP_ALLOWLIST.get(self.regime, set())),
-            "choppy_min_ta_score": CHOPPY_MIN_TA_SCORE if self.regime in ("choppy", "bear") else 0.0,
+            "regime_setup_allowlist": list(
+                REGIME_SETUP_ALLOWLIST.get(self.regime, set())
+            ),
+            "choppy_min_ta_score": CHOPPY_MIN_TA_SCORE
+            if self.regime in ("choppy", "bear")
+            else 0.0,
             "regime_max_positions": regime_capital["max_positions"],
             "drawdown": round(drawdown, 4),
             "win_rate": health["win_rate"],
@@ -355,7 +398,9 @@ class BigBrotherAgent:
             "max_positions": max_pos,
         }
 
-    def _detect_regime(self, btc_ticker: Optional[dict], closed_trades: list[dict]) -> str:
+    def _detect_regime(
+        self, btc_ticker: Optional[dict], closed_trades: list[dict]
+    ) -> str:
         """
         v5.0 Wave Rider regime detector — MARKET-ONLY signals.
 
@@ -379,7 +424,7 @@ class BigBrotherAgent:
         # ── Composite score: BTC-only (-10 → +10) ────────────────────────────
         # BTC 24h change is the dominant signal. +3% = strong bull, -3% = bear.
         # No bot WR, no profit factor, no consecutive loss penalty.
-        score = (btc_change / 2.5) * 5.0   # BTC: ±5 weight (scaled so ±2.5% → ±5)
+        score = (btc_change / 2.5) * 5.0  # BTC: ±5 weight (scaled so ±2.5% → ±5)
 
         if score >= 2.5:
             primary = "bull"
@@ -399,7 +444,9 @@ class BigBrotherAgent:
                 logger.info(f"[BigBrother] LLM macro upgraded regime: {primary} → bull")
                 primary = "bull"
             elif score_with_llm <= -2.0 and primary != "bear":
-                logger.info(f"[BigBrother] LLM macro downgraded regime: {primary} → bear")
+                logger.info(
+                    f"[BigBrother] LLM macro downgraded regime: {primary} → bear"
+                )
                 primary = "bear"
 
         # ── Choppy override — MARKET-ONLY signal ─────────────────────────────
@@ -416,7 +463,11 @@ class BigBrotherAgent:
 
     def _avg_hold_hours(self, trades: list[dict]) -> float:
         """Compute average hold time in hours from recent closed trades."""
-        holds = [t.get("hold_time_hours", 0.0) for t in trades if t.get("hold_time_hours", 0) > 0]
+        holds = [
+            t.get("hold_time_hours", 0.0)
+            for t in trades
+            if t.get("hold_time_hours", 0) > 0
+        ]
         if not holds:
             return 0.0
         return sum(holds) / len(holds)
@@ -459,6 +510,7 @@ class BigBrotherAgent:
                     raw = resp.json()["choices"][0]["message"]["content"].strip()
                     # Parse JSON from response
                     import json as _json
+
                     start = raw.find("{")
                     end = raw.rfind("}") + 1
                     if start != -1 and end > 0:
@@ -552,7 +604,9 @@ class BigBrotherAgent:
 
     def get_status_summary(self) -> dict:
         uptime_hours = (time.time() - self._start_time) / 3600.0
-        health = self.risk.check_portfolio_health(self._last_equity if self._last_equity > 0 else self.risk.peak_equity)
+        health = self.risk.check_portfolio_health(
+            self._last_equity if self._last_equity > 0 else self.risk.peak_equity
+        )
         return {
             "regime": self.regime,
             "mode": self.mode,
@@ -567,7 +621,9 @@ class BigBrotherAgent:
             "bayesian_priors": self.bayesian.get_status()["priors"],
             "regime_params": self._build_regime_params(self.regime),
             "regime_capital": self._build_regime_capital(self.regime),
-            "regime_setup_allowlist": list(REGIME_SETUP_ALLOWLIST.get(self.regime, set())),
+            "regime_setup_allowlist": list(
+                REGIME_SETUP_ALLOWLIST.get(self.regime, set())
+            ),
             # LLM macro signal — visible in /api/swarm/status for observability
             "llm_macro_score": self._llm_macro_score,
             "llm_macro_label": self._llm_macro_label,
@@ -592,12 +648,14 @@ class BigBrotherAgent:
         api_latency: float = 0.0,
     ) -> None:
         """Called every cycle from server.py to feed telemetry into the supervisor."""
-        self._sv_agent_history.append({
-            "watcher": watcher_candidates,
-            "analyzer": analyzer_setups,
-            "errors": cycle_errors,
-            "ts": time.time(),
-        })
+        self._sv_agent_history.append(
+            {
+                "watcher": watcher_candidates,
+                "analyzer": analyzer_setups,
+                "errors": cycle_errors,
+                "ts": time.time(),
+            }
+        )
         # Keep last 30 cycles (~7.5 min of history)
         if len(self._sv_agent_history) > 30:
             self._sv_agent_history = self._sv_agent_history[-30:]
@@ -661,7 +719,9 @@ class BigBrotherAgent:
         report["checks"]["positions"] = pos_checks
         for pc in pos_checks.get("stagnant", []):
             report["actions"].append(f"TIGHTEN: {pc['symbol']} stagnant {pc['detail']}")
-            self._record_event("supervisor_pos_stagnant", f"{pc['symbol']}: {pc['detail']}")
+            self._record_event(
+                "supervisor_pos_stagnant", f"{pc['symbol']}: {pc['detail']}"
+            )
         for pc in pos_checks.get("underwater_long", []):
             report["actions"].append(f"WATCH: {pc['symbol']} underwater {pc['detail']}")
 
@@ -684,7 +744,9 @@ class BigBrotherAgent:
         if exchange_health["status"] == "degraded":
             report["actions"].append(f"WARN: {exchange_health['detail']}")
             report["alerts"].append(exchange_health["detail"])
-            self._record_event("supervisor_exchange_degraded", exchange_health["detail"])
+            self._record_event(
+                "supervisor_exchange_degraded", exchange_health["detail"]
+            )
 
         # ── 6. Position Health Monitor — live RSI/momentum check ───────────
         # Fetches 5m candles, computes RSI, closes stale losers with fading momentum.
@@ -778,25 +840,41 @@ class BigBrotherAgent:
         issues = []
         # Watcher producing zero candidates for most cycles = something broken
         if watcher_zeros >= 6:
-            issues.append(f"Watcher returned 0 candidates in {watcher_zeros}/{len(recent)} cycles")
+            issues.append(
+                f"Watcher returned 0 candidates in {watcher_zeros}/{len(recent)} cycles"
+            )
         # Analyzer producing zero setups consistently (could be legitimate in choppy)
         # Only flag if watcher IS producing candidates but analyzer kills them all
         if analyzer_zeros >= 7 and avg_watcher > 10:
-            issues.append(f"Analyzer produced 0 setups in {analyzer_zeros}/{len(recent)} cycles despite {avg_watcher:.0f} avg candidates")
+            issues.append(
+                f"Analyzer produced 0 setups in {analyzer_zeros}/{len(recent)} cycles despite {avg_watcher:.0f} avg candidates"
+            )
         # Error spike
         if error_total >= 5:
             issues.append(f"{error_total} errors in last {len(recent)} cycles")
 
         if issues:
-            return {"status": "degraded", "detail": "; ".join(issues),
-                    "avg_watcher": round(avg_watcher, 1), "avg_analyzer": round(avg_analyzer, 1)}
-        return {"status": "healthy", "detail": "OK",
-                "avg_watcher": round(avg_watcher, 1), "avg_analyzer": round(avg_analyzer, 1)}
+            return {
+                "status": "degraded",
+                "detail": "; ".join(issues),
+                "avg_watcher": round(avg_watcher, 1),
+                "avg_analyzer": round(avg_analyzer, 1),
+            }
+        return {
+            "status": "healthy",
+            "detail": "OK",
+            "avg_watcher": round(avg_watcher, 1),
+            "avg_analyzer": round(avg_analyzer, 1),
+        }
 
     def _check_strategy_performance(self, closed_trades: list) -> dict:
         """Is the bot making money? Detect bleeding before drawdown triggers."""
         if len(closed_trades) < 5:
-            return {"status": "healthy", "detail": "insufficient trades", "expectancy": 0}
+            return {
+                "status": "healthy",
+                "detail": "insufficient trades",
+                "expectancy": 0,
+            }
 
         # Last 10 trades: rolling expectancy and win rate
         recent = closed_trades[-10:]
@@ -806,12 +884,18 @@ class BigBrotherAgent:
         total_pnl = sum(t.get("pnl_usd", 0) for t in recent)
         expectancy = total_pnl / len(recent)
         avg_win = sum(t.get("pnl_usd", 0) for t in wins) / len(wins) if wins else 0
-        avg_loss = sum(t.get("pnl_usd", 0) for t in losses) / len(losses) if losses else 0
+        avg_loss = (
+            sum(t.get("pnl_usd", 0) for t in losses) / len(losses) if losses else 0
+        )
 
         # Last 5 trades: short-term trend
         last5 = closed_trades[-5:]
         last5_pnl = sum(t.get("pnl_usd", 0) for t in last5)
-        last5_wr = sum(1 for t in last5 if t.get("pnl_usd", 0) > 0) / len(last5) if last5 else 0
+        last5_wr = (
+            sum(1 for t in last5 if t.get("pnl_usd", 0) > 0) / len(last5)
+            if last5
+            else 0
+        )
 
         result = {
             "win_rate_10": round(wr, 2),
@@ -855,7 +939,11 @@ class BigBrotherAgent:
             current_pnl = pos.current_pnl_pct(highest)  # PnL at best point
             # Use last known price approximation from highest/lowest tracking
             # (actual price fetching happens in server.py, not here)
-            peak_pnl = pos.current_pnl_pct(highest) if pos.side == "long" else pos.current_pnl_pct(getattr(pos, "lowest_price", entry))
+            peak_pnl = (
+                pos.current_pnl_pct(highest)
+                if pos.side == "long"
+                else pos.current_pnl_pct(getattr(pos, "lowest_price", entry))
+            )
 
             # Track PnL snapshots for stagnation detection
             sym = pos.symbol
@@ -872,29 +960,37 @@ class BigBrotherAgent:
                 # Check if peak PnL hasn't improved over last 3 supervisor runs (≈6 min)
                 pnl_range = max(snaps[-3:]) - min(snaps[-3:])
                 if pnl_range < 0.3:  # PnL hasn't moved >0.3% in 6 minutes
-                    result["stagnant"].append({
-                        "symbol": sym,
-                        "pos": pos,
-                        "hold_h": round(hold_h, 2),
-                        "peak_pnl": round(peak_pnl, 2),
-                        "detail": f"held {hold_h:.1f}h, peak {peak_pnl:+.1f}%, PnL flat for {len(snaps[-3:])} checks",
-                    })
+                    result["stagnant"].append(
+                        {
+                            "symbol": sym,
+                            "pos": pos,
+                            "hold_h": round(hold_h, 2),
+                            "peak_pnl": round(peak_pnl, 2),
+                            "detail": f"held {hold_h:.1f}h, peak {peak_pnl:+.1f}%, PnL flat for {len(snaps[-3:])} checks",
+                        }
+                    )
                     continue
 
             # ── Underwater long: held >30min and consistently red ──
             if hold_h >= 0.5 and peak_pnl < 0:
-                result["underwater_long"].append({
-                    "symbol": sym,
-                    "hold_h": round(hold_h, 2),
-                    "peak_pnl": round(peak_pnl, 2),
-                    "detail": f"held {hold_h:.1f}h, best PnL {peak_pnl:+.1f}% — never went green",
-                })
+                result["underwater_long"].append(
+                    {
+                        "symbol": sym,
+                        "hold_h": round(hold_h, 2),
+                        "peak_pnl": round(peak_pnl, 2),
+                        "detail": f"held {hold_h:.1f}h, best PnL {peak_pnl:+.1f}% — never went green",
+                    }
+                )
                 continue
 
             result["healthy"] += 1
 
         # Clean snapshots for closed positions
-        open_syms = {getattr(p, "symbol", "") for p in positions if getattr(p, "status", "") == "open"}
+        open_syms = {
+            getattr(p, "symbol", "")
+            for p in positions
+            if getattr(p, "status", "") == "open"
+        }
         for sym in list(self._sv_pos_snapshots.keys()):
             if sym not in open_syms:
                 del self._sv_pos_snapshots[sym]
@@ -903,10 +999,19 @@ class BigBrotherAgent:
 
     def _check_concentration_risk(self, positions: list) -> dict:
         """Are positions too correlated? Detect sector concentration."""
-        open_pos = [p for p in positions if getattr(p, "status", "") == "open"
-                    and getattr(p, "setup_type", "") not in ("synced_holding", "exchange_holding")]
+        open_pos = [
+            p
+            for p in positions
+            if getattr(p, "status", "") == "open"
+            and getattr(p, "setup_type", "")
+            not in ("synced_holding", "exchange_holding")
+        ]
         if len(open_pos) < 3:
-            return {"status": "healthy", "detail": "too few positions to assess", "count": len(open_pos)}
+            return {
+                "status": "healthy",
+                "detail": "too few positions to assess",
+                "count": len(open_pos),
+            }
 
         # Check: all positions same side (all long or all short)
         sides = [getattr(p, "side", "long") for p in open_pos]
@@ -917,7 +1022,11 @@ class BigBrotherAgent:
         pnl_signs = []
         for p in open_pos:
             highest = getattr(p, "highest_price", p.entry_price)
-            pnl = p.current_pnl_pct(highest) if p.side == "long" else p.current_pnl_pct(getattr(p, "lowest_price", p.entry_price))
+            pnl = (
+                p.current_pnl_pct(highest)
+                if p.side == "long"
+                else p.current_pnl_pct(getattr(p, "lowest_price", p.entry_price))
+            )
             pnl_signs.append(1 if pnl > 0 else -1)
 
         all_same_sign = len(set(pnl_signs)) == 1 and len(pnl_signs) >= 3
@@ -926,13 +1035,23 @@ class BigBrotherAgent:
         if long_pct == 1.0 and len(open_pos) >= 4:
             issues.append(f"All {len(open_pos)} positions are LONG — no hedge")
         if all_same_sign and pnl_signs[0] == -1:
-            issues.append(f"All {len(open_pos)} positions are RED — highly correlated downturn")
+            issues.append(
+                f"All {len(open_pos)} positions are RED — highly correlated downturn"
+            )
 
         if issues:
-            return {"status": "high", "detail": "; ".join(issues), "count": len(open_pos),
-                    "long_pct": round(long_pct, 2)}
-        return {"status": "healthy", "detail": "OK", "count": len(open_pos),
-                "long_pct": round(long_pct, 2)}
+            return {
+                "status": "high",
+                "detail": "; ".join(issues),
+                "count": len(open_pos),
+                "long_pct": round(long_pct, 2),
+            }
+        return {
+            "status": "healthy",
+            "detail": "OK",
+            "count": len(open_pos),
+            "long_pct": round(long_pct, 2),
+        }
 
     def _check_exchange_health(self) -> dict:
         """API error rate and latency check."""
@@ -952,10 +1071,18 @@ class BigBrotherAgent:
             issues.append(f"Max API latency {max_lat:.1f}s (timeout risk)")
 
         if issues:
-            return {"status": "degraded", "detail": "; ".join(issues),
-                    "error_count": error_count, "avg_latency": round(avg_lat, 2)}
-        return {"status": "healthy", "detail": "OK",
-                "error_count": error_count, "avg_latency": round(avg_lat, 2)}
+            return {
+                "status": "degraded",
+                "detail": "; ".join(issues),
+                "error_count": error_count,
+                "avg_latency": round(avg_lat, 2),
+            }
+        return {
+            "status": "healthy",
+            "detail": "OK",
+            "error_count": error_count,
+            "avg_latency": round(avg_lat, 2),
+        }
 
     async def _heal_stagnant_position(self, pos, position_manager) -> None:
         """Self-healing: tighten trailing stop on stagnant positions.
@@ -965,7 +1092,9 @@ class BigBrotherAgent:
         the full time_exit to clean it up.
         """
         try:
-            current_price = await position_manager.execution.get_current_price(pos.symbol)
+            current_price = await position_manager.execution.get_current_price(
+                pos.symbol
+            )
             if current_price <= 0:
                 return
 
@@ -1046,7 +1175,9 @@ class BigBrotherAgent:
                 continue
 
             try:
-                current_price = await position_manager.execution.get_current_price(symbol)
+                current_price = await position_manager.execution.get_current_price(
+                    symbol
+                )
                 if current_price <= 0:
                     continue
                 pnl_pct = pos.current_pnl_pct(current_price)
@@ -1107,35 +1238,45 @@ class BigBrotherAgent:
                         pos, current_price, close_reason, pos.amount
                     )
                     if result:
-                        closed_results.append({
-                            "symbol": symbol,
-                            "reason": close_reason,
-                            "pnl_pct": round(pnl_pct, 2),
-                            "pnl_usd": float(result.get("pnl_usd", 0)),
-                            "hold_min": round(hold_minutes, 1),
-                            "rsi": round(rsi, 1),
-                            "side": side,
-                            "result": result,
-                        })
+                        closed_results.append(
+                            {
+                                "symbol": symbol,
+                                "reason": close_reason,
+                                "pnl_pct": round(pnl_pct, 2),
+                                "pnl_usd": float(result.get("pnl_usd", 0)),
+                                "hold_min": round(hold_minutes, 1),
+                                "rsi": round(rsi, 1),
+                                "side": side,
+                                "result": result,
+                            }
+                        )
                         # Log lesson for self-improvement
                         self._log_lesson(pos, result, close_reason, rsi)
                 except Exception as e:
                     logger.warning(f"[HealthMonitor] Exit failed for {symbol}: {e}")
 
         # Clean RSI snapshots for closed/missing positions
-        open_syms = {getattr(p, "symbol", "") for p in positions if getattr(p, "status", "") == "open"}
+        open_syms = {
+            getattr(p, "symbol", "")
+            for p in positions
+            if getattr(p, "status", "") == "open"
+        }
         for sym in list(self._hm_rsi_snapshots.keys()):
             if sym not in open_syms:
                 del self._hm_rsi_snapshots[sym]
 
         if closed_results:
-            logger.info(f"[HealthMonitor] Closed {len(closed_results)} position(s) with fading momentum")
+            logger.info(
+                f"[HealthMonitor] Closed {len(closed_results)} position(s) with fading momentum"
+            )
 
         return closed_results
 
     # ── Self-Improvement: Learning Log ────────────────────────────────────────
 
-    def _log_lesson(self, pos, exit_result: dict, close_reason: str, rsi_at_close: float) -> None:
+    def _log_lesson(
+        self, pos, exit_result: dict, close_reason: str, rsi_at_close: float
+    ) -> None:
         """Record WHY a position was taken and WHY it was closed.
 
         Called on every health-monitor close. Can also be called externally
@@ -1160,7 +1301,7 @@ class BigBrotherAgent:
         }
         self._learning_log.append(entry)
         if len(self._learning_log) > self._learning_log_max:
-            self._learning_log = self._learning_log[-self._learning_log_max:]
+            self._learning_log = self._learning_log[-self._learning_log_max :]
 
         logger.info(
             f"[SelfImprove] LESSON: {entry['symbol']} {entry['side']} "
@@ -1186,11 +1327,11 @@ class BigBrotherAgent:
             "mode_at_entry": trade_dict.get("mode", self.mode),
             "decision": trade_dict.get("decision", {}),
             "lesson": f"Lost {trade_dict.get('pnl_pct', 0):+.1f}% via {trade_dict.get('close_reason', '?')} "
-                      f"after {trade_dict.get('hold_minutes', 0):.0f}min in {self.regime} regime",
+            f"after {trade_dict.get('hold_minutes', 0):.0f}min in {self.regime} regime",
         }
         self._learning_log.append(entry)
         if len(self._learning_log) > self._learning_log_max:
-            self._learning_log = self._learning_log[-self._learning_log_max:]
+            self._learning_log = self._learning_log[-self._learning_log_max :]
 
     @staticmethod
     def _generate_lesson(pos, close_reason: str, rsi: float) -> str:
@@ -1198,14 +1339,20 @@ class BigBrotherAgent:
         setup = getattr(pos, "setup_type", "unknown")
         hold_min = pos.hold_time_hours() * 60
         if "rsi_fade" in close_reason:
-            return (f"Entered {side} {setup}, RSI faded to {rsi:.0f} after {hold_min:.0f}min — "
-                    f"momentum was already exhausted at entry")
+            return (
+                f"Entered {side} {setup}, RSI faded to {rsi:.0f} after {hold_min:.0f}min — "
+                f"momentum was already exhausted at entry"
+            )
         if "momentum_lost" in close_reason:
-            return (f"Entered {side} {setup}, momentum fully reversed (RSI={rsi:.0f}) "
-                    f"after {hold_min:.0f}min — entry was against emerging trend")
+            return (
+                f"Entered {side} {setup}, momentum fully reversed (RSI={rsi:.0f}) "
+                f"after {hold_min:.0f}min — entry was against emerging trend"
+            )
         if "rsi_bounce" in close_reason:
-            return (f"Short {setup} hit RSI bounce to {rsi:.0f} after {hold_min:.0f}min — "
-                    f"selling pressure exhausted")
+            return (
+                f"Short {setup} hit RSI bounce to {rsi:.0f} after {hold_min:.0f}min — "
+                f"selling pressure exhausted"
+            )
         return f"{side} {setup} closed after {hold_min:.0f}min: {close_reason}"
 
     # ── Self-Improvement: Pattern Detector ────────────────────────────────────
@@ -1231,14 +1378,18 @@ class BigBrotherAgent:
         recent_losers = []
         for t in closed_trades[-20:]:
             if float(t.get("pnl_usd", 0)) < 0:
-                recent_losers.append({
-                    "setup_type": t.get("setup_type", "unknown"),
-                    "close_reason": t.get("close_reason", "unknown"),
-                    "pnl_pct": float(t.get("pnl_pct", 0)),
-                    "hold_minutes": float(t.get("hold_minutes", t.get("hold_time_hours", 0) * 60)),
-                    "regime_at_entry": t.get("regime", "unknown"),
-                    "side": t.get("side", "long"),
-                })
+                recent_losers.append(
+                    {
+                        "setup_type": t.get("setup_type", "unknown"),
+                        "close_reason": t.get("close_reason", "unknown"),
+                        "pnl_pct": float(t.get("pnl_pct", 0)),
+                        "hold_minutes": float(
+                            t.get("hold_minutes", t.get("hold_time_hours", 0) * 60)
+                        ),
+                        "regime_at_entry": t.get("regime", "unknown"),
+                        "side": t.get("side", "long"),
+                    }
+                )
 
         all_losses = recent_lessons + recent_losers
         if len(all_losses) < 3:
@@ -1278,8 +1429,10 @@ class BigBrotherAgent:
                     issue = {
                         "id": issue_id,
                         "severity": "high",
-                        "summary": (f"Regime '{regime}' has {wr:.0f}% win rate over last {total} trades "
-                                    f"— consider pausing entries in this regime"),
+                        "summary": (
+                            f"Regime '{regime}' has {wr:.0f}% win rate over last {total} trades "
+                            f"— consider pausing entries in this regime"
+                        ),
                         "count": total,
                         "ts": int(time.time()),
                         "category": "regime",
@@ -1355,12 +1508,16 @@ class BigBrotherAgent:
         self._confirmed_issues = [i for i in self._confirmed_issues if i["ts"] > cutoff]
         self._confirmed_issues.append(issue)
         if len(self._confirmed_issues) > self._confirmed_issues_max:
-            self._confirmed_issues = self._confirmed_issues[-self._confirmed_issues_max:]
+            self._confirmed_issues = self._confirmed_issues[
+                -self._confirmed_issues_max :
+            ]
 
     def dismiss_issue(self, issue_id: str) -> bool:
         """Dismiss a confirmed issue (called from dashboard API)."""
         before = len(self._confirmed_issues)
-        self._confirmed_issues = [i for i in self._confirmed_issues if i["id"] != issue_id]
+        self._confirmed_issues = [
+            i for i in self._confirmed_issues if i["id"] != issue_id
+        ]
         return len(self._confirmed_issues) < before
 
     @property

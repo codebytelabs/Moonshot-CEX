@@ -26,6 +26,23 @@ class SubMinimumAmountError(Exception):
             f"{symbol} exit amount {amount:.8f} < exchange minimum {min_amount:.8f} (dust)"
         )
 
+
+class PositionAlreadyClosedError(Exception):
+    """Raised when Binance rejects an exit order with -2022 ReduceOnly.
+
+    This means the position was already closed exchange-side (e.g. the algo
+    stop-loss triggered), but the bot still thinks it's open. PositionManager
+    should catch this and ghost-close immediately WITHOUT retrying (retries
+    will all fail with the same error and waste time).
+    """
+    def __init__(self, symbol: str, reason: str):
+        self.symbol = symbol
+        self.reason = reason
+        super().__init__(
+            f"{symbol}: position already closed on exchange (-2022 ReduceOnly)"
+        )
+
+
 class ExecutionCore:
     """Order execution with retry and paper trading support."""
 
@@ -703,6 +720,17 @@ class FuturesExecutionCore(ExecutionCore):
                 raise
             except Exception as e:
                 _err_str = str(e)
+                # ── -2022 ReduceOnly: position already closed on exchange ──
+                # Retrying is futile — every attempt returns the same error.
+                # Raise immediately so PositionManager can ghost-close in ONE
+                # hop instead of burning 5 attempts × 3 retries = 15 rejections
+                # per stale position (root cause of 6,900+ rejection log spam).
+                if "-2022" in _err_str or "reduceonly" in _err_str.lower():
+                    logger.warning(
+                        f"[FuturesExec] {symbol} ({reason}): position already closed "
+                        f"on exchange (-2022) — aborting retries, will ghost-close"
+                    )
+                    raise PositionAlreadyClosedError(symbol, reason) from e
                 # ── Max quantity exceeded (-4005): halve and close in chunks ──
                 # BAS/USDT had 1M tokens but Binance max was ~500K.
                 # Without this, exit fails 5× and position gets ghost-closed.
