@@ -39,7 +39,7 @@ from src.bigbrother import BigBrotherAgent
 from src.alerts import AlertManager
 from src.metrics import account_equity, portfolio_value
 from src.performance_tracker import PerformanceTracker
-from src.strategy_manager import StrategyManager
+from src.strategy_manager import StrategyManager, compute_old_strategy_merge_cap
 from src.strategies.regime_engine import RegimeEngine
 from src.leverage_engine import LeverageEngine
 
@@ -781,8 +781,9 @@ async def _run_cycle():
             approved.append(setup)
     # 2) Old strategy manager signals (2 slot cap)
     _old_strat_added = 0
+    _old_strat_cap = compute_old_strategy_merge_cap(strategy_setups, cfg.max_positions)
     for setup in strategy_setups:
-        if _old_strat_added >= 2:
+        if _old_strat_added >= _old_strat_cap:
             break
         sym = setup.get("symbol", "")
         if sym not in seen_symbols:

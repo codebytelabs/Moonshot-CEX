@@ -29,6 +29,18 @@ from .strategies.breakout import BreakoutORB
 from .strategies.mean_reversion import MeanReversionStrategy
 
 
+def compute_old_strategy_merge_cap(strategy_setups: list[dict], max_positions: int) -> int:
+    breakout_count = sum(
+        1
+        for setup in strategy_setups
+        if setup.get("strategy") == "breakout"
+        or setup.get("setup_type") == "breakout_orb"
+    )
+    if breakout_count == 0:
+        return 2
+    return min(3, max(2, max_positions // 2))
+
+
 class StrategyManager:
     """Manages multiple concurrent trading strategies."""
 

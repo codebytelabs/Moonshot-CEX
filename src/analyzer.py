@@ -249,12 +249,11 @@ class AnalyzerAgent:
                 return None
 
         # Setup classification
-        setup_type = self._classify_setup(tf_data, ta_scores)
-        # Tokens that cleared all hard filter gates ARE showing momentum signals.
-        # 'neutral' just means score patterns don't fit a clean category — trade it
-        # as momentum. Position sizing (kelly × ta_score) auto-scales weak signals smaller.
-        if setup_type == "neutral":
-            setup_type = "momentum"
+        setup_type = self._finalize_setup_type(
+            self._classify_setup(tf_data, ta_scores), _fast_track
+        )
+        if setup_type is None:
+            return None
         # ── v6.0 OVERHAUL: block short direction entirely ────────────────
         # Trade data: momentum_short had negative expectancy across all regimes.
         # Focus exclusively on long momentum setups.
@@ -335,6 +334,11 @@ class AnalyzerAgent:
             score += min(20.0, max(0.0, obv_slope * 20.0))
 
         return min(100.0, score)
+
+    def _finalize_setup_type(self, setup_type: str, fast_track: bool) -> Optional[str]:
+        if setup_type != "neutral":
+            return setup_type
+        return "momentum" if fast_track else None
 
     def _classify_setup(self, tf_data: dict, ta_scores: dict) -> str:
         score_5m = ta_scores.get("5m", 0.0)

@@ -5,6 +5,29 @@ Format: **version → date → category → what changed → why**.
 
 ---
 
+## v7.8 — April 19, 2026 — Strategy Quality Pruning + Trend Engine Rebalance
+
+> **Mission:** Remove the legacy analyzer's garbage-bucket entries, restore the higher-quality EMA trend-follow behavior that previously produced the best ROI, and give the strongest live winners more allocation in the merge path and bull-regime router.
+
+---
+
+### WHAT CHANGED
+
+| Area | Change | Why |
+|---|---|---|
+| `src/analyzer.py` | Killed the `neutral → momentum` fallback unless the symbol is explicitly approved by the fast-track path | Historical review showed the fallback was leaking low-quality legacy entries into the momentum bucket and bleeding PnL |
+| `src/strategies/ema_trend.py` | Replaced the over-strict `ema_ribbon_pullback` logic with a long-only EMA trend-follow / continuation model and restored `setup_type="ema_trend_follow"` | The pullback-only variant had become too selective and regressed against the older trend-follow engine that was the highest-ROI setup |
+| `src/strategies/regime_engine.py` | Bull weights rebalanced to `ema_trend=0.45`, `vwap_momentum=0.50`, `bb_squeeze=0.15` | Bull data favored VWAP momentum most, with EMA trend still deserving higher priority than before |
+| `backend/server.py` + `src/strategy_manager.py` | Old-strategy merge cap is now dynamic: profitable breakout-orb flows can use up to 3 slots when capacity allows | Breakout ORB was profitable but under-utilized by the fixed 2-slot merge cap |
+| `__tests__/` | Added focused regression tests for analyzer setup finalization, EMA trend signal generation, and breakout merge-cap scaling | Locks in the v7.8 behavior and reduces the chance of accidental strategy regressions |
+
+### PENDING MONITORING
+
+- Watch live `ema_trend_follow` trade count, win rate, and expectancy after redeploy before making any further EMA loosening.
+- Keep the global short-direction block unchanged until fresh post-v7.8 data proves a durable short edge.
+
+---
+
 ## v7.7 — April 19, 2026 — Root-Cause Bug Hunt + Profit-Locking Overhaul
 
 > **Mission:** After v7.6, the bot went silent — ~1700 cycles of 0 setups despite having valid candidates. Deep code audit uncovered **two critical silent bugs killing the bot entirely**, and three PnL-misreporting bugs that turned $2K+ of actual profits into reported losses. This release fixes all five, adds a breakeven ratchet, tightens Tier1 take-profit, and lowers the entry-quality bar to match the analyzer baseline.

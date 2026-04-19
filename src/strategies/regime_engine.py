@@ -29,7 +29,7 @@ from .base import BaseStrategy, StrategySignal
 
 # ── Regime → Strategy Weights ────────────────────────────────────────────────
 REGIME_WEIGHTS = {
-    "bull":     {"ema_trend": 0.40, "vwap_momentum": 0.40, "bb_squeeze": 0.20, "bb_mean_rev": 0.00},
+    "bull":     {"ema_trend": 0.45, "vwap_momentum": 0.50, "bb_squeeze": 0.15, "bb_mean_rev": 0.00},
     "bear":     {"ema_trend": 0.35, "vwap_momentum": 0.00, "bb_squeeze": 0.35, "bb_mean_rev": 0.30},
     "sideways": {"ema_trend": 0.00, "vwap_momentum": 0.25, "bb_squeeze": 0.30, "bb_mean_rev": 0.45},
     "choppy":   {"ema_trend": 0.15, "vwap_momentum": 0.00, "bb_squeeze": 0.50, "bb_mean_rev": 0.35},
