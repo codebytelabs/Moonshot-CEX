@@ -514,7 +514,7 @@ class AnalyzerAgent:
                 await self.redis.cache_ohlcv(symbol, timeframe, candles, ttl=240)
             return candles
         except Exception as e:
-            logger.warning(f"[Analyzer] OHLCV fetch failed {symbol}/{timeframe}: {e}")
+            logger.debug(f"[Analyzer] OHLCV fetch failed {symbol}/{timeframe}: {e}")
             return None
 
 

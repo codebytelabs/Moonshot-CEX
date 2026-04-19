@@ -2,6 +2,7 @@
 Moonshot-CEX — FastAPI backend + autonomous trading swarm.
 All agents are initialized here and run in a background async loop.
 """
+
 import asyncio
 import json
 import sys
@@ -44,7 +45,10 @@ from src.leverage_engine import LeverageEngine
 
 # ── Global state ──────────────────────────────────────────────────────────────
 cfg = get_settings()
-setup_logging(debug=cfg.log_level == "DEBUG", log_file=cfg.log_level and "backend/backend.log" or "backend/backend.log")
+setup_logging(
+    debug=cfg.log_level == "DEBUG",
+    log_file=cfg.log_level and "backend/backend.log" or "backend/backend.log",
+)
 
 STATE: dict = {
     "running": False,
@@ -54,7 +58,12 @@ STATE: dict = {
     "mode": "paper",
     "regime": "sideways",
     "regime_params": {},
-    "regime_capital": {"max_exposure_pct": 0.82, "size_mult": 0.92, "max_single_pct": 0.15, "max_positions": 6},
+    "regime_capital": {
+        "max_exposure_pct": 0.82,
+        "size_mult": 0.92,
+        "max_single_pct": 0.15,
+        "max_positions": 6,
+    },
     # NOTE: 0.0 = equity not yet known. Will be set from exchange at startup.
     # NEVER use a hardcoded value here — position sizing must be based on real account size.
     "current_equity": 0.0,
@@ -94,7 +103,9 @@ _alerts: Optional[AlertManager] = None
 _min_score_live: float = cfg.analyzer_min_score
 _bayesian_threshold_live: float = cfg.bayesian_threshold_normal
 _swarm_task: Optional[asyncio.Task] = None
-_consecutive_zero_setups: int = 0  # cycles with 0 setups; drought relief triggers at 200
+_consecutive_zero_setups: int = (
+    0  # cycles with 0 setups; drought relief triggers at 200
+)
 _strategy_manager: Optional[StrategyManager] = None
 _regime_engine: Optional[RegimeEngine] = None
 _futures_exchange: Optional[FuturesExchangeConnector] = None
@@ -111,7 +122,9 @@ _exchange_open_symbols: set[str] = set()
 _symbol_blacklist: set[str] = set()
 _blacklist_refresh_cycle: int = 0
 _BLACKLIST_REFRESH_INTERVAL = 50  # refresh every 50 cycles (~25 min)
-_BLACKLIST_MIN_TRADES = 4  # v7.6: raised 3→4 to avoid false-positive (BTC had 8 trades, some wins)
+_BLACKLIST_MIN_TRADES = (
+    4  # v7.6: raised 3→4 to avoid false-positive (BTC had 8 trades, some wins)
+)
 
 
 async def _refresh_symbol_blacklist():
@@ -122,11 +135,13 @@ async def _refresh_symbol_blacklist():
     try:
         pipeline = [
             {"$match": {"status": "closed"}},
-            {"$group": {
-                "_id": "$symbol",
-                "total": {"$sum": 1},
-                "wins": {"$sum": {"$cond": [{"$gt": ["$pnl_usd", 0]}, 1, 0]}},
-            }},
+            {
+                "$group": {
+                    "_id": "$symbol",
+                    "total": {"$sum": 1},
+                    "wins": {"$sum": {"$cond": [{"$gt": ["$pnl_usd", 0]}, 1, 0]}},
+                }
+            },
             {"$match": {"total": {"$gte": _BLACKLIST_MIN_TRADES}, "wins": 0}},
         ]
         cursor = _db.trades.aggregate(pipeline)
@@ -201,7 +216,7 @@ async def _startup():
     )
     _context = ContextAgent(
         openrouter_api_key=cfg.openrouter_api_key or "",
-        model=cfg.openrouter_primary_model,   # Gemini Flash — works with standard chat API
+        model=cfg.openrouter_primary_model,  # Gemini Flash — works with standard chat API
         base_url=cfg.openrouter_base_url,
         redis=_redis,
         cache_ttl=cfg.context_cache_ttl,
@@ -324,12 +339,16 @@ async def _startup():
             },
         },
     )
-    logger.info(f"[Startup] StrategyManager initialized: {_strategy_manager.active_strategies}")
+    logger.info(
+        f"[Startup] StrategyManager initialized: {_strategy_manager.active_strategies}"
+    )
 
     # ── Regime Engine v7.0 (adaptive multi-strategy) ──────────────────────
     global _regime_engine
     _regime_engine = RegimeEngine(exchange=_exchange)
-    logger.info(f"[Startup] RegimeEngine v7.0 initialized: {_regime_engine.strategy_names}")
+    logger.info(
+        f"[Startup] RegimeEngine v7.0 initialized: {_regime_engine.strategy_names}"
+    )
 
     # ── Futures Mode Setup ─────────────────────────────────────────────────
     _is_futures = cfg.trading_mode.lower() == "futures"
@@ -370,8 +389,9 @@ async def _startup():
         _execution = _futures_execution
         _position_manager.execution = _futures_execution
 
-        # Update watcher and strategy manager to use futures exchange
+        # Update watcher, analyzer, and strategy manager to use futures exchange
         _watcher.exchange = _futures_exchange
+        _analyzer.exchange = _futures_exchange
         if _strategy_manager:
             _strategy_manager._exchange = _futures_exchange
             for strat in _strategy_manager._strategies.values():
@@ -381,7 +401,9 @@ async def _startup():
             for strat in _regime_engine._strategies.values():
                 strat.exchange = _futures_exchange
 
-        logger.info("[Startup] Futures wiring complete — all agents use futures exchange")
+        logger.info(
+            "[Startup] Futures wiring complete — all agents use futures exchange"
+        )
 
     STATE["mode"] = cfg.exchange_mode
     STATE["start_time"] = time.time()
@@ -401,11 +423,15 @@ async def _startup():
                 # v3.1: detect account size tier — sets Kelly fraction + per-tier caps
                 tier = _risk_manager.detect_account_tier(eq)
                 STATE["account_tier"] = tier
-                logger.info(f"[Startup] Real account equity fetched: ${eq:,.2f} (attempt {attempt}) | tier={tier}")
+                logger.info(
+                    f"[Startup] Real account equity fetched: ${eq:,.2f} (attempt {attempt}) | tier={tier}"
+                )
                 equity_fetched = True
                 break
             else:
-                logger.warning(f"[Startup] Equity fetch returned 0 (attempt {attempt}/5), retrying...")
+                logger.warning(
+                    f"[Startup] Equity fetch returned 0 (attempt {attempt}/5), retrying..."
+                )
         except Exception as e:
             logger.warning(f"[Startup] Equity fetch error (attempt {attempt}/5): {e}")
         if attempt < 5:
@@ -413,7 +439,11 @@ async def _startup():
 
     if not equity_fetched:
         # Use paper balance as absolute last resort so bot can still function
-        fallback = float(cfg.paper_balance_usd) if hasattr(cfg, "paper_balance_usd") else 1000.0
+        fallback = (
+            float(cfg.paper_balance_usd)
+            if hasattr(cfg, "paper_balance_usd")
+            else 1000.0
+        )
         STATE["current_equity"] = fallback
         STATE["peak_equity"] = fallback
         _risk_manager.peak_equity = fallback
@@ -576,7 +606,9 @@ async def _run_cycle():
             logger.info(f"[CIRCUIT BREAKER] Anchored start equity ${equity:.2f}")
         if cycle == _CB_GRACE_CYCLES:
             _cb_anchor = STATE.get("_cb_day_start_equity", equity)
-            logger.info(f"[CIRCUIT BREAKER] Armed after {_CB_GRACE_CYCLES} cycles — start equity ${_cb_anchor:.2f} threshold={_CB_THRESHOLD:.0%}")
+            logger.info(
+                f"[CIRCUIT BREAKER] Armed after {_CB_GRACE_CYCLES} cycles — start equity ${_cb_anchor:.2f} threshold={_CB_THRESHOLD:.0%}"
+            )
     elif STATE["_cb_day_date"] != _today_str and equity > 0:
         STATE["_cb_day_start_equity"] = equity
         STATE["_cb_day_date"] = _today_str
@@ -590,12 +622,19 @@ async def _run_cycle():
     cb_start = STATE.get("_cb_day_start_equity", 0)
     day_pnl = equity - cb_start if cb_start > 0 else 0
     _cb_loss_pct = abs(day_pnl) / cb_start if cb_start > 0 and day_pnl < 0 else 0.0
-    _CB_L1 = 0.08   # 8% → graduated close (deep losers only)
-    _CB_L2 = 0.12   # 12% → close all losing positions
+    _CB_L1 = 0.08  # 8% → graduated close (deep losers only)
+    _CB_L2 = 0.12  # 12% → close all losing positions
     _CB_L3 = _CB_THRESHOLD  # 15% → nuclear close everything
 
-    if cycle > _CB_GRACE_CYCLES and equity > 0 and cb_start > 0 and _cb_loss_pct > _CB_L1:
-        _cb_level = 3 if _cb_loss_pct >= _CB_L3 else (2 if _cb_loss_pct >= _CB_L2 else 1)
+    if (
+        cycle > _CB_GRACE_CYCLES
+        and equity > 0
+        and cb_start > 0
+        and _cb_loss_pct > _CB_L1
+    ):
+        _cb_level = (
+            3 if _cb_loss_pct >= _CB_L3 else (2 if _cb_loss_pct >= _CB_L2 else 1)
+        )
         _prev_level = STATE.get("_cb_level", 0)
 
         if _cb_level > _prev_level:
@@ -779,7 +818,11 @@ async def _run_cycle():
         _blocked_syms = []
         for _s in approved:
             _sym_full = _s.get("symbol", "")
-            _base = _sym_full.split("/")[0].upper() if "/" in _sym_full else _sym_full.upper()
+            _base = (
+                _sym_full.split("/")[0].upper()
+                if "/" in _sym_full
+                else _sym_full.upper()
+            )
             if _base in _whitelist:
                 _filtered.append(_s)
             else:
@@ -788,7 +831,7 @@ async def _run_cycle():
         if _blocked_syms:
             logger.info(
                 f"[Cycle {cycle}] Whitelist: {_pre_wl}→{len(approved)} "
-                f"(blocked: {','.join(_blocked_syms[:8])}{'...' if len(_blocked_syms)>8 else ''})"
+                f"(blocked: {','.join(_blocked_syms[:8])}{'...' if len(_blocked_syms) > 8 else ''})"
             )
 
     # ── Unified quality ranking — best opportunities fill limited slots first ──
@@ -797,7 +840,9 @@ async def _run_cycle():
     # passed threshold but only 3 slots free, slots went to the first 3 iterated
     # rather than the top 3 by quality.
     def _rank_score(setup: dict) -> float:
-        posterior = float(setup.get("decision", {}).get("posterior", setup.get("confidence", 0.5)))
+        posterior = float(
+            setup.get("decision", {}).get("posterior", setup.get("confidence", 0.5))
+        )
         ta = float(setup.get("ta_score", setup.get("score", 50.0)))
         return posterior * ta  # higher = better opportunity
 
@@ -809,9 +854,13 @@ async def _run_cycle():
         for _ri, _rs in enumerate(approved):
             _rk = _rank_score(_rs)
             _sym = _rs.get("symbol", "?")
-            _post = float(_rs.get("decision", {}).get("posterior", _rs.get("confidence", 0)))
+            _post = float(
+                _rs.get("decision", {}).get("posterior", _rs.get("confidence", 0))
+            )
             _ta = float(_rs.get("ta_score", _rs.get("score", 0)))
-            _rank_lines.append(f"#{_ri+1} {_sym} rank={_rk:.1f} (post={_post:.3f} ta={_ta:.0f})")
+            _rank_lines.append(
+                f"#{_ri + 1} {_sym} rank={_rk:.1f} (post={_post:.3f} ta={_ta:.0f})"
+            )
         logger.info(f"[Cycle {cycle}] Opportunity ranking: {' | '.join(_rank_lines)}")
 
     STATE["last_decisions"] = approved[:5]
@@ -833,12 +882,18 @@ async def _run_cycle():
     # Fetch funding rates for approved symbols and inject into setups.
     # Skip trades where funding is extreme and direction is unfavorable.
     _funding_rates: dict[str, float] = {}
-    if not _skip_entries and STATE.get("trading_mode", "spot") == "futures" and _futures_exchange:
+    if (
+        not _skip_entries
+        and STATE.get("trading_mode", "spot") == "futures"
+        and _futures_exchange
+    ):
         try:
             _approved_syms = [s["symbol"] for s in approved]
             _funding_rates = await _futures_exchange.fetch_funding_rates(_approved_syms)
             if _funding_rates:
-                logger.info(f"[Cycle {cycle}] Funding rates: { {k: f'{v:.6f}' for k, v in _funding_rates.items() if abs(v) > 0.0001} }")
+                logger.info(
+                    f"[Cycle {cycle}] Funding rates: { {k: f'{v:.6f}' for k, v in _funding_rates.items() if abs(v) > 0.0001} }"
+                )
         except Exception as _fr_err:
             logger.debug(f"[Cycle {cycle}] Funding rate fetch failed: {_fr_err}")
 
@@ -853,7 +908,9 @@ async def _run_cycle():
         # Funding gate: skip if extreme funding opposes our direction
         _dir = setup.get("direction", "long")
         abs_fr = abs(fr)
-        if abs_fr > 0.0015:  # >0.15% per 8h is extreme (was 0.1% — too tight, killed all entries)
+        if (
+            abs_fr > 0.0015
+        ):  # >0.15% per 8h is extreme (was 0.1% — too tight, killed all entries)
             if (fr > 0 and _dir == "long") or (fr < 0 and _dir == "short"):
                 trace["steps"].append(f"skip_funding:{sym}:{_dir}:fr={fr:.6f}")
                 logger.info(
@@ -864,7 +921,9 @@ async def _run_cycle():
 
     approved = _funding_filtered
     if _pre_funding_count > len(approved):
-        logger.info(f"[Cycle {cycle}] Funding gate filtered {_pre_funding_count - len(approved)} signals")
+        logger.info(
+            f"[Cycle {cycle}] Funding gate filtered {_pre_funding_count - len(approved)} signals"
+        )
 
     if not approved:
         STATE["_cycle_trace"] = trace
@@ -890,14 +949,20 @@ async def _run_cycle():
             else:
                 _bal = {}
             _usdt = _bal.get("USDT", {})
-            available_cash_usd = float(
-                _usdt.get("free") or _usdt.get("total") or 0.0
+            available_cash_usd = float(_usdt.get("free") or _usdt.get("total") or 0.0)
+            logger.info(
+                f"[Cycle {cycle}] Available USDT cash: ${available_cash_usd:.2f} ({'futures' if _is_futures_cycle else 'spot'})"
             )
-            logger.info(f"[Cycle {cycle}] Available USDT cash: ${available_cash_usd:.2f} ({'futures' if _is_futures_cycle else 'spot'})")
         except Exception as _e:
-            logger.warning(f"[Cycle {cycle}] Could not fetch cash balance, using equity: {_e}")
+            logger.warning(
+                f"[Cycle {cycle}] Could not fetch cash balance, using equity: {_e}"
+            )
 
-    if not _skip_entries and _uses_exchange_account_state() and available_cash_usd < _MIN_POSITION_USD:
+    if (
+        not _skip_entries
+        and _uses_exchange_account_state()
+        and available_cash_usd < _MIN_POSITION_USD
+    ):
         trace["steps"].append(f"skip_entries:cash_too_low:${available_cash_usd:.0f}")
         logger.warning(
             f"[Cycle {cycle}] Only ${available_cash_usd:.2f} USDT free — "
@@ -916,11 +981,15 @@ async def _run_cycle():
 
     # ── Pull regime capital params from BigBrother (set in Step 8 of previous cycle) ──
     _regime_capital = STATE.get("regime_capital", {})
-    _regime_setup_allowlist = set(STATE.get("regime_setup_allowlist", []))  # empty = all allowed
+    _regime_setup_allowlist = set(
+        STATE.get("regime_setup_allowlist", [])
+    )  # empty = all allowed
     _regime_size_mult = float(_regime_capital.get("size_mult", 1.0))
     _regime_max_positions = _regime_capital.get("max_positions")
     _regime_max_exposure = _regime_capital.get("max_exposure_pct")
-    _regime_max_single_pct = float(_regime_capital.get("max_single_pct", cfg.max_single_exposure_pct))
+    _regime_max_single_pct = float(
+        _regime_capital.get("max_single_pct", cfg.max_single_exposure_pct)
+    )
     _choppy_min_ta = float(STATE.get("choppy_min_ta_score", 0.0))
     _current_regime = STATE.get("regime", "sideways")
 
@@ -933,9 +1002,9 @@ async def _run_cycle():
     # ON (score >= 0.40): Full entries allowed, normal sizing
     # OFF (score < 0.40): ZERO new long entries. Shorts still allowed (profit from weakness).
     _btc_momentum = {"score": 0.7, "bullish": True}  # default: moderate
-    _btc_size_scale = 1.0   # v7.4: graduated BTC sizing (replaces binary gate)
-    _btc_score = 0.7        # default score
-    _btc_trend_on = True    # master switch (True when _btc_size_scale > 0)
+    _btc_size_scale = 1.0  # v7.4: graduated BTC sizing (replaces binary gate)
+    _btc_score = 0.7  # default score
+    _btc_trend_on = True  # master switch (True when _btc_size_scale > 0)
     if not _skip_entries:
         try:
             _btc_momentum = await _watcher.btc_momentum_score()
@@ -978,7 +1047,9 @@ async def _run_cycle():
                 )
                 for _crash_pos in _open_positions:
                     try:
-                        _crash_price = await _execution.get_current_price(_crash_pos.symbol)
+                        _crash_price = await _execution.get_current_price(
+                            _crash_pos.symbol
+                        )
                         if _crash_price <= 0:
                             continue
                         _crash_pnl = _crash_pos.current_pnl_pct(_crash_price)
@@ -989,10 +1060,15 @@ async def _run_cycle():
                                 f"pnl={_crash_pnl:+.1f}% (btc_score={_btc_score:.2f})"
                             )
                             await _position_manager._execute_exit(
-                                _crash_pos, _crash_price, "btc_crash_sweep", _crash_pos.amount
+                                _crash_pos,
+                                _crash_price,
+                                "btc_crash_sweep",
+                                _crash_pos.amount,
                             )
                     except Exception as _cse:
-                        logger.warning(f"[Cycle {cycle}] BTC crash sweep failed for {_crash_pos.symbol}: {_cse}")
+                        logger.warning(
+                            f"[Cycle {cycle}] BTC crash sweep failed for {_crash_pos.symbol}: {_cse}"
+                        )
 
     # v7.3: Reset per-cycle entry counter and compute dynamic entry quality bars
     _risk_manager.reset_cycle_entries()
@@ -1018,12 +1094,24 @@ async def _run_cycle():
         _setup_ta = float(setup.get("ta_score", 0.0))
         _setup_posterior = float(setup.get("decision", {}).get("posterior", 0.0))
         if _setup_ta < _dynamic_min_ta and not bool(setup.get("strategy", "")):
-            trace["steps"].append(f"skip_quality_ta:{symbol}:{_setup_ta:.0f}<{_dynamic_min_ta:.0f}")
-            logger.info(f"[Swarm] {symbol} skipped: ta_score {_setup_ta:.0f} < dynamic min {_dynamic_min_ta:.0f} (dd={_dd_current:.1%})")
+            trace["steps"].append(
+                f"skip_quality_ta:{symbol}:{_setup_ta:.0f}<{_dynamic_min_ta:.0f}"
+            )
+            logger.info(
+                f"[Swarm] {symbol} skipped: ta_score {_setup_ta:.0f} < dynamic min {_dynamic_min_ta:.0f} (dd={_dd_current:.1%})"
+            )
             continue
-        if _setup_posterior > 0 and _setup_posterior < _dynamic_min_posterior and not bool(setup.get("strategy", "")):
-            trace["steps"].append(f"skip_quality_post:{symbol}:{_setup_posterior:.2f}<{_dynamic_min_posterior:.2f}")
-            logger.info(f"[Swarm] {symbol} skipped: posterior {_setup_posterior:.2f} < dynamic min {_dynamic_min_posterior:.2f} (dd={_dd_current:.1%})")
+        if (
+            _setup_posterior > 0
+            and _setup_posterior < _dynamic_min_posterior
+            and not bool(setup.get("strategy", ""))
+        ):
+            trace["steps"].append(
+                f"skip_quality_post:{symbol}:{_setup_posterior:.2f}<{_dynamic_min_posterior:.2f}"
+            )
+            logger.info(
+                f"[Swarm] {symbol} skipped: posterior {_setup_posterior:.2f} < dynamic min {_dynamic_min_posterior:.2f} (dd={_dd_current:.1%})"
+            )
             continue
 
         # ── Pre-compute desired size (needed for both scale and new-entry paths) ──
@@ -1038,7 +1126,9 @@ async def _run_cycle():
             _signal_score = float(setup.get("ta_score", setup.get("score", 50.0)))
             # Use Bayesian posterior as confidence — it actually varies per signal (0.45-0.90)
             # unlike the static 0.65 fallback which made all leverages identical
-            _signal_conf = float(decision.get("posterior", setup.get("confidence", 0.50)))
+            _signal_conf = float(
+                decision.get("posterior", setup.get("confidence", 0.50))
+            )
             _trade_leverage = _leverage_engine.compute_leverage(
                 signal_score=_signal_score,
                 confidence=_signal_conf,
@@ -1051,7 +1141,9 @@ async def _run_cycle():
                 direction=_direction,
                 btc_momentum=_btc_momentum.get("score", 0.7),
             )
-            _trade_leverage = _leverage_engine.adjust_for_account_tier(_trade_leverage, equity)
+            _trade_leverage = _leverage_engine.adjust_for_account_tier(
+                _trade_leverage, equity
+            )
             # Inject leverage into setup so position_manager picks it up
             setup["leverage"] = _trade_leverage
 
@@ -1063,7 +1155,9 @@ async def _run_cycle():
                 stop_loss_pct=sl_pct,
                 leverage=_trade_leverage,
                 posterior=float(decision.get("posterior", 0.65)),
-                threshold=float(decision.get("threshold", cfg.bayesian_threshold_normal)),
+                threshold=float(
+                    decision.get("threshold", cfg.bayesian_threshold_normal)
+                ),
                 vol_usd=float(setup.get("vol_usd", 0.0)),
                 ta_score=float(setup.get("ta_score", 50.0)),
                 regime_size_mult=_regime_size_mult,
@@ -1075,7 +1169,9 @@ async def _run_cycle():
                 current_equity=equity,
                 stop_loss_pct=sl_pct,
                 posterior=float(decision.get("posterior", 0.65)),
-                threshold=float(decision.get("threshold", cfg.bayesian_threshold_normal)),
+                threshold=float(
+                    decision.get("threshold", cfg.bayesian_threshold_normal)
+                ),
                 vol_usd=float(setup.get("vol_usd", 0.0)),
                 ta_score=float(setup.get("ta_score", 50.0)),
                 regime_size_mult=_regime_size_mult,
@@ -1083,7 +1179,12 @@ async def _run_cycle():
             )
         # v7.4: Apply BTC graduated sizing to position size
         _is_strat = bool(setup.get("strategy", ""))
-        if _btc_size_scale < 1.0 and _btc_size_scale > 0 and _direction == "long" and not _is_strat:
+        if (
+            _btc_size_scale < 1.0
+            and _btc_size_scale > 0
+            and _direction == "long"
+            and not _is_strat
+        ):
             _effective_btc_scale = _btc_size_scale
             # Quality override: strong signals get boosted BTC scale
             _q_ta = float(setup.get("ta_score", 0.0))
@@ -1113,9 +1214,11 @@ async def _run_cycle():
             _MIN_MARGIN_FLOOR = 150.0
             if _margin_usd < _MIN_MARGIN_FLOOR:
                 size_usd = _MIN_MARGIN_FLOOR * _trade_leverage
-                logger.info(f"[Sizing] {symbol} margin floor applied: ${_margin_usd:.0f} → ${_MIN_MARGIN_FLOOR:.0f}")
+                logger.info(
+                    f"[Sizing] {symbol} margin floor applied: ${_margin_usd:.0f} → ${_MIN_MARGIN_FLOOR:.0f}"
+                )
             logger.info(
-                f"[Sizing] {symbol} FINAL notional=${size_usd:.0f} margin=${size_usd/_trade_leverage:.0f} "
+                f"[Sizing] {symbol} FINAL notional=${size_usd:.0f} margin=${size_usd / _trade_leverage:.0f} "
                 f"(lev={_trade_leverage}x cap={_regime_max_single_pct:.0%} regime={_current_regime})"
             )
         else:
@@ -1142,11 +1245,16 @@ async def _run_cycle():
                 # "death by a thousand cuts" loop with TAO/MOODENG).
                 if _position_manager.is_symbol_on_cooldown(symbol):
                     trace["steps"].append(f"skip_scale_cooldown:{symbol}")
-                    logger.info(f"[Swarm] {symbol} scale skipped: symbol cooldown active after stop-loss")
+                    logger.info(
+                        f"[Swarm] {symbol} scale skipped: symbol cooldown active after stop-loss"
+                    )
                     continue
 
                 existing_pos = _position_manager.get_position_for_symbol(symbol)
-                if existing_pos and existing_pos.setup_type not in ("synced_holding", "exchange_holding"):
+                if existing_pos and existing_pos.setup_type not in (
+                    "synced_holding",
+                    "exchange_holding",
+                ):
                     try:
                         _scale_price = await _execution.get_current_price(symbol)
                         if _scale_price > 0 and size_usd >= _MIN_POSITION_USD:
@@ -1157,12 +1265,16 @@ async def _run_cycle():
                                 tolerance_pct=cfg.position_scale_tolerance_pct,
                             )
                             trace["steps"].append(f"scale_{scale_result}:{symbol}")
-                            logger.info(f"[Swarm] {symbol} already held → scale={scale_result}")
+                            logger.info(
+                                f"[Swarm] {symbol} already held → scale={scale_result}"
+                            )
                             # Track committed cash so subsequent entries see accurate available
                             if scale_result == "scaled_up":
                                 current_val = existing_pos.amount * _scale_price
                                 delta_spent = max(0.0, size_usd - current_val)
-                                available_cash_usd = max(0.0, available_cash_usd - delta_spent)
+                                available_cash_usd = max(
+                                    0.0, available_cash_usd - delta_spent
+                                )
                                 # Persist updated position to DB so crash recovery has accurate amounts
                                 await _save_position_to_db(existing_pos)
                     except Exception as _se:
@@ -1185,7 +1297,7 @@ async def _run_cycle():
         # Replaces binary block with size scaling. Hard block only on BTC crash (<0.25).
         # Quality override: strong signals get boosted BTC scale (up to 1.0x).
         _is_strategy_signal = bool(setup.get("strategy", ""))
-        if _direction == "long" and not _is_strategy_signal:
+        if _direction == "long":
             _base = symbol.replace("/USDT", "").replace(":USDT", "")
             _is_short_token = any(_base.endswith(sfx) for sfx in ("3S", "5S", "DOWN"))
             if not _is_short_token and _btc_size_scale == 0.0:
@@ -1212,13 +1324,19 @@ async def _run_cycle():
         # v6.0 OVERHAUL: symbol blacklist — block 0% WR repeat losers
         if symbol in _symbol_blacklist:
             trace["steps"].append(f"skip_blacklist:{symbol}")
-            logger.info(f"[Swarm] {symbol} BLACKLISTED: 0% win rate across {_BLACKLIST_MIN_TRADES}+ trades")
+            logger.info(
+                f"[Swarm] {symbol} BLACKLISTED: 0% win rate across {_BLACKLIST_MIN_TRADES}+ trades"
+            )
             continue
 
         # v3.1: Setup allowlist gate — regime restricts which setup types are allowed
         # Strategy signals bypass — they have built-in regime awareness.
         setup_type = setup.get("setup_type", "neutral")
-        if _regime_setup_allowlist and setup_type not in _regime_setup_allowlist and not _is_strategy_signal:
+        if (
+            _regime_setup_allowlist
+            and setup_type not in _regime_setup_allowlist
+            and not _is_strategy_signal
+        ):
             trace["steps"].append(f"skip_regime_setup:{symbol}:{setup_type}")
             logger.info(
                 f"[Swarm] {symbol} skipped: setup_type '{setup_type}' not allowed in "
@@ -1228,11 +1346,17 @@ async def _run_cycle():
 
         # v3.1: Choppy regime — additional ta_score gate (only high-quality breakouts)
         # v7.3: use max of choppy_min_ta and dynamic drawdown-scaled min
-        _effective_min_ta = max(_choppy_min_ta, _dynamic_min_ta) if _choppy_min_ta > 0 else _dynamic_min_ta
+        _effective_min_ta = (
+            max(_choppy_min_ta, _dynamic_min_ta)
+            if _choppy_min_ta > 0
+            else _dynamic_min_ta
+        )
         if _effective_min_ta > 0 and not _is_strategy_signal:
             ta_score_check = float(setup.get("ta_score", 0.0))
             if ta_score_check < _effective_min_ta:
-                trace["steps"].append(f"skip_ta_gate:{symbol}:score={ta_score_check:.0f}<{_effective_min_ta:.0f}")
+                trace["steps"].append(
+                    f"skip_ta_gate:{symbol}:score={ta_score_check:.0f}<{_effective_min_ta:.0f}"
+                )
                 logger.info(
                     f"[Swarm] {symbol} skipped: min ta_score {_effective_min_ta:.0f} "
                     f"(got {ta_score_check:.0f}, regime={_current_regime}, dd={_dd_current:.1%})"
@@ -1256,13 +1380,19 @@ async def _run_cycle():
             # Let positions hit SL or trail naturally — don't prematurely kill them.
             trace["steps"].append(f"risk_block:{symbol}:{gate_reason}")
             logger.info(f"[Swarm] {symbol} blocked: {gate_reason}")
-            asyncio.create_task(_save_rejected_setup_to_db(setup, gate_reason, "risk_gate"))
+            asyncio.create_task(
+                _save_rejected_setup_to_db(setup, gate_reason, "risk_gate")
+            )
             continue
 
         # Cash sufficiency check for new entries
         if _uses_exchange_account_state() and size_usd < _MIN_POSITION_USD:
-            trace["steps"].append(f"skip_{symbol}:cash_depleted:${available_cash_usd:.0f}")
-            logger.info(f"[Swarm] {symbol} skipped: only ${available_cash_usd:.2f} USDT left")
+            trace["steps"].append(
+                f"skip_{symbol}:cash_depleted:${available_cash_usd:.0f}"
+            )
+            logger.info(
+                f"[Swarm] {symbol} skipped: only ${available_cash_usd:.2f} USDT left"
+            )
             break
 
         trace["steps"].append(f"sizing:{symbol}:${size_usd:.0f}")
@@ -1283,7 +1413,11 @@ async def _run_cycle():
             entries.append(symbol)
             _risk_manager.record_entry()  # count new entries only (not exits) toward daily limit
             # In futures, exchange deducts margin (not notional) from wallet
-            _cash_committed = size_usd / _trade_leverage if _is_futures_mode and _trade_leverage > 1 else size_usd
+            _cash_committed = (
+                size_usd / _trade_leverage
+                if _is_futures_mode and _trade_leverage > 1
+                else size_usd
+            )
             available_cash_usd -= _cash_committed
             await _save_position_to_db(pos)
             # Register with strategy manager so exit logic uses correct strategy rules
@@ -1302,7 +1436,7 @@ async def _run_cycle():
                     priority="medium",
                 )
             open_syms.add(symbol)
-    
+
     trace["steps"].append(f"entries:{len(entries)}")
     trace["entries"] = entries
     STATE["_cycle_trace"] = trace
@@ -1328,27 +1462,34 @@ async def _run_cycle():
                 try:
                     await _db.positions.update_one(
                         {"id": exit_result.get("id")},
-                        {"$set": {"status": "closed", "close_reason": exit_result.get("close_reason")}},
+                        {
+                            "$set": {
+                                "status": "closed",
+                                "close_reason": exit_result.get("close_reason"),
+                            }
+                        },
                     )
                 except Exception:
                     pass
             _bayesian.update_prior(exit_result.get("setup_type", "neutral"), pnl > 0)
             # Feed losing trades into BigBrother learning log for self-improvement
             if pnl < 0 and _bigbrother:
-                _bigbrother.log_losing_trade({
-                    "symbol": exit_result.get("symbol", "?"),
-                    "side": exit_result.get("side", "long"),
-                    "setup_type": exit_result.get("setup_type", "unknown"),
-                    "entry_price": float(exit_result.get("entry_price", 0)),
-                    "exit_price": float(exit_result.get("exit_price", 0)),
-                    "pnl_pct": pnl_pct,
-                    "pnl_usd": pnl,
-                    "hold_minutes": hold_h * 60,
-                    "close_reason": exit_result.get("close_reason", "unknown"),
-                    "regime": STATE.get("regime", "sideways"),
-                    "mode": STATE.get("bigbrother_mode", "normal"),
-                    "decision": exit_result.get("decision", {}),
-                })
+                _bigbrother.log_losing_trade(
+                    {
+                        "symbol": exit_result.get("symbol", "?"),
+                        "side": exit_result.get("side", "long"),
+                        "setup_type": exit_result.get("setup_type", "unknown"),
+                        "entry_price": float(exit_result.get("entry_price", 0)),
+                        "exit_price": float(exit_result.get("exit_price", 0)),
+                        "pnl_pct": pnl_pct,
+                        "pnl_usd": pnl,
+                        "hold_minutes": hold_h * 60,
+                        "close_reason": exit_result.get("close_reason", "unknown"),
+                        "regime": STATE.get("regime", "sideways"),
+                        "mode": STATE.get("bigbrother_mode", "normal"),
+                        "decision": exit_result.get("decision", {}),
+                    }
+                )
             if _alerts:
                 emoji = "🟢" if pnl > 0 else "🔴"
                 await _alerts.send(
@@ -1359,7 +1500,11 @@ async def _run_cycle():
 
     # ── Step 7: Quant Mutator ──────────────────────────────────────────────
     closed_history = _position_manager.get_closed_history(50)
-    day_pnl_pct = STATE["day_pnl_usd"] / STATE["current_equity"] if STATE["current_equity"] else 0.0
+    day_pnl_pct = (
+        STATE["day_pnl_usd"] / STATE["current_equity"]
+        if STATE["current_equity"]
+        else 0.0
+    )
     mutation = _quant_mutator.maybe_mutate(
         current_min_score=_min_score_live,
         current_bayesian_threshold=_bayesian_threshold_live,
@@ -1434,12 +1579,18 @@ async def _run_cycle():
     if cycle % _HEALTH_CHECK_INTERVAL == 0 and _position_manager.open_count > 0:
         await _check_position_health()
 
-    # ── Step 11: Periodic orphan algo order + position sync (every 10 cycles) ──
+    # ── Step 11: Periodic orphan algo order + position sync ──────────────────
     # Exchange data is golden — clean up any algo stop orders that don't match
     # real exchange positions, and ghost-close bot-tracked positions that the
     # exchange no longer has (e.g. exchange-side SL triggered).
-    _ORPHAN_SWEEP_INTERVAL = 10
-    if cycle % _ORPHAN_SWEEP_INTERVAL == 0:
+    # v8.0: tightened from 10 to 3 cycles (~45s → 9s). Root cause of -$900 leak:
+    # exchange-side SL fires, bot tries to close what's already flat → -2022
+    # reject loop → force-ghost with PnL=0, losing the real loss from stats.
+    # Running every 3 cycles catches stale state quickly; if any position is
+    # tracked, run EVERY cycle as a belt-and-suspenders.
+    _ORPHAN_SWEEP_INTERVAL = 3
+    _has_open = _position_manager.open_count > 0 if _position_manager else False
+    if cycle % _ORPHAN_SWEEP_INTERVAL == 0 or _has_open:
         await _sweep_orphan_algo_orders_and_positions()
 
     # ── Step 12: BigBrother Supervisor Loop (every 8 cycles ≈ 2 min) ──────────
@@ -1473,7 +1624,9 @@ async def _run_cycle():
 
 async def _tick_positions() -> list[dict]:
     regime_params = dict(STATE.get("regime_params") or {})
-    regime_params["regime"] = STATE.get("regime", "sideways")  # explicit name for is_aggressive check
+    regime_params["regime"] = STATE.get(
+        "regime", "sideways"
+    )  # explicit name for is_aggressive check
     exits = await _position_manager.update_all(regime_params=regime_params)
     # Persist all open positions to DB so trailing_stop, highest_price,
     # exchange_sl_order_id etc. survive restarts. With 8-10 positions max,
@@ -1539,7 +1692,9 @@ async def _check_position_health():
                 if strat_name:
                     strat = _strategy_manager.get_strategy(strat_name)
                     if strat:
-                        is_dead, kill_reason = strat.check_falsification(pos.to_dict(), tf_data)
+                        is_dead, kill_reason = strat.check_falsification(
+                            pos.to_dict(), tf_data
+                        )
                         if is_dead:
                             logger.error(
                                 f"[HealthCheck] THESIS FALSIFIED for {pos.symbol} [{strat_name}] "
@@ -1547,7 +1702,9 @@ async def _check_position_health():
                             )
                             # Create an async task to execute exit without blocking the check loop
                             asyncio.create_task(
-                                _position_manager._execute_exit(pos, current_price, kill_reason, pos.amount)
+                                _position_manager._execute_exit(
+                                    pos, current_price, kill_reason, pos.amount
+                                )
                             )
                             continue
 
@@ -1599,7 +1756,7 @@ async def _check_position_health():
                     if pos.trailing_stop is None or tight_trail > pos.trailing_stop:
                         logger.info(
                             f"[HealthCheck] {pos.symbol} WEAK health={health:.2f} "
-                            f"(EMA={ema_gap_pct:+.2f}% RSI={rsi:.0f} MACD={'+'if macd_hist>0 else ''}{macd_hist:.6f}) "
+                            f"(EMA={ema_gap_pct:+.2f}% RSI={rsi:.0f} MACD={'+' if macd_hist > 0 else ''}{macd_hist:.6f}) "
                             f"pnl={pnl_pct:+.1f}% → tightening trail to {tight_trail:.6f}"
                         )
                         pos.trailing_stop = tight_trail
@@ -1618,7 +1775,7 @@ async def _check_position_health():
             elif health < 0.3 and pnl_pct <= 0.3:
                 logger.info(
                     f"[HealthCheck] {pos.symbol} WEAK health={health:.2f} pnl={pnl_pct:+.1f}% "
-                    f"(EMA={ema_gap_pct:+.2f}% RSI={rsi:.0f} MACD={'+'if macd_hist>0 else ''}{macd_hist:.6f}) "
+                    f"(EMA={ema_gap_pct:+.2f}% RSI={rsi:.0f} MACD={'+' if macd_hist > 0 else ''}{macd_hist:.6f}) "
                     f"— SL/Falsification will protect"
                 )
             elif health >= 0.6:
@@ -1668,7 +1825,11 @@ async def _sweep_orphan_algo_orders_and_positions():
             open_algo_orders = await _futures_exchange.exchange.request(
                 "openAlgoOrders", "fapiPrivate", "GET", params={}
             )
-            orders_list = open_algo_orders if isinstance(open_algo_orders, list) else open_algo_orders.get("orders", [])
+            orders_list = (
+                open_algo_orders
+                if isinstance(open_algo_orders, list)
+                else open_algo_orders.get("orders", [])
+            )
             cancelled = 0
             for order in orders_list:
                 order_symbol_raw = order.get("symbol", "")
@@ -1685,13 +1846,19 @@ async def _sweep_orphan_algo_orders_and_positions():
                 if not matched and algo_id:
                     try:
                         await _futures_exchange.exchange.request(
-                            "algoOrder", "fapiPrivate", "DELETE",
-                            params={"algoId": str(algo_id)}
+                            "algoOrder",
+                            "fapiPrivate",
+                            "DELETE",
+                            params={"algoId": str(algo_id)},
                         )
                         cancelled += 1
-                        logger.info(f"[OrphanSweep] Cancelled orphan algo order {algo_id} for {order_symbol_raw} (no exchange position)")
+                        logger.info(
+                            f"[OrphanSweep] Cancelled orphan algo order {algo_id} for {order_symbol_raw} (no exchange position)"
+                        )
                     except Exception as ce:
-                        logger.debug(f"[OrphanSweep] Failed to cancel algo {algo_id}: {ce}")
+                        logger.debug(
+                            f"[OrphanSweep] Failed to cancel algo {algo_id}: {ce}"
+                        )
             if cancelled > 0:
                 logger.info(f"[OrphanSweep] Cancelled {cancelled} orphaned algo orders")
         except Exception as ae:
@@ -1712,51 +1879,79 @@ async def _sweep_orphan_algo_orders_and_positions():
                         f"→ removing from tracking (no exchange order needed)"
                     )
                     try:
-                        current_price = await _position_manager.execution.get_current_price(pos.symbol)
+                        current_price = (
+                            await _position_manager.execution.get_current_price(
+                                pos.symbol
+                            )
+                        )
                         if current_price <= 0:
                             current_price = pos.entry_price
                         if pos.side == "short":
                             pnl_usd = (pos.entry_price - current_price) * pos.amount
-                            pnl_pct = (pos.entry_price - current_price) / pos.entry_price * 100.0
+                            pnl_pct = (
+                                (pos.entry_price - current_price)
+                                / pos.entry_price
+                                * 100.0
+                            )
                         else:
                             pnl_usd = (current_price - pos.entry_price) * pos.amount
-                            pnl_pct = (current_price - pos.entry_price) / pos.entry_price * 100.0
+                            pnl_pct = (
+                                (current_price - pos.entry_price)
+                                / pos.entry_price
+                                * 100.0
+                            )
                         pos.status = "closed"
                         pos.closed_at = int(time.time())
                         pos.close_reason = "ghost_close_sync"
                         # Clear any exit failure count so has_failed_exits unblocks
                         _position_manager._exit_failure_count.pop(pos.id, None)
                         closed = {
-                            "symbol": pos.symbol, "side": pos.side,
-                            "entry_price": pos.entry_price, "exit_price": current_price,
-                            "pnl_usd": pnl_usd, "pnl_pct": pnl_pct,
+                            "symbol": pos.symbol,
+                            "side": pos.side,
+                            "entry_price": pos.entry_price,
+                            "exit_price": current_price,
+                            "pnl_usd": pnl_usd,
+                            "pnl_pct": pnl_pct,
                             "close_reason": "ghost_close_sync",
                             "hold_hours": pos.hold_time_hours(),
                             "amount_usd": pos.amount_usd,
                         }
                         _position_manager._closed_history.append(closed)
                         if len(_position_manager._closed_history) > 200:
-                            _position_manager._closed_history = _position_manager._closed_history[-200:]
+                            _position_manager._closed_history = (
+                                _position_manager._closed_history[-200:]
+                            )
                         del _position_manager._positions[pos_id]
                         active_positions.set(len(_position_manager._positions))
                         if _db is not None:
                             await _save_trade_to_db(closed)
                             await _db.positions.update_one(
                                 {"id": pos.id},
-                                {"$set": {"status": "closed", "close_reason": "ghost_close_sync"}},
+                                {
+                                    "$set": {
+                                        "status": "closed",
+                                        "close_reason": "ghost_close_sync",
+                                    }
+                                },
                             )
                         logger.info(
                             f"[OrphanSweep] Removed {pos.symbol} from tracking: "
                             f"pnl=${pnl_usd:.2f} ({pnl_pct:+.1f}%)"
                         )
                     except Exception as ge:
-                        logger.debug(f"[OrphanSweep] Ghost-close error for {pos.symbol}: {ge}")
+                        logger.debug(
+                            f"[OrphanSweep] Ghost-close error for {pos.symbol}: {ge}"
+                        )
 
         # Step 4: Adopt untracked exchange positions into PM for SL/TP/trailing protection
         # Without this, positions opened by the bot but lost during restart (or exchange-
         # side SL fills that partially closed) sit on exchange with ZERO exit management.
         if _position_manager:
-            tracked_symbols = {p.symbol for p in _position_manager._positions.values() if p.status == "open"}
+            tracked_symbols = {
+                p.symbol
+                for p in _position_manager._positions.values()
+                if p.status == "open"
+            }
             for fpos in raw_positions:
                 contracts = abs(float(fpos.get("contracts", 0)))
                 if contracts <= 0:
@@ -1769,16 +1964,38 @@ async def _sweep_orphan_algo_orders_and_positions():
                     entry_price = float(fpos.get("entryPrice", 0) or 0)
                     if entry_price <= 0:
                         continue
-                    mark_price = float(fpos.get("markPrice", 0) or fpos.get("lastPrice", 0) or entry_price)
-                    notional = abs(float(fpos.get("notional", 0) or (contracts * mark_price)))
+                    mark_price = float(
+                        fpos.get("markPrice", 0)
+                        or fpos.get("lastPrice", 0)
+                        or entry_price
+                    )
+                    notional = abs(
+                        float(fpos.get("notional", 0) or (contracts * mark_price))
+                    )
                     _raw_lev = int(float(fpos.get("leverage", 0) or 0))
-                    leverage = _raw_lev if _raw_lev > 1 else (cfg.futures_default_leverage or 7)
+                    leverage = (
+                        _raw_lev
+                        if _raw_lev > 1
+                        else (cfg.futures_default_leverage or 7)
+                    )
 
                     # Compute SL/TP from global defaults
                     sl_pct = abs(_position_manager.stop_loss_pct) / 100.0
-                    stop_loss = entry_price * (1 - sl_pct) if side == "long" else entry_price * (1 + sl_pct)
-                    tp1 = entry_price * (1 + 0.04) if side == "long" else entry_price * (1 - 0.04)
-                    tp2 = entry_price * (1 + 0.10) if side == "long" else entry_price * (1 - 0.10)
+                    stop_loss = (
+                        entry_price * (1 - sl_pct)
+                        if side == "long"
+                        else entry_price * (1 + sl_pct)
+                    )
+                    tp1 = (
+                        entry_price * (1 + 0.04)
+                        if side == "long"
+                        else entry_price * (1 - 0.04)
+                    )
+                    tp2 = (
+                        entry_price * (1 + 0.10)
+                        if side == "long"
+                        else entry_price * (1 - 0.10)
+                    )
 
                     adopted = Position(
                         symbol=symbol,
@@ -1864,15 +2081,21 @@ async def _update_equity():
                     if _risk_manager:
                         _risk_manager.update_peak_equity(equity)
                     account_equity.set(equity)
-                    STATE["equity_history"].append({"t": int(time.time()), "v": round(equity, 2)})
+                    STATE["equity_history"].append(
+                        {"t": int(time.time()), "v": round(equity, 2)}
+                    )
                     if len(STATE["equity_history"]) > 2000:
                         STATE["equity_history"] = STATE["equity_history"][-2000:]
                     if _db is not None:
                         ts_now = int(time.time())
                         try:
-                            await _db.equity_snapshots.insert_one({"t": ts_now, "v": round(equity, 2)})
+                            await _db.equity_snapshots.insert_one(
+                                {"t": ts_now, "v": round(equity, 2)}
+                            )
                             cutoff = ts_now - 30 * 86400
-                            await _db.equity_snapshots.delete_many({"t": {"$lt": cutoff}})
+                            await _db.equity_snapshots.delete_many(
+                                {"t": {"$lt": cutoff}}
+                            )
                         except Exception as _dbe:
                             logger.debug(f"[Equity] DB snapshot error: {_dbe}")
                 return
@@ -1880,7 +2103,9 @@ async def _update_equity():
                 # CRITICAL: Do NOT fall through to spot wallet in futures mode.
                 # Spot wallet has ~$10k+ which inflates peak_equity permanently
                 # and creates a drawdown death spiral (50%+ phantom drawdown).
-                logger.warning(f"[Equity] Futures balance error (NOT falling back to spot): {fe}")
+                logger.warning(
+                    f"[Equity] Futures balance error (NOT falling back to spot): {fe}"
+                )
                 return
 
         # ── Spot mode: USDT + coin holdings ─────────────────────────────
@@ -1895,7 +2120,15 @@ async def _update_equity():
         # Collect all non-zero non-USDT coin holdings
         coin_holdings: dict[str, float] = {}
         for currency, amounts in balance.items():
-            if currency in ("USDT", "free", "used", "total", "info", "timestamp", "datetime"):
+            if currency in (
+                "USDT",
+                "free",
+                "used",
+                "total",
+                "info",
+                "timestamp",
+                "datetime",
+            ):
                 continue
             if not isinstance(amounts, dict):
                 continue
@@ -1906,14 +2139,18 @@ async def _update_equity():
         # Price each coin holding via batch ticker fetch
         if coin_holdings and _exchange:
             markets = _exchange.exchange.markets or {}
-            valid_symbols = [f"{c}/USDT" for c in coin_holdings if f"{c}/USDT" in markets]
+            valid_symbols = [
+                f"{c}/USDT" for c in coin_holdings if f"{c}/USDT" in markets
+            ]
             if valid_symbols:
                 try:
                     tickers = await _exchange.fetch_tickers(valid_symbols)
                     for sym, ticker in tickers.items():
                         coin = sym.split("/")[0]
                         if coin in coin_holdings:
-                            price = float(ticker.get("last") or ticker.get("close") or 0)
+                            price = float(
+                                ticker.get("last") or ticker.get("close") or 0
+                            )
                             if price > 0:
                                 total_usd += coin_holdings[coin] * price
                 except Exception as te:
@@ -1928,14 +2165,18 @@ async def _update_equity():
             if equity > STATE.get("peak_equity", 0):
                 STATE["peak_equity"] = equity
             account_equity.set(equity)
-            STATE["equity_history"].append({"t": int(time.time()), "v": round(equity, 2)})
+            STATE["equity_history"].append(
+                {"t": int(time.time()), "v": round(equity, 2)}
+            )
             if len(STATE["equity_history"]) > 2000:
                 STATE["equity_history"] = STATE["equity_history"][-2000:]
             # Persist snapshot to MongoDB for historical chart (fire-and-forget)
             if _db is not None:
                 ts_now = int(time.time())
                 try:
-                    await _db.equity_snapshots.insert_one({"t": ts_now, "v": round(equity, 2)})
+                    await _db.equity_snapshots.insert_one(
+                        {"t": ts_now, "v": round(equity, 2)}
+                    )
                     # Keep only last 30 days of data in the collection
                     cutoff = ts_now - 30 * 86400
                     await _db.equity_snapshots.delete_many({"t": {"$lt": cutoff}})
@@ -2001,7 +2242,7 @@ async def _save_rejected_setup_to_db(setup: dict, reason: str, gate: str):
             "ta_score": setup.get("ta_score"),
             "posterior": setup.get("decision", {}).get("posterior"),
             "rejection_reason": reason,
-            "rejection_gate": gate,   # "risk_gate" | "bayesian" | "cooldown"
+            "rejection_gate": gate,  # "risk_gate" | "bayesian" | "cooldown"
             "regime": STATE.get("regime", "unknown"),
             "mode": STATE.get("bigbrother_mode", "normal"),
             "exchange": cfg.exchange_name,
@@ -2009,8 +2250,6 @@ async def _save_rejected_setup_to_db(setup: dict, reason: str, gate: str):
         await _db.rejected_setups.insert_one(doc)
     except Exception as e:
         logger.debug(f"DB save rejected setup error: {e}")
-
-
 
 
 async def _recover_positions_from_db():
@@ -2033,7 +2272,9 @@ async def _recover_positions_from_db():
         global _exchange_open_symbols
         # Fetch live exchange state for amount reconciliation
         live_balances: dict[str, float] = {}
-        _is_futures_recovery = STATE.get("trading_mode") == "futures" and _futures_exchange
+        _is_futures_recovery = (
+            STATE.get("trading_mode") == "futures" and _futures_exchange
+        )
         _live_fetch_ok = False  # True = we successfully queried the exchange
         if _exchange and _uses_exchange_account_state():
             try:
@@ -2048,7 +2289,9 @@ async def _recover_positions_from_db():
                     # Seed _exchange_open_symbols at startup so the entry loop
                     # blocks duplicate opens even before the first orphan sweep.
                     _exchange_open_symbols = set(live_balances.keys())
-                    logger.info(f"[Recovery] Futures positions on exchange: {list(live_balances.keys())}")
+                    logger.info(
+                        f"[Recovery] Futures positions on exchange: {list(live_balances.keys())}"
+                    )
                     _live_fetch_ok = True
                 else:
                     # Spot: fetch wallet balances
@@ -2071,7 +2314,9 @@ async def _recover_positions_from_db():
             # swings every restart and triggers exit loops through the wrong exchange.
             doc_setup_type = doc.get("setup_type", "")
             if doc_setup_type in ("exchange_holding", "synced_holding"):
-                logger.debug(f"[Recovery] Skipping {symbol} ({doc_setup_type}) — user holding, not bot trade")
+                logger.debug(
+                    f"[Recovery] Skipping {symbol} ({doc_setup_type}) — user holding, not bot trade"
+                )
                 continue
             # De-duplicate: only recover the first DB record per symbol.
             # Multiple records arise from partial fills updating in-memory but not DB.
@@ -2087,9 +2332,17 @@ async def _recover_positions_from_db():
             doc_amount_usd = float(doc.get("amount_usd") or 0)
             doc_amount = float(doc.get("amount") or 0)
             doc_entry_price = float(doc.get("entry_price") or 0)
-            estimated_remaining_usd = doc_amount * doc_entry_price if doc_entry_price > 0 else doc_amount_usd
-            if doc_amount_usd < 5.0 or doc_amount < 1e-6 or estimated_remaining_usd < 20.0:
-                logger.debug(f"[Recovery] Skipping dust position {symbol}: amount_usd=${doc_amount_usd:.4f}")
+            estimated_remaining_usd = (
+                doc_amount * doc_entry_price if doc_entry_price > 0 else doc_amount_usd
+            )
+            if (
+                doc_amount_usd < 5.0
+                or doc_amount < 1e-6
+                or estimated_remaining_usd < 20.0
+            ):
+                logger.debug(
+                    f"[Recovery] Skipping dust position {symbol}: amount_usd=${doc_amount_usd:.4f}"
+                )
                 try:
                     await _db.positions.update_one(
                         {"id": doc.get("id")},
@@ -2121,8 +2374,7 @@ async def _recover_positions_from_db():
                     # Mark closed in DB so we don't revisit it
                     try:
                         await _db.positions.update_one(
-                            {"id": pos.id},
-                            {"$set": {"status": "closed_on_restart"}}
+                            {"id": pos.id}, {"$set": {"status": "closed_on_restart"}}
                         )
                     except Exception:
                         pass
@@ -2140,8 +2392,7 @@ async def _recover_positions_from_db():
                     )
                     try:
                         await _db.positions.update_one(
-                            {"id": pos.id},
-                            {"$set": {"status": "closed_dust"}}
+                            {"id": pos.id}, {"$set": {"status": "closed_dust"}}
                         )
                     except Exception:
                         pass
@@ -2152,6 +2403,7 @@ async def _recover_positions_from_db():
 
         if recovered > 0:
             from src.metrics import active_positions
+
             active_positions.set(len(_position_manager._positions))
             logger.info(f"[Recovery] ✅ Restored {recovered} open position(s) from DB")
 
@@ -2163,7 +2415,11 @@ async def _recover_positions_from_db():
                     open_algo_orders = await _futures_exchange.exchange.request(
                         "openAlgoOrders", "fapiPrivate", "GET", params={}
                     )
-                    orders_list = open_algo_orders if isinstance(open_algo_orders, list) else open_algo_orders.get("orders", [])
+                    orders_list = (
+                        open_algo_orders
+                        if isinstance(open_algo_orders, list)
+                        else open_algo_orders.get("orders", [])
+                    )
                     # Build set of recovered symbols in raw Binance format
                     recovered_raw = set()
                     for pos in _position_manager._positions.values():
@@ -2174,24 +2430,36 @@ async def _recover_positions_from_db():
                         if order.get("symbol", "") in recovered_raw:
                             try:
                                 await _futures_exchange.exchange.request(
-                                    "algoOrder", "fapiPrivate", "DELETE",
-                                    params={"algoId": str(order["algoId"])}
+                                    "algoOrder",
+                                    "fapiPrivate",
+                                    "DELETE",
+                                    params={"algoId": str(order["algoId"])},
                                 )
                                 _cancelled_old += 1
                             except Exception:
                                 pass
                     if _cancelled_old > 0:
-                        logger.info(f"[Recovery] Cancelled {_cancelled_old} stale algo orders before re-placing")
+                        logger.info(
+                            f"[Recovery] Cancelled {_cancelled_old} stale algo orders before re-placing"
+                        )
                 except Exception as sweep_err:
-                    logger.debug(f"[Recovery] Pre-sweep of algo orders failed: {sweep_err}")
+                    logger.debug(
+                        f"[Recovery] Pre-sweep of algo orders failed: {sweep_err}"
+                    )
 
                 for pos in _position_manager._positions.values():
-                    pos.exchange_sl_order_id = None  # cleared — old orders just cancelled
+                    pos.exchange_sl_order_id = (
+                        None  # cleared — old orders just cancelled
+                    )
                     try:
                         await _position_manager._place_exchange_sl(pos)
                     except Exception as sl_err:
-                        logger.warning(f"[Recovery] Could not place exchange SL for {pos.symbol}: {sl_err}")
-                logger.info(f"[Recovery] Exchange SL orders placed for {recovered} recovered position(s)")
+                        logger.warning(
+                            f"[Recovery] Could not place exchange SL for {pos.symbol}: {sl_err}"
+                        )
+                logger.info(
+                    f"[Recovery] Exchange SL orders placed for {recovered} recovered position(s)"
+                )
 
             if _alerts:
                 await _alerts.send(
@@ -2209,24 +2477,29 @@ async def _recover_positions_from_db():
     if _exchange and _uses_exchange_account_state() and _position_manager:
         try:
             tracked_symbols = {
-                pos.symbol
-                for pos in _position_manager._positions.values()
+                pos.symbol for pos in _position_manager._positions.values()
             }
             # Also include symbols that were in DB as "open" before recovery
             if _db is not None:
                 try:
                     db_syms_cursor = _db.positions.find(
-                        {"status": {"$in": ["open", "closed_on_restart"]}, "exchange": cfg.exchange_name},
+                        {
+                            "status": {"$in": ["open", "closed_on_restart"]},
+                            "exchange": cfg.exchange_name,
+                        },
                         {"_id": 0, "symbol": 1},
                     )
                     db_sym_docs = await db_syms_cursor.to_list(length=200)
-                    tracked_symbols |= {d["symbol"] for d in db_sym_docs if d.get("symbol")}
+                    tracked_symbols |= {
+                        d["symbol"] for d in db_sym_docs if d.get("symbol")
+                    }
                 except Exception:
                     pass
 
             open_orders = await _exchange.fetch_open_orders()
             orphans = [
-                o for o in open_orders
+                o
+                for o in open_orders
                 if o.get("side") == "sell" and o.get("symbol") in tracked_symbols
             ]
             if orphans:
@@ -2263,7 +2536,8 @@ async def _recover_positions_from_db():
                 )
                 if isinstance(open_algo, list) and open_algo:
                     orphan_algo = [
-                        o for o in open_algo
+                        o
+                        for o in open_algo
                         if o.get("symbol") not in tracked_symbols_raw
                     ]
                     if orphan_algo:
@@ -2275,14 +2549,18 @@ async def _recover_positions_from_db():
                             sym = ao.get("symbol", "?")
                             try:
                                 await _futures_exchange.exchange.request(
-                                    "algoOrder", "fapiPrivate", "DELETE",
+                                    "algoOrder",
+                                    "fapiPrivate",
+                                    "DELETE",
                                     params={"algoId": algo_id},
                                 )
                                 logger.info(
                                     f"[Recovery] Cancelled orphan algo order {algo_id} for {sym}"
                                 )
                             except Exception as ce:
-                                logger.debug(f"[Recovery] Could not cancel algo {algo_id}: {ce}")
+                                logger.debug(
+                                    f"[Recovery] Could not cancel algo {algo_id}: {ce}"
+                                )
             except Exception as e:
                 logger.debug(f"[Recovery] Algo order sweep error: {e}")
 
@@ -2314,7 +2592,11 @@ async def _recover_positions_from_db():
                         f"{contracts} contracts, PnL=${pnl:.2f} — CLOSING"
                     )
                     try:
-                        amount = float(_futures_exchange.exchange.amount_to_precision(fsymbol, contracts))
+                        amount = float(
+                            _futures_exchange.exchange.amount_to_precision(
+                                fsymbol, contracts
+                            )
+                        )
                         if fside == "long":
                             await _futures_exchange.close_long(fsymbol, amount)
                         else:
@@ -2322,9 +2604,13 @@ async def _recover_positions_from_db():
                         orphan_count += 1
                         logger.info(f"[Recovery] Closed orphan {fsymbol} ✅")
                     except Exception as close_err:
-                        logger.error(f"[Recovery] Failed to close orphan {fsymbol}: {close_err}")
+                        logger.error(
+                            f"[Recovery] Failed to close orphan {fsymbol}: {close_err}"
+                        )
                 if orphan_count > 0:
-                    logger.warning(f"[Recovery] Closed {orphan_count} orphan futures position(s)")
+                    logger.warning(
+                        f"[Recovery] Closed {orphan_count} orphan futures position(s)"
+                    )
                     if _alerts:
                         await _alerts.send(
                             f"⚠️ Closed {orphan_count} orphan futures position(s) on startup.",
@@ -2355,8 +2641,14 @@ async def _recover_positions_from_db():
                 r = pct / abs(cfg.stop_loss_pct) if cfg.stop_loss_pct else 0.0
                 _risk_manager.record_trade(pnl, pct, r)
             if trade_docs:
-                wr = sum(1 for t in trade_docs if (t.get("pnl_usd") or 0) > 0) / len(trade_docs) * 100
-                logger.info(f"[Recovery] Seeded risk manager with {len(trade_docs)} historical trades (WR={wr:.0f}%)")
+                wr = (
+                    sum(1 for t in trade_docs if (t.get("pnl_usd") or 0) > 0)
+                    / len(trade_docs)
+                    * 100
+                )
+                logger.info(
+                    f"[Recovery] Seeded risk manager with {len(trade_docs)} historical trades (WR={wr:.0f}%)"
+                )
             # Reset session-level safeguards — consecutive_loss_pause and day_trade_count
             # are within-session guards, not persistent state. Replaying historical trades
             # would re-trigger pauses and exhaust daily trade quota every restart.
@@ -2378,15 +2670,17 @@ async def _recover_positions_from_db():
     _is_futures_recovery = STATE.get("trading_mode") == "futures" and _futures_exchange
     if _db is not None and _risk_manager is not None and not _is_futures_recovery:
         try:
-            peak_cursor = _db.equity_snapshots.find(
-                {}, {"_id": 0, "v": 1}
-            ).sort("v", -1).limit(1)
+            peak_cursor = (
+                _db.equity_snapshots.find({}, {"_id": 0, "v": 1}).sort("v", -1).limit(1)
+            )
             peak_docs = await peak_cursor.to_list(length=1)
             if peak_docs:
                 historical_peak = float(peak_docs[0]["v"])
                 if historical_peak > _risk_manager.peak_equity:
                     _risk_manager.peak_equity = historical_peak
-                    logger.info(f"[Recovery] Restored peak equity ${historical_peak:.2f} from snapshots")
+                    logger.info(
+                        f"[Recovery] Restored peak equity ${historical_peak:.2f} from snapshots"
+                    )
         except Exception as e:
             logger.debug(f"[Recovery] Peak equity restore error: {e}")
     elif _is_futures_recovery and _risk_manager is not None:
@@ -2394,19 +2688,22 @@ async def _recover_positions_from_db():
         if eq > 0:
             _risk_manager.peak_equity = eq
             STATE["peak_equity"] = eq
-            logger.info(f"[Recovery] Futures mode: peak equity reset to current ${eq:,.2f} (ignoring old spot peak)")
+            logger.info(
+                f"[Recovery] Futures mode: peak equity reset to current ${eq:,.2f} (ignoring old spot peak)"
+            )
             # Clear old spot-era equity snapshots so total_pnl doesn't show phantom -$7K
             if _db is not None:
                 try:
                     del_result = await _db.equity_snapshots.delete_many({})
-                    await _db.equity_snapshots.insert_one({"t": int(time.time()), "v": round(eq, 2)})
+                    await _db.equity_snapshots.insert_one(
+                        {"t": int(time.time()), "v": round(eq, 2)}
+                    )
                     logger.info(
                         f"[Recovery] Cleared {del_result.deleted_count} old equity snapshots, "
                         f"fresh baseline: ${eq:,.2f}"
                     )
                 except Exception as e:
                     logger.debug(f"[Recovery] Equity snapshot reset error: {e}")
-
 
 
 def _uses_exchange_account_state() -> bool:
@@ -2434,15 +2731,37 @@ async def _get_exchange_account_snapshot() -> dict:
     _is_futures_snap = STATE.get("trading_mode") == "futures" and _futures_exchange
     if _is_futures_snap:
         try:
-            fut_balance = await _futures_exchange.exchange.fetch_balance()
+            # v8.0: 12s hard timeout. Previously unbounded, which caused /api/portfolio
+            # to hang for 15-30s+ when the trade loop saturated the exchange connection
+            # (dashboard/health-check freezes observed on VM2). 12s survives normal
+            # exchange latency (Binance testnet can spike to 8-10s) while still
+            # capping runaway hangs.
+            fut_balance = await asyncio.wait_for(
+                _futures_exchange.exchange.fetch_balance(), timeout=12.0
+            )
             fut_usdt = fut_balance.get("USDT", {})
             cash_usd = _extract_balance_amount(fut_usdt)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[Snapshot] Futures balance fetch timed out (>12s) — returning stale snapshot"
+            )
+            return {
+                "source": "futures_exchange_stale",
+                "equity": STATE.get("current_equity", 0),
+                "cash_usd": 0.0,
+                "open_positions": [],
+                "open_count": 0,
+                "exposure_usd": 0.0,
+            }
         except Exception as fe:
             # CRITICAL: Do NOT fall back to spot wallet in futures mode.
             # Spot wallet has different balance that inflates peak_equity permanently.
-            logger.warning(f"[Snapshot] Futures balance error (NOT falling back to spot): {fe}")
+            _err = str(fe) or type(fe).__name__
+            logger.warning(
+                f"[Snapshot] Futures balance error (NOT falling back to spot): {_err}"
+            )
             return {
-                "source": "futures_exchange",
+                "source": "futures_exchange_stale",
                 "equity": STATE.get("current_equity", 0),
                 "cash_usd": 0.0,
                 "open_positions": [],
@@ -2450,7 +2769,31 @@ async def _get_exchange_account_snapshot() -> dict:
                 "exposure_usd": 0.0,
             }
     else:
-        balance = await _exchange.fetch_balance()
+        try:
+            balance = await asyncio.wait_for(_exchange.fetch_balance(), timeout=12.0)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[Snapshot] Spot balance fetch timed out (>12s) — returning stale snapshot"
+            )
+            return {
+                "source": "internal_stale",
+                "equity": STATE.get("current_equity", 0),
+                "cash_usd": 0.0,
+                "open_positions": [],
+                "open_count": 0,
+                "exposure_usd": 0.0,
+            }
+        except Exception as be:
+            _err = str(be) or type(be).__name__
+            logger.warning(f"[Snapshot] Spot balance error: {_err}")
+            return {
+                "source": "internal_stale",
+                "equity": STATE.get("current_equity", 0),
+                "cash_usd": 0.0,
+                "open_positions": [],
+                "open_count": 0,
+                "exposure_usd": 0.0,
+            }
         usdt = balance.get("USDT", {})
         cash_usd = _extract_balance_amount(usdt)
 
@@ -2470,7 +2813,15 @@ async def _get_exchange_account_snapshot() -> dict:
     holdings: list[tuple[str, float]] = []
     markets = _exchange.exchange.markets or {}
     for currency, amounts in balance.items():
-        if currency in ("USDT", "free", "used", "total", "info", "timestamp", "datetime"):
+        if currency in (
+            "USDT",
+            "free",
+            "used",
+            "total",
+            "info",
+            "timestamp",
+            "datetime",
+        ):
             continue
         amount = _extract_balance_amount(amounts)
         if amount <= 1e-8:
@@ -2514,36 +2865,44 @@ async def _get_exchange_account_snapshot() -> dict:
         entry_price_used = tracked.entry_price if tracked else current_price
         cost_basis = amount * entry_price_used if entry_price_used > 0 else 0.0
         unrealized_pnl = (amount_usd - cost_basis) if cost_basis > 0 else 0.0
-        unrealized_pnl_pct = (unrealized_pnl / cost_basis * 100.0) if cost_basis > 0 else 0.0
+        unrealized_pnl_pct = (
+            (unrealized_pnl / cost_basis * 100.0) if cost_basis > 0 else 0.0
+        )
 
-        open_positions.append({
-            "id": tracked.id if tracked else f"exchange-{symbol.replace('/', '-').lower()}",
-            "symbol": symbol,
-            "status": "open",
-            "setup_type": tracked.setup_type if tracked else "exchange_holding",
-            "entry_price": entry_price_used,
-            "amount": amount,
-            "amount_usd": round(amount_usd, 4),
-            "current_price": current_price,
-            "unrealized_pnl_usd": round(unrealized_pnl, 4),
-            "unrealized_pnl_pct": round(unrealized_pnl_pct, 2),
-            "stop_loss": tracked.stop_loss if tracked else 0.0,
-            "take_profit_1": tracked.take_profit_1 if tracked else 0.0,
-            "take_profit_2": tracked.take_profit_2 if tracked else 0.0,
-            "highest_price": tracked.highest_price if tracked else current_price,
-            "trailing_stop": tracked.trailing_stop if tracked else None,
-            "tier1_done": tracked.tier1_done if tracked else False,
-            "tier2_done": tracked.tier2_done if tracked else False,
-            "pyramid_count": tracked.pyramid_count if tracked else 0,
-            "realized_pnl_usd": tracked.realized_pnl_usd if tracked else 0.0,
-            "total_fees_usd": tracked.total_fees_usd if tracked else 0.0,
-            "opened_at": opened_at,
-            "closed_at": None,
-            "close_reason": None,
-            "hold_time_hours": round((now - opened_at) / 3600.0, 2) if opened_at else 0.0,
-            "posterior": posterior,
-            "source": "exchange",
-        })
+        open_positions.append(
+            {
+                "id": tracked.id
+                if tracked
+                else f"exchange-{symbol.replace('/', '-').lower()}",
+                "symbol": symbol,
+                "status": "open",
+                "setup_type": tracked.setup_type if tracked else "exchange_holding",
+                "entry_price": entry_price_used,
+                "amount": amount,
+                "amount_usd": round(amount_usd, 4),
+                "current_price": current_price,
+                "unrealized_pnl_usd": round(unrealized_pnl, 4),
+                "unrealized_pnl_pct": round(unrealized_pnl_pct, 2),
+                "stop_loss": tracked.stop_loss if tracked else 0.0,
+                "take_profit_1": tracked.take_profit_1 if tracked else 0.0,
+                "take_profit_2": tracked.take_profit_2 if tracked else 0.0,
+                "highest_price": tracked.highest_price if tracked else current_price,
+                "trailing_stop": tracked.trailing_stop if tracked else None,
+                "tier1_done": tracked.tier1_done if tracked else False,
+                "tier2_done": tracked.tier2_done if tracked else False,
+                "pyramid_count": tracked.pyramid_count if tracked else 0,
+                "realized_pnl_usd": tracked.realized_pnl_usd if tracked else 0.0,
+                "total_fees_usd": tracked.total_fees_usd if tracked else 0.0,
+                "opened_at": opened_at,
+                "closed_at": None,
+                "close_reason": None,
+                "hold_time_hours": round((now - opened_at) / 3600.0, 2)
+                if opened_at
+                else 0.0,
+                "posterior": posterior,
+                "source": "exchange",
+            }
+        )
 
     open_positions.sort(key=lambda item: item["amount_usd"], reverse=True)
     return {
@@ -2556,7 +2915,9 @@ async def _get_exchange_account_snapshot() -> dict:
     }
 
 
-async def _get_futures_account_snapshot(cash_usd: float, tracked_by_symbol: dict) -> dict:
+async def _get_futures_account_snapshot(
+    cash_usd: float, tracked_by_symbol: dict
+) -> dict:
     """Futures-specific snapshot: reads positions from exchange, not coin holdings."""
     open_positions = []
     exposure_usd = 0.0
@@ -2564,7 +2925,12 @@ async def _get_futures_account_snapshot(cash_usd: float, tracked_by_symbol: dict
     now = time.time()
 
     try:
-        raw_positions = await _futures_exchange.exchange.fetch_positions()
+        # v8.0: 12s hard timeout to prevent /api/portfolio hangs when trade loop
+        # saturates the exchange connection. Testnet positions-fetch can spike
+        # to 8-10s under load; 12s avoids spurious snapshot warnings.
+        raw_positions = await asyncio.wait_for(
+            _futures_exchange.exchange.fetch_positions(), timeout=12.0
+        )
         for pos in raw_positions:
             contracts = abs(float(pos.get("contracts", 0)))
             if contracts <= 0:
@@ -2572,7 +2938,9 @@ async def _get_futures_account_snapshot(cash_usd: float, tracked_by_symbol: dict
             symbol = pos.get("symbol", "")
             side = pos.get("side", "long")
             entry_price = float(pos.get("entryPrice", 0) or 0)
-            mark_price = float(pos.get("markPrice", 0) or pos.get("lastPrice", 0) or entry_price)
+            mark_price = float(
+                pos.get("markPrice", 0) or pos.get("lastPrice", 0) or entry_price
+            )
             notional = float(pos.get("notional", 0) or (contracts * mark_price))
             unrealized_pnl = float(pos.get("unrealizedPnl", 0) or 0)
             _raw_leverage = int(float(pos.get("leverage", 0) or 0))
@@ -2583,7 +2951,9 @@ async def _get_futures_account_snapshot(cash_usd: float, tracked_by_symbol: dict
             elif _raw_leverage > 1:
                 leverage = _raw_leverage
             else:
-                leverage = cfg.futures_default_leverage or 6  # fallback to configured default
+                leverage = (
+                    cfg.futures_default_leverage or 6
+                )  # fallback to configured default
             margin_usd = abs(notional) / leverage if leverage > 0 else abs(notional)
 
             exposure_usd += abs(notional)
@@ -2592,41 +2962,52 @@ async def _get_futures_account_snapshot(cash_usd: float, tracked_by_symbol: dict
             opened_at = tracked.opened_at if tracked else int(now)
             posterior = tracked.decision.get("posterior", 0.0) if tracked else 0.0
             cost_basis = contracts * entry_price if entry_price > 0 else abs(notional)
-            unrealized_pnl_pct = (unrealized_pnl / cost_basis * 100.0) if cost_basis > 0 else 0.0
+            unrealized_pnl_pct = (
+                (unrealized_pnl / cost_basis * 100.0) if cost_basis > 0 else 0.0
+            )
 
-            open_positions.append({
-                "id": tracked.id if tracked else f"futures-{symbol.replace('/', '-').lower()}",
-                "symbol": symbol,
-                "status": "open",
-                "side": side,
-                "leverage": leverage,
-                "setup_type": tracked.setup_type if tracked else "futures_position",
-                "entry_price": entry_price,
-                "amount": contracts,
-                "amount_usd": round(abs(notional), 4),
-                "margin_usd": round(margin_usd, 4),
-                "current_price": mark_price,
-                "unrealized_pnl_usd": round(unrealized_pnl, 4),
-                "unrealized_pnl_pct": round(unrealized_pnl_pct, 2),
-                "stop_loss": tracked.stop_loss if tracked else 0.0,
-                "take_profit_1": tracked.take_profit_1 if tracked else 0.0,
-                "take_profit_2": tracked.take_profit_2 if tracked else 0.0,
-                "highest_price": tracked.highest_price if tracked else mark_price,
-                "trailing_stop": tracked.trailing_stop if tracked else None,
-                "tier1_done": tracked.tier1_done if tracked else False,
-                "tier2_done": tracked.tier2_done if tracked else False,
-                "pyramid_count": tracked.pyramid_count if tracked else 0,
-                "realized_pnl_usd": tracked.realized_pnl_usd if tracked else 0.0,
-                "total_fees_usd": tracked.total_fees_usd if tracked else 0.0,
-                "opened_at": opened_at,
-                "closed_at": None,
-                "close_reason": None,
-                "hold_time_hours": round((now - opened_at) / 3600.0, 2) if opened_at else 0.0,
-                "posterior": posterior,
-                "source": "futures_exchange",
-            })
+            open_positions.append(
+                {
+                    "id": tracked.id
+                    if tracked
+                    else f"futures-{symbol.replace('/', '-').lower()}",
+                    "symbol": symbol,
+                    "status": "open",
+                    "side": side,
+                    "leverage": leverage,
+                    "setup_type": tracked.setup_type if tracked else "futures_position",
+                    "entry_price": entry_price,
+                    "amount": contracts,
+                    "amount_usd": round(abs(notional), 4),
+                    "margin_usd": round(margin_usd, 4),
+                    "current_price": mark_price,
+                    "unrealized_pnl_usd": round(unrealized_pnl, 4),
+                    "unrealized_pnl_pct": round(unrealized_pnl_pct, 2),
+                    "stop_loss": tracked.stop_loss if tracked else 0.0,
+                    "take_profit_1": tracked.take_profit_1 if tracked else 0.0,
+                    "take_profit_2": tracked.take_profit_2 if tracked else 0.0,
+                    "highest_price": tracked.highest_price if tracked else mark_price,
+                    "trailing_stop": tracked.trailing_stop if tracked else None,
+                    "tier1_done": tracked.tier1_done if tracked else False,
+                    "tier2_done": tracked.tier2_done if tracked else False,
+                    "pyramid_count": tracked.pyramid_count if tracked else 0,
+                    "realized_pnl_usd": tracked.realized_pnl_usd if tracked else 0.0,
+                    "total_fees_usd": tracked.total_fees_usd if tracked else 0.0,
+                    "opened_at": opened_at,
+                    "closed_at": None,
+                    "close_reason": None,
+                    "hold_time_hours": round((now - opened_at) / 3600.0, 2)
+                    if opened_at
+                    else 0.0,
+                    "posterior": posterior,
+                    "source": "futures_exchange",
+                }
+            )
+    except asyncio.TimeoutError:
+        logger.warning("[Snapshot] Futures positions fetch timed out (>12s)")
     except Exception as e:
-        logger.warning(f"[Snapshot] Futures positions fetch error: {e}")
+        _err = str(e) or type(e).__name__
+        logger.warning(f"[Snapshot] Futures positions fetch error: {_err}")
 
     open_positions.sort(key=lambda item: item["amount_usd"], reverse=True)
     return {
@@ -2663,7 +3044,7 @@ def _compute_pnl_from_fills(raw_fills: list[dict]) -> tuple[list[dict], float]:
         symbol = fill.get("symbol", "")
         side = fill.get("side", "")
         price = float(fill.get("price") or 0)
-        amount = float(fill.get("amount") or 0)       # base currency qty
+        amount = float(fill.get("amount") or 0)  # base currency qty
         cost = float(fill.get("cost") or (price * amount) or 0)  # quote cost
         fee_raw = fill.get("fee") or {}
         fee = float(fee_raw.get("cost", 0) or 0)
@@ -2700,45 +3081,55 @@ def _compute_pnl_from_fills(raw_fills: list[dict]) -> tuple[list[dict], float]:
 
             if matched_qty <= 1e-10:
                 # No matching buy found — still record as sell-only fill
-                completed_trades.append({
-                    "symbol": symbol,
-                    "close_reason": "sell",
-                    "pnl_usd": 0.0,
-                    "pnl_pct": 0.0,
-                    "entry_price": price,
-                    "exit_price": price,
-                    "hold_time_hours": 0.0,
-                    "setup_type": "exchange_fill",
-                    "closed_at": ts,
-                    "amount_usd": round(cost, 4),
-                    "fee_usd": round(fee, 4),
-                    "source": "exchange",
-                })
+                completed_trades.append(
+                    {
+                        "symbol": symbol,
+                        "close_reason": "sell",
+                        "pnl_usd": 0.0,
+                        "pnl_pct": 0.0,
+                        "entry_price": price,
+                        "exit_price": price,
+                        "hold_time_hours": 0.0,
+                        "setup_type": "exchange_fill",
+                        "closed_at": ts,
+                        "amount_usd": round(cost, 4),
+                        "fee_usd": round(fee, 4),
+                        "source": "exchange",
+                    }
+                )
                 continue
 
             # Sell revenue proportional to matched qty (minus sell fee)
-            sell_revenue = (matched_qty / amount) * cost - fee if amount > 0 else cost - fee
+            sell_revenue = (
+                (matched_qty / amount) * cost - fee if amount > 0 else cost - fee
+            )
             pnl = sell_revenue - total_buy_cost
             total_pnl += pnl
 
             pnl_pct = (pnl / total_buy_cost * 100.0) if total_buy_cost > 0 else 0.0
-            entry_price_avg = (total_buy_cost / matched_qty) if matched_qty > 0 else price
-            hold_h = round((ts - earliest_open_ts) / 3600.0, 2) if earliest_open_ts else 0.0
+            entry_price_avg = (
+                (total_buy_cost / matched_qty) if matched_qty > 0 else price
+            )
+            hold_h = (
+                round((ts - earliest_open_ts) / 3600.0, 2) if earliest_open_ts else 0.0
+            )
 
-            completed_trades.append({
-                "symbol": symbol,
-                "close_reason": "exchange_sell",
-                "pnl_usd": round(pnl, 4),
-                "pnl_pct": round(pnl_pct, 2),
-                "entry_price": round(entry_price_avg, 8),
-                "exit_price": round(price, 8),
-                "hold_time_hours": hold_h,
-                "setup_type": "exchange_fill",
-                "closed_at": ts,
-                "amount_usd": round(matched_qty * price, 4),
-                "fee_usd": round(fee, 4),
-                "source": "exchange",
-            })
+            completed_trades.append(
+                {
+                    "symbol": symbol,
+                    "close_reason": "exchange_sell",
+                    "pnl_usd": round(pnl, 4),
+                    "pnl_pct": round(pnl_pct, 2),
+                    "entry_price": round(entry_price_avg, 8),
+                    "exit_price": round(price, 8),
+                    "hold_time_hours": hold_h,
+                    "setup_type": "exchange_fill",
+                    "closed_at": ts,
+                    "amount_usd": round(matched_qty * price, 4),
+                    "fee_usd": round(fee, 4),
+                    "source": "exchange",
+                }
+            )
 
     return completed_trades, round(total_pnl, 4)
 
@@ -2768,7 +3159,9 @@ async def _get_exchange_trade_history(limit: int) -> list[dict]:
         raw = await _exchange.fetch_my_trades(limit=fetch_limit)
     except Exception as e:
         logger.debug(f"[TradeHistory] fetch_my_trades error: {e}")
-        return _exchange_fills_cache[:limit]  # return stale cache on error rather than []
+        return _exchange_fills_cache[
+            :limit
+        ]  # return stale cache on error rather than []
 
     # Normalize timestamps and attach _ts_sec for FIFO sorting
     fills: list[dict] = []
@@ -2806,8 +3199,12 @@ async def _compute_pnl_from_equity_snapshots(current_equity: float) -> dict:
         cached_base = _equity_pnl_cache.get("_base_total", 0.0)
         cached_today = _equity_pnl_cache.get("_base_day", 0.0)
         return {
-            "pnl": round(current_equity - cached_base, 4) if cached_base else _equity_pnl_cache["pnl"],
-            "day_pnl": round(current_equity - cached_today, 4) if cached_today else _equity_pnl_cache["day_pnl"],
+            "pnl": round(current_equity - cached_base, 4)
+            if cached_base
+            else _equity_pnl_cache["pnl"],
+            "day_pnl": round(current_equity - cached_today, 4)
+            if cached_today
+            else _equity_pnl_cache["day_pnl"],
         }
 
     if _db is None:
@@ -2815,6 +3212,7 @@ async def _compute_pnl_from_equity_snapshots(current_equity: float) -> dict:
 
     try:
         import datetime as _dt
+
         today_start_ts = int(
             _dt.datetime(
                 *_dt.datetime.now(_dt.timezone.utc).timetuple()[:3],
@@ -2823,13 +3221,21 @@ async def _compute_pnl_from_equity_snapshots(current_equity: float) -> dict:
         )
 
         # Oldest snapshot ever → baseline for total PnL
-        oldest_cursor = _db.equity_snapshots.find({}, {"_id": 0, "t": 1, "v": 1}).sort("t", 1).limit(1)
+        oldest_cursor = (
+            _db.equity_snapshots.find({}, {"_id": 0, "t": 1, "v": 1})
+            .sort("t", 1)
+            .limit(1)
+        )
         oldest = await oldest_cursor.to_list(length=1)
 
         # First snapshot of today → baseline for day PnL
-        today_cursor = _db.equity_snapshots.find(
-            {"t": {"$gte": today_start_ts}}, {"_id": 0, "t": 1, "v": 1}
-        ).sort("t", 1).limit(1)
+        today_cursor = (
+            _db.equity_snapshots.find(
+                {"t": {"$gte": today_start_ts}}, {"_id": 0, "t": 1, "v": 1}
+            )
+            .sort("t", 1)
+            .limit(1)
+        )
         today_first = await today_cursor.to_list(length=1)
 
         base_total = float(oldest[0]["v"]) if oldest else current_equity
@@ -2845,7 +3251,9 @@ async def _compute_pnl_from_equity_snapshots(current_equity: float) -> dict:
             "_base_total": base_total,
             "_base_day": base_day,
         }
-        logger.debug(f"[PnL Snapshots] base_total={base_total:.2f} base_day={base_day:.2f} total={total_pnl:+.2f} today={day_pnl:+.2f}")
+        logger.debug(
+            f"[PnL Snapshots] base_total={base_total:.2f} base_day={base_day:.2f} total={total_pnl:+.2f} today={day_pnl:+.2f}"
+        )
     except Exception as e:
         logger.debug(f"[PnL Snapshots] error: {e}")
 
@@ -2885,6 +3293,7 @@ async def _compute_cumulative_exchange_pnl() -> dict:
     completed, total_pnl = _compute_pnl_from_fills(fills)
 
     import datetime
+
     today_start_ts = int(
         datetime.datetime(
             *datetime.datetime.now(datetime.timezone.utc).timetuple()[:3],
@@ -2946,8 +3355,12 @@ async def _build_ws_payload() -> dict:
         "last_setups": STATE.get("last_setups", [])[:3],
         "last_decisions": STATE.get("last_decisions", [])[:3],
         "recent_events": STATE.get("recent_events", [])[-10:],
-        "risk_health": _risk_manager.check_portfolio_health(STATE["current_equity"]) if _risk_manager else {},
-        "recent_trades": _position_manager.get_closed_history(10) if _position_manager else [],
+        "risk_health": _risk_manager.check_portfolio_health(STATE["current_equity"])
+        if _risk_manager
+        else {},
+        "recent_trades": _position_manager.get_closed_history(10)
+        if _position_manager
+        else [],
         "confirmed_issues": STATE.get("confirmed_issues", []),
     }
 
@@ -3111,7 +3524,9 @@ async def debug_pipeline():
         "total_open": _position_manager.open_count if _position_manager else 0,
         "bot_open": _position_manager.bot_open_count if _position_manager else 0,
         "max_positions": _risk_manager.max_positions if _risk_manager else 0,
-        "max_exposure_pct": _risk_manager.max_portfolio_exposure_pct if _risk_manager else 0,
+        "max_exposure_pct": _risk_manager.max_portfolio_exposure_pct
+        if _risk_manager
+        else 0,
     }
 
     return trace
@@ -3167,7 +3582,9 @@ async def reset_peak_equity():
         _risk_manager.force_reset_peak(eq)
     logger.warning(f"[API] Peak equity force-reset: ${old_peak:,.2f} → ${eq:,.2f}")
     if _alerts:
-        await _alerts.send(f"⚠️ Peak equity reset: ${old_peak:,.2f} → ${eq:,.2f}", priority="medium")
+        await _alerts.send(
+            f"⚠️ Peak equity reset: ${old_peak:,.2f} → ${eq:,.2f}", priority="medium"
+        )
     return {"status": "ok", "old_peak": round(old_peak, 2), "new_peak": round(eq, 2)}
 
 
@@ -3179,7 +3596,9 @@ async def emergency_stop():
     if _position_manager:
         results = await _position_manager.emergency_close_all()
     if _alerts:
-        await _alerts.send("🚨 EMERGENCY STOP — all positions closed.", priority="critical")
+        await _alerts.send(
+            "🚨 EMERGENCY STOP — all positions closed.", priority="critical"
+        )
     return {"status": "emergency_stop", "positions_closed": len(results)}
 
 
@@ -3195,7 +3614,16 @@ async def close_all_positions():
     # 1) Close in-memory tracked positions first
     if _position_manager:
         tracked = await _position_manager.emergency_close_all()
-        sells.extend([{"source": "tracked", "symbol": r.get("symbol"), "pnl": r.get("pnl_usd")} for r in tracked])
+        sells.extend(
+            [
+                {
+                    "source": "tracked",
+                    "symbol": r.get("symbol"),
+                    "pnl": r.get("pnl_usd"),
+                }
+                for r in tracked
+            ]
+        )
 
     # 2) In demo/live mode, sweep the exchange for any remaining holdings
     if _uses_exchange_account_state() and _exchange:
@@ -3203,7 +3631,15 @@ async def close_all_positions():
             balance = await _exchange.fetch_balance()
             markets = _exchange.exchange.markets or {}
             for currency, amounts in balance.items():
-                if currency in ("USDT", "free", "used", "total", "info", "timestamp", "datetime"):
+                if currency in (
+                    "USDT",
+                    "free",
+                    "used",
+                    "total",
+                    "info",
+                    "timestamp",
+                    "datetime",
+                ):
                     continue
                 amount = _extract_balance_amount(amounts)
                 if amount <= 1e-8:
@@ -3211,10 +3647,19 @@ async def close_all_positions():
                 symbol = f"{currency}/USDT"
                 if symbol not in markets:
                     continue
-                logger.info(f"[CloseAll] Market selling {amount:.6f} {currency} ({symbol})")
+                logger.info(
+                    f"[CloseAll] Market selling {amount:.6f} {currency} ({symbol})"
+                )
                 try:
                     order = await _exchange.create_market_sell(symbol, amount)
-                    sells.append({"source": "exchange", "symbol": symbol, "amount": amount, "order_id": order.get("id")})
+                    sells.append(
+                        {
+                            "source": "exchange",
+                            "symbol": symbol,
+                            "amount": amount,
+                            "order_id": order.get("id"),
+                        }
+                    )
                 except Exception as e:
                     logger.error(f"[CloseAll] Sell failed for {symbol}: {e}")
                     errors.append({"symbol": symbol, "error": str(e)})
@@ -3231,7 +3676,12 @@ async def close_all_positions():
             priority="high",
         )
 
-    return {"status": "closed", "sold": len(sells), "errors": len(errors), "details": sells}
+    return {
+        "status": "closed",
+        "sold": len(sells),
+        "errors": len(errors),
+        "details": sells,
+    }
 
 
 # ── Portfolio ────────────────────────────────────────────────────────────────
@@ -3239,7 +3689,11 @@ async def close_all_positions():
 async def portfolio():
     if _uses_exchange_account_state():
         snapshot = await _get_exchange_account_snapshot()
-        health = _risk_manager.check_portfolio_health(snapshot["equity"]) if _risk_manager else {}
+        health = (
+            _risk_manager.check_portfolio_health(snapshot["equity"])
+            if _risk_manager
+            else {}
+        )
 
         # PnL from equity snapshots = exchange ground truth (accounts for ALL
         # equity changes: realized, unrealized, fees). Falls back to exchange
@@ -3277,7 +3731,11 @@ async def portfolio():
             "source": snapshot["source"],
         }
     open_pos = _position_manager.get_open_positions() if _position_manager else []
-    health = _risk_manager.check_portfolio_health(STATE["current_equity"]) if _risk_manager else {}
+    health = (
+        _risk_manager.check_portfolio_health(STATE["current_equity"])
+        if _risk_manager
+        else {}
+    )
     return {
         "equity": STATE["current_equity"],
         "peak_equity": STATE.get("peak_equity", STATE["current_equity"]),
@@ -3285,7 +3743,9 @@ async def portfolio():
         "day_pnl_usd": round(STATE["day_pnl_usd"], 2),
         "open_positions": open_pos,
         "open_count": len(open_pos),
-        "exposure_usd": _position_manager.get_total_exposure_usd() if _position_manager else 0.0,
+        "exposure_usd": _position_manager.get_total_exposure_usd()
+        if _position_manager
+        else 0.0,
         "health": health,
         "source": "internal",
     }
@@ -3320,7 +3780,15 @@ async def sync_holdings():
         already_tracked = _position_manager.get_open_symbols()
 
         for currency, amounts in balance.items():
-            if currency in ("USDT", "free", "used", "total", "info", "timestamp", "datetime"):
+            if currency in (
+                "USDT",
+                "free",
+                "used",
+                "total",
+                "info",
+                "timestamp",
+                "datetime",
+            ):
                 continue
             if not isinstance(amounts, dict):
                 continue
@@ -3347,21 +3815,32 @@ async def sync_holdings():
 
                 amount_usd = amount * price
                 if amount_usd < 1.0:
-                    skipped.append({"symbol": symbol, "reason": f"too_small_${amount_usd:.2f}"})
+                    skipped.append(
+                        {"symbol": symbol, "reason": f"too_small_${amount_usd:.2f}"}
+                    )
                     continue
 
                 regime_params = STATE.get("regime_params") or {}
                 sl_pct = float(regime_params.get("stop_loss_pct", cfg.stop_loss_pct))
                 stop_loss = price * (1 + sl_pct / 100.0)
 
-                trail_activate = float(regime_params.get("trailing_activate_pct", cfg.trailing_stop_activate_pct))
-                trail_dist = float(regime_params.get("trailing_distance_pct", cfg.trailing_stop_distance_pct))
+                trail_activate = float(
+                    regime_params.get(
+                        "trailing_activate_pct", cfg.trailing_stop_activate_pct
+                    )
+                )
+                trail_dist = float(
+                    regime_params.get(
+                        "trailing_distance_pct", cfg.trailing_stop_distance_pct
+                    )
+                )
 
                 risk_per_unit = price - stop_loss
                 take_profit_1 = price + 2.0 * risk_per_unit
                 take_profit_2 = price + 5.0 * risk_per_unit
 
                 from src.position_manager import Position
+
                 pos = Position(
                     symbol=symbol,
                     entry_price=price,
@@ -3371,20 +3850,28 @@ async def sync_holdings():
                     take_profit_1=take_profit_1,
                     take_profit_2=take_profit_2,
                     setup_type="synced_holding",
-                    entry_fill={"filled_price": price, "filled_amount": amount, "amount_usd": amount_usd, "fee_usd": 0.0},
+                    entry_fill={
+                        "filled_price": price,
+                        "filled_amount": amount,
+                        "amount_usd": amount_usd,
+                        "fee_usd": 0.0,
+                    },
                 )
                 _position_manager._positions[pos.id] = pos
                 from src.metrics import active_positions
+
                 active_positions.set(len(_position_manager._positions))
 
-                synced.append({
-                    "symbol": symbol,
-                    "amount": amount,
-                    "amount_usd": round(amount_usd, 2),
-                    "entry_price": price,
-                    "stop_loss": round(stop_loss, 6),
-                    "take_profit_1": round(take_profit_1, 6),
-                })
+                synced.append(
+                    {
+                        "symbol": symbol,
+                        "amount": amount,
+                        "amount_usd": round(amount_usd, 2),
+                        "entry_price": price,
+                        "stop_loss": round(stop_loss, 6),
+                        "take_profit_1": round(take_profit_1, 6),
+                    }
+                )
                 logger.info(
                     f"[SyncHoldings] Imported {symbol}: "
                     f"qty={amount:.6f} price={price:.6f} value=${amount_usd:.2f}"
@@ -3434,11 +3921,17 @@ async def get_trades(limit: int = 50):
             exchange_fills = await _get_exchange_trade_history(remaining)
             # Avoid showing exchange fills that duplicate a DB entry (same symbol+close_reason)
             db_ids = {(t.get("symbol"), t.get("close_reason")) for t in db_trades}
-            extra = [f for f in exchange_fills
-                     if (f.get("symbol"), f.get("close_reason")) not in db_ids]
+            extra = [
+                f
+                for f in exchange_fills
+                if (f.get("symbol"), f.get("close_reason")) not in db_ids
+            ]
             merged = db_trades + extra
             if merged:
-                return {"trades": merged, "source": "db+exchange" if db_trades else "exchange"}
+                return {
+                    "trades": merged,
+                    "source": "db+exchange" if db_trades else "exchange",
+                }
         except Exception as e:
             logger.debug(f"Exchange trades fetch error: {e}")
 
@@ -3459,7 +3952,7 @@ async def equity_history(since: int = 0):
     """
     Return equity history. If `since` timestamp is provided, returns MongoDB
     historical data from that timestamp. Otherwise returns in-session history.
-    
+
     Query params:
       since: unix timestamp. If 0 or missing, returns current session.
     """
@@ -3469,10 +3962,13 @@ async def equity_history(since: int = 0):
     if since > 0 and _db is not None:
         # Fetch from persistent store for historical intervals
         try:
-            cursor = _db.equity_snapshots.find(
-                {"t": {"$gte": since}},
-                {"_id": 0, "t": 1, "v": 1}
-            ).sort("t", 1).limit(2000)
+            cursor = (
+                _db.equity_snapshots.find(
+                    {"t": {"$gte": since}}, {"_id": 0, "t": 1, "v": 1}
+                )
+                .sort("t", 1)
+                .limit(2000)
+            )
             db_hist = await cursor.to_list(length=2000)
             if db_hist:
                 history = [{"t": p["t"], "v": p["v"]} for p in db_hist]
@@ -3485,7 +3981,11 @@ async def equity_history(since: int = 0):
 
 @app.get("/api/performance")
 async def get_performance():
-    health = _risk_manager.check_portfolio_health(STATE["current_equity"]) if _risk_manager else {}
+    health = (
+        _risk_manager.check_portfolio_health(STATE["current_equity"])
+        if _risk_manager
+        else {}
+    )
     return {
         "health": health,
         "total_pnl_usd": round(STATE["total_pnl_usd"], 2),
@@ -3517,7 +4017,9 @@ async def get_agents():
     bb_mode = STATE.get("bigbrother_mode", "normal")
     return {
         "watcher": {
-            "status": "ok" if (_watcher and getattr(_watcher, "_scan_count", 0) > 0) else "idle",
+            "status": "ok"
+            if (_watcher and getattr(_watcher, "_scan_count", 0) > 0)
+            else "idle",
             "runs": getattr(_watcher, "_scan_count", 0) if _watcher else 0,
             "errors": 0,
             "last_run": STATE.get("last_cycle_at"),
@@ -3530,7 +4032,9 @@ async def get_agents():
         },
         "context": {
             **(_context.get_stats() if _context else {}),
-            "status": "idle" if (_context and not _context.enabled) else ("ok" if _context else "idle"),
+            "status": "idle"
+            if (_context and not _context.enabled)
+            else ("ok" if _context else "idle"),
             "runs": getattr(_context, "_call_count", 0) if _context else 0,
             "errors": 0,
         },
@@ -3624,7 +4128,9 @@ async def get_settings_endpoint():
         "max_positions": cfg.max_positions,
         "max_portfolio_exposure_pct": cfg.max_portfolio_exposure_pct,
         "max_portfolio_pct": cfg.max_portfolio_exposure_pct,
-        "daily_loss_limit_usd": round(STATE["current_equity"] * cfg.daily_loss_limit_pct, 2),
+        "daily_loss_limit_usd": round(
+            STATE["current_equity"] * cfg.daily_loss_limit_pct, 2
+        ),
         "max_drawdown_pct": cfg.max_drawdown_pct,
         "stop_loss_pct": cfg.stop_loss_pct,
         "trailing_activate_pct": cfg.trailing_stop_activate_pct,
@@ -3670,12 +4176,19 @@ async def _process_tc_command(message: str) -> str:
         poss = _position_manager.get_open_positions() if _position_manager else []
         if not poss:
             return "No open positions currently."
-        lines = [f"• {p['symbol']}: entry={p['entry_price']:.6f} size=${p['amount_usd']:.2f}" for p in poss]
+        lines = [
+            f"• {p['symbol']}: entry={p['entry_price']:.6f} size=${p['amount_usd']:.2f}"
+            for p in poss
+        ]
         return f"{len(poss)} open positions:\n" + "\n".join(lines)
     if any(k in msg for k in ["regime", "market", "trend"]):
         return f"Current regime: *{STATE['regime']}* | Mode: *{STATE.get('bigbrother_mode', 'normal')}*"
     if any(k in msg for k in ["win rate", "winrate", "accuracy"]):
-        health = _risk_manager.check_portfolio_health(STATE["current_equity"]) if _risk_manager else {}
+        health = (
+            _risk_manager.check_portfolio_health(STATE["current_equity"])
+            if _risk_manager
+            else {}
+        )
         wr = health.get("win_rate", 0.0)
         return f"Win rate: {wr:.1%} over {health.get('total_trades', 0)} trades."
     if any(k in msg for k in ["pause", "stop trading"]):
@@ -3695,11 +4208,23 @@ async def _process_tc_command(message: str) -> str:
             f"equity=${STATE['current_equity']:.2f} pnl=${STATE['total_pnl_usd']:+.2f} "
             f"open_positions={_position_manager.open_count if _position_manager else 0}"
         )
-        trade_context = {"symbol": "general", "setup_type": "inquiry", "context": {}, "decision": {}}
-        explanation = await _bigbrother.explain_decision({"symbol": "swarm", "question": message, **trade_context})
-        return explanation or "I'm monitoring the markets. Ask about PnL, positions, regime, or win rate."
+        trade_context = {
+            "symbol": "general",
+            "setup_type": "inquiry",
+            "context": {},
+            "decision": {},
+        }
+        explanation = await _bigbrother.explain_decision(
+            {"symbol": "swarm", "question": message, **trade_context}
+        )
+        return (
+            explanation
+            or "I'm monitoring the markets. Ask about PnL, positions, regime, or win rate."
+        )
 
-    return "Moonshot-CEX swarm is running. Ask about PnL, positions, regime, or win rate."
+    return (
+        "Moonshot-CEX swarm is running. Ask about PnL, positions, regime, or win rate."
+    )
 
 
 @app.get("/api/tc/agents")
