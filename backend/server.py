@@ -2677,6 +2677,12 @@ async def _recover_positions_from_db():
             _risk_manager._consecutive_wins = 0
             _risk_manager._pause_until = None
             _risk_manager._day_trade_count = 0
+            # v7.7: Mark end of historical seed. Rolling-WR gate now sees 0
+            # session trades → will NOT fire a cooldown until 10 fresh live
+            # trades accumulate in this session. Prevents "bot resurrects
+            # after bug fix, then immediately self-pauses on yesterday's
+            # losses" deadlock.
+            _risk_manager._session_start_idx = len(_risk_manager._trade_history)
         except Exception as e:
             logger.debug(f"[Recovery] Risk manager seed error: {e}")
 

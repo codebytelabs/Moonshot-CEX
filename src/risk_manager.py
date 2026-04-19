@@ -117,6 +117,10 @@ class RiskManager:
         self._consecutive_wins = 0
         self._pause_until: Optional[float] = None
         self._trade_history: list[dict] = []
+        # v7.7: Rolling-WR cooldown uses SESSION trades only, not historical
+        # seed. Without this, a restart after any bad-luck streak triggers a
+        # 60-min cooldown on the first cycle, locking the fresh-fixed bot out.
+        self._session_start_idx: int = 0
         self._day_trade_count: int = 0
         self._drawdown_halt_cycles: int = (
             0  # consecutive cycles blocked by drawdown_halt
@@ -258,8 +262,11 @@ class RiskManager:
 
         # Rolling win-rate gate: if last N trades have abysmal win rate,
         # trigger a 60-min cooldown then resume (avoids permanent deadlock).
-        if len(self._trade_history) >= self.rolling_wr_window:
-            recent = self._trade_history[-self.rolling_wr_window :]
+        # v7.7: Only count SESSION trades — historical seed would trigger a
+        # pause immediately after any restart following a bad streak.
+        _session_trades = self._trade_history[self._session_start_idx :]
+        if len(_session_trades) >= self.rolling_wr_window:
+            recent = _session_trades[-self.rolling_wr_window :]
             wins = sum(1 for t in recent if t.get("won"))
             wr = wins / len(recent)
             if wr < self.rolling_wr_floor:
