@@ -80,7 +80,11 @@ class EMATrendStrategy(BaseStrategy):
         elif price_4h < ema50_4h and ema50_4h < ema50_4h_prev:
             trend_4h = "bear"
 
-        if regime == "bear":
+        # v7.8.1: gate EMA trend-follow by regime — this strategy bleeds in choppy
+        # and bear tapes (live evidence: 0/4 wins, -$323 during a mostly-choppy
+        # window). Only allow when the regime classifier says bull or sideways,
+        # and always require the 4H trend to not be bear.
+        if regime in ("bear", "choppy"):
             return None
         if trend_4h == "bear":
             return None

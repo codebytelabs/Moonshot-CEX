@@ -5,6 +5,45 @@ Format: **version → date → category → what changed → why**.
 
 ---
 
+## v7.8.1 — April 20, 2026 — Post-Deploy Retrospective Hotfix
+
+> **Mission:** First 24h of v7.8 live data showed the EMA trend-follow restoration was a net loser in choppy and bear tapes (0/4 wins, -$323.83), and a stale-bytecode deploy drift silently disabled the BTC crash sweep for hours. This release ring-fences the EMA strategy, adds per-setup validation sizing and circuit breakers, and hardens deploy hygiene so the same regressions cannot recur.
+
+### WHAT CHANGED
+
+| Area | Change | Why |
+|---|---|---|
+| `src/strategies/ema_trend.py` | Skip signals when regime is `choppy` or `bear` (previously only `bear`) | Live data: 4/4 losers were in choppy, -$323 in 24h. Trend-follow is a chop-killer by design. |
+| `src/strategies/regime_engine.py` | `ema_trend` weight zeroed in `choppy` and `bear`; reallocated to `bb_squeeze` + `bb_mean_rev` | Belt-and-suspenders with the strategy-internal gate; no signal routing through a known-losing regime |
+| `src/risk_manager.py` | Added `SETUP_SIZE_MULT` table (`ema_trend_follow = 0.5×`) and applied as the 8th multiplier in sizing | Restored strategies must earn full allocation during a validation window |
+| `src/risk_manager.py` | Added per-setup circuit breaker (`SETUP_CIRCUIT_BREAKERS`) auto-pausing a single setup at ≤20% WR over a 5-trade window, 120-minute cooldown | Prevents one bad strategy from dominating portfolio drawdown |
+| `src/risk_manager.py` | Extended `record_trade()` to accept `setup_type`; persisted in trade history | Prereq for the per-setup circuit breaker |
+| `backend/server.py` | Passed `setup_type` through `can_open_position`, `compute_position_size`, `compute_futures_position_size`, and `record_trade` at every callsite + seeding loop | End-to-end plumbing for the new per-setup knobs |
+| `backend/server.py` | Added a startup smoke test asserting `PositionManager` exposes `get_all_positions`, `get_position_for_symbol`, `get_bot_exposure_usd` | Fast, loud failure when a deploy leaves the process on stale bytecode (root cause of the v7.8 BTC crash sweep regression) |
+| `backend/server.py` | New endpoint `GET /api/stats/by_setup?hours=N` — returns per-setup trades/WR/PnL/PF | Fast ops visibility without shelling into mongosh |
+| `scripts/deploy_clean.sh` | New helper: fast-forward pull → clear every `__pycache__` → restart service → health check | Codifies the deploy hygiene that would have prevented the v7.8 regression |
+| `__tests__/` | New focused tests: EMA regime gate, setup size multiplier, per-setup circuit breaker, PositionManager surface | Locks behavior in and fails fast on future drift |
+
+### v7.8 RETROSPECTIVE (reference data that drove this release)
+
+- **Window**: 2026-04-19 11:50 UTC → 2026-04-20 ~04:00 UTC (~24h)
+- **Equity**: $5,026.64 → $4,717.48 (`-$309.16` / `-6.1%`)
+- **Closed trades**: 7 (3W / 4L, WR 43%)
+- **Regime exposure**: ~24k `choppy` cycles, ~15k `bull`, ~6.7k `bear`, ~0.9k `sideways`
+- **Per-setup PnL**:
+  - `ema_trend_follow` — 4 trades, **0% WR**, **-$323.83**
+  - `vwap_momentum_breakout` — 2 trades, **100% WR**, +$35.17
+  - `bb_mean_reversion` — 1 trade, **100% WR**, +$27.80
+- **Silent regression**: 37 `'PositionManager' object has no attribute 'get_all_positions'` errors — the BTC crash sweep branch was a no-op every time BTC score ≤ 0.30
+
+### PENDING MONITORING
+
+- Watch `/api/stats/by_setup?hours=24` for `ema_trend_follow` post-relaunch behavior; if the first 10 signals in `bull`/`sideways` still underperform, zero its weight everywhere and retire the strategy.
+- Keep sizing at 0.5× for `ema_trend_follow` for at least 20 closed trades before considering a lift to 0.75× / 1.0×.
+- Confirm `get_all_positions` AttributeError does not reappear after the clean deploy; if it does, investigate a deeper import-path issue.
+
+---
+
 ## v7.8 — April 19, 2026 — Strategy Quality Pruning + Trend Engine Rebalance
 
 > **Mission:** Remove the legacy analyzer's garbage-bucket entries, restore the higher-quality EMA trend-follow behavior that previously produced the best ROI, and give the strongest live winners more allocation in the merge path and bull-regime router.

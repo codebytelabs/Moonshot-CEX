@@ -180,6 +180,28 @@ async def _startup():
     logger.info(f"  Initial equity: ${cfg.initial_equity_usd:,.2f}")
     logger.info("=" * 60)
 
+    # v7.8.1: Startup smoke test. Catches deploy-drift where the running process
+    # loaded an older module version (e.g. stale __pycache__ or half-deployed
+    # file) that no longer exposes methods backend/server.py depends on. The
+    # error is loud and fatal — better to fail startup than to silently crash
+    # every cycle as happened during v7.8 with `get_all_positions`.
+    _required_pm_methods = (
+        "get_all_positions",
+        "get_position_for_symbol",
+        "get_bot_exposure_usd",
+    )
+    from src.position_manager import PositionManager as _PM_CLS
+
+    _missing_pm = [m for m in _required_pm_methods if not hasattr(_PM_CLS, m)]
+    if _missing_pm:
+        raise RuntimeError(
+            f"[Startup] PositionManager is missing required methods: {_missing_pm}. "
+            "Clear __pycache__ and redeploy — this is a stale-bytecode regression."
+        )
+    logger.info(
+        f"[Startup] PositionManager surface OK ({len(_required_pm_methods)} methods verified)"
+    )
+
     # MongoDB
     _mongo_client = AsyncIOMotorClient(cfg.mongo_url)
     _db = _mongo_client[cfg.db_name]
@@ -1167,6 +1189,7 @@ async def _run_cycle():
                 ta_score=float(setup.get("ta_score", 50.0)),
                 regime_size_mult=_regime_size_mult,
                 current_regime=_current_regime,
+                setup_type=setup.get("setup_type"),
             )
         else:
             size_usd = _risk_manager.compute_position_size(
@@ -1181,6 +1204,7 @@ async def _run_cycle():
                 ta_score=float(setup.get("ta_score", 50.0)),
                 regime_size_mult=_regime_size_mult,
                 current_regime=_current_regime,
+                setup_type=setup.get("setup_type"),
             )
         # v7.4: Apply BTC graduated sizing to position size
         _is_strat = bool(setup.get("strategy", ""))
@@ -1378,6 +1402,7 @@ async def _run_cycle():
             open_symbols=open_syms,
             regime_max_positions=_regime_max_positions,
             regime_max_exposure_pct=_regime_max_exposure,
+            setup_type=setup.get("setup_type"),
         )
         if not can_open:
             # v7.3: Rotation DISABLED. 14 rotated_out trades = 0% win rate, -$839.
@@ -1454,7 +1479,12 @@ async def _run_cycle():
             pnl_pct = float(exit_result.get("pnl_pct", 0))
             r_mult = float(exit_result.get("decision", {}).get("r_multiple", 0))
             hold_h = float(exit_result.get("hold_time_hours", 0))
-            _risk_manager.record_trade(pnl, pnl_pct, r_mult)
+            _risk_manager.record_trade(
+                pnl,
+                pnl_pct,
+                r_mult,
+                setup_type=exit_result.get("setup_type"),
+            )
             STATE["total_pnl_usd"] += pnl
             STATE["day_pnl_usd"] += pnl
             await _save_trade_to_db(exit_result)
@@ -2652,7 +2682,7 @@ async def _recover_positions_from_db():
                 trade_filter["trading_mode"] = "futures"
             cursor = _db.trades.find(
                 trade_filter,
-                {"_id": 0, "pnl_usd": 1, "pnl_pct": 1},
+                {"_id": 0, "pnl_usd": 1, "pnl_pct": 1, "setup_type": 1},
                 sort=[("saved_at", 1)],
                 limit=500,
             )
@@ -2661,7 +2691,9 @@ async def _recover_positions_from_db():
                 pnl = float(t.get("pnl_usd") or 0)
                 pct = float(t.get("pnl_pct") or 0)
                 r = pct / abs(cfg.stop_loss_pct) if cfg.stop_loss_pct else 0.0
-                _risk_manager.record_trade(pnl, pct, r)
+                _risk_manager.record_trade(
+                    pnl, pct, r, setup_type=t.get("setup_type")
+                )
             if trade_docs:
                 wr = (
                     sum(1 for t in trade_docs if (t.get("pnl_usd") or 0) > 0)
@@ -4029,6 +4061,79 @@ async def get_metrics_performance():
     """Rolling 7d/30d metrics, equity curve, drawdown, win-rate alerts."""
     tracker = PerformanceTracker(db=_db)
     return await tracker.get_current_metrics()
+
+
+@app.get("/api/stats/by_setup")
+async def get_stats_by_setup(hours: int = 24, limit: int = 500):
+    """v7.8.1: per-setup performance stats over the last N hours.
+
+    Lightweight ops endpoint — groups closed trades by `setup_type` and returns
+    count, win rate, total PnL, and average PnL/trade. Replaces the mongosh
+    spelunking we had to do during the v7.8 retrospective.
+    """
+    if _db is None:
+        return {"ok": False, "error": "db_not_ready"}
+    try:
+        now = int(time.time())
+        hours = max(1, min(int(hours), 24 * 30))
+        limit = max(1, min(int(limit), 2000))
+        since = now - hours * 3600
+        cursor = _db.trades.find(
+            {"closed_at": {"$gte": since}, "pnl_usd": {"$exists": True}},
+            {
+                "_id": 0,
+                "setup_type": 1,
+                "strategy": 1,
+                "pnl_usd": 1,
+                "regime": 1,
+                "close_reason": 1,
+                "closed_at": 1,
+            },
+            sort=[("closed_at", 1)],
+            limit=limit,
+        )
+        docs = await cursor.to_list(length=limit)
+        buckets: dict[str, dict] = {}
+        for t in docs:
+            key = (t.get("setup_type") or t.get("strategy") or "unknown")
+            b = buckets.setdefault(
+                key,
+                {"trades": 0, "wins": 0, "pnl_usd": 0.0, "pnl_win": 0.0, "pnl_loss": 0.0},
+            )
+            pnl = float(t.get("pnl_usd") or 0.0)
+            b["trades"] += 1
+            b["pnl_usd"] += pnl
+            if pnl > 0:
+                b["wins"] += 1
+                b["pnl_win"] += pnl
+            else:
+                b["pnl_loss"] += pnl
+        for key, b in buckets.items():
+            n = b["trades"]
+            b["win_rate"] = round(b["wins"] / n, 3) if n else None
+            b["avg_pnl_usd"] = round(b["pnl_usd"] / n, 2) if n else None
+            b["pnl_usd"] = round(b["pnl_usd"], 2)
+            b["pnl_win"] = round(b["pnl_win"], 2)
+            b["pnl_loss"] = round(b["pnl_loss"], 2)
+            denom = abs(b["pnl_loss"]) or None
+            b["profit_factor"] = (
+                round(b["pnl_win"] / denom, 2) if denom else None
+            )
+        total_pnl = round(sum(b["pnl_usd"] for b in buckets.values()), 2)
+        total_trades = sum(b["trades"] for b in buckets.values())
+        wins = sum(b["wins"] for b in buckets.values())
+        return {
+            "ok": True,
+            "since_ts": since,
+            "hours": hours,
+            "total_trades": total_trades,
+            "win_rate": round(wins / total_trades, 3) if total_trades else None,
+            "total_pnl_usd": total_pnl,
+            "by_setup": buckets,
+        }
+    except Exception as exc:
+        logger.error(f"[api/stats/by_setup] failed: {exc}")
+        return {"ok": False, "error": str(exc)}
 
 
 @app.get("/api/metrics/daily")

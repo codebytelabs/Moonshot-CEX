@@ -73,6 +73,24 @@ WIN_STREAK_BONUS = [
 ]
 
 
+# ── v7.8.1: Per-setup sizing multiplier ───────────────────────────────────────
+# Apply a size multiplier to specific setup_types. 1.0 = normal.
+# Used to half-size restored or under-validated strategies until they prove out.
+SETUP_SIZE_MULT: dict[str, float] = {
+    # Validation period after the v7.8 restoration: 0/4 wins in live data.
+    # Stay at half-size until at least SETUP_VALIDATION_GRAD_AFTER closes land.
+    "ema_trend_follow": 0.5,
+}
+
+# ── v7.8.1: Per-setup circuit breaker ─────────────────────────────────────────
+# If a setup_type's win rate over the last `window` closed trades is at or
+# below `max_wr`, pause entries for that setup for `pause_minutes`. Keep other
+# setups running normally. Prevents one bad strategy from dominating drawdown.
+SETUP_CIRCUIT_BREAKERS: dict[str, dict] = {
+    "ema_trend_follow": {"window": 5, "max_wr": 0.20, "pause_minutes": 120},
+}
+
+
 class RiskManager:
     """Multi-layer portfolio protection and position sizing."""
 
@@ -137,6 +155,11 @@ class RiskManager:
         self._tier_max_single: float = 0.25
         self._tier_max_risk: float = 0.08
 
+        # v7.8.1: per-setup pause state. Key = setup_type, value = unix ts
+        # after which the setup becomes allowed again. Not persisted across
+        # restarts by design — startup recovery re-evaluates from history.
+        self._setup_pause_until: dict[str, float] = {}
+
     # ── Account-tier detection (call at startup and after equity updates) ──────
     def detect_account_tier(self, equity: float) -> str:
         """
@@ -169,6 +192,7 @@ class RiskManager:
         open_symbols: set = None,
         regime_max_positions: Optional[int] = None,
         regime_max_exposure_pct: Optional[float] = None,
+        setup_type: Optional[str] = None,
     ) -> tuple[bool, str]:
         """
         Check all risk gates. Returns (allowed: bool, reason: str).
@@ -282,6 +306,17 @@ class RiskManager:
                     f"rolling_winrate_cooldown ({wins}/{len(recent)} = {wr:.0%}, {remaining}s left)",
                 )
 
+        # v7.8.1: per-setup circuit breaker. Pauses a single setup_type without
+        # affecting others. State is computed in record_trade() on each close.
+        if setup_type:
+            pause_until = self._setup_pause_until.get(setup_type)
+            if pause_until and time.time() < pause_until:
+                remaining = int(pause_until - time.time())
+                return (
+                    False,
+                    f"setup_circuit_breaker:{setup_type} ({remaining}s left)",
+                )
+
         return True, "ok"
 
     def compute_position_size(
@@ -296,6 +331,7 @@ class RiskManager:
         regime: str = "sideways",
         regime_size_mult: float = 1.0,
         current_regime: str = "sideways",
+        setup_type: Optional[str] = None,
     ) -> float:
         """
         Compute position size in USD — conviction-aware, liquidity-gated,
@@ -376,8 +412,17 @@ class RiskManager:
         # ── 7. Regime size multiplier (from BigBrother) ───────────────────────
         reg_mult = max(0.30, min(1.20, regime_size_mult))  # guard rails
 
+        # ── 8. v7.8.1: Per-setup validation multiplier ────────────────────────
+        # Let a restored or unproven strategy run at reduced size until it has
+        # earned back full allocation. Hard-clipped to [0.25, 1.0] so a typo in
+        # the table can't blow up sizing.
+        setup_mult = 1.0
+        if setup_type:
+            raw = SETUP_SIZE_MULT.get(setup_type, 1.0)
+            setup_mult = max(0.25, min(1.0, float(raw)))
+
         # ── Final size ────────────────────────────────────────────────────────
-        size = base_size * conviction_mult * liq_mult * ta_mult * reg_mult
+        size = base_size * conviction_mult * liq_mult * ta_mult * reg_mult * setup_mult
         size = min(size, max_single)  # hard cap (% of equity)
         size = min(size, 5000.0)  # absolute hard cap — no single position > $5000
         # v8.0: $150 margin floor (was $50). Rationale from live data: positions
@@ -394,7 +439,7 @@ class RiskManager:
             f"tier={self._account_tier}({tier_mult:.2f}×) dd={drawdown:.1%}({dd_mult:.2f}×) "
             f"streak={self._consecutive_wins}w({streak_mult:.2f}×) | "
             f"conv={conviction_mult:.2f}× liq={liq_mult:.2f}× ta={ta_mult:.2f}× "
-            f"regime={reg_mult:.2f}×)"
+            f"regime={reg_mult:.2f}× setup={setup_mult:.2f}×)"
         )
         return size
 
@@ -411,6 +456,7 @@ class RiskManager:
         regime: str = "sideways",
         regime_size_mult: float = 1.0,
         current_regime: str = "sideways",
+        setup_type: Optional[str] = None,
     ) -> float:
         """Leverage-aware position sizing for futures.
 
@@ -437,6 +483,7 @@ class RiskManager:
                 regime=regime,
                 regime_size_mult=regime_size_mult,
                 current_regime=current_regime,
+                setup_type=setup_type,
             )
 
         # For futures: compute margin (spot-equivalent) size first
@@ -455,6 +502,7 @@ class RiskManager:
             regime=regime,
             regime_size_mult=regime_size_mult,
             current_regime=current_regime,
+            setup_type=setup_type,
         )
 
         self.max_risk_per_trade_pct = original_risk
@@ -514,8 +562,19 @@ class RiskManager:
         self._day_trade_count += 1
         self._entries_this_cycle += 1
 
-    def record_trade(self, pnl_usd: float, pnl_pct: float, r_multiple: float):
-        """Record trade outcome for Kelly and circuit breaker logic."""
+    def record_trade(
+        self,
+        pnl_usd: float,
+        pnl_pct: float,
+        r_multiple: float,
+        setup_type: Optional[str] = None,
+    ):
+        """Record trade outcome for Kelly and circuit breaker logic.
+
+        v7.8.1: setup_type is stored so the per-setup circuit breaker can
+        evaluate a rolling window of trades for that specific strategy and
+        pause it without affecting others.
+        """
         won = pnl_usd > 0
         self._trade_history.append(
             {
@@ -524,10 +583,37 @@ class RiskManager:
                 "r_multiple": r_multiple,
                 "won": won,
                 "timestamp": int(time.time()),
+                "setup_type": setup_type,
             }
         )
         if len(self._trade_history) > 500:
             self._trade_history = self._trade_history[-500:]
+
+        # v7.8.1: per-setup circuit breaker evaluation. Only evaluate the
+        # setup that just closed. Pause for the configured minutes when the
+        # rolling window WR is at or below the configured threshold.
+        if setup_type and setup_type in SETUP_CIRCUIT_BREAKERS:
+            cfg = SETUP_CIRCUIT_BREAKERS[setup_type]
+            window = int(cfg.get("window", 5))
+            max_wr = float(cfg.get("max_wr", 0.20))
+            pause_minutes = int(cfg.get("pause_minutes", 120))
+            setup_trades = [
+                t for t in self._trade_history if t.get("setup_type") == setup_type
+            ]
+            if len(setup_trades) >= window:
+                recent = setup_trades[-window:]
+                wins = sum(1 for t in recent if t.get("won"))
+                wr = wins / len(recent)
+                if wr <= max_wr:
+                    new_pause = time.time() + pause_minutes * 60
+                    prev = self._setup_pause_until.get(setup_type)
+                    if not prev or new_pause > prev:
+                        self._setup_pause_until[setup_type] = new_pause
+                        logger.warning(
+                            f"[Risk] setup_circuit_breaker:{setup_type} "
+                            f"{wins}/{len(recent)} = {wr:.0%} ≤ {max_wr:.0%} "
+                            f"→ paused {pause_minutes}min"
+                        )
 
         if won:
             self._consecutive_losses = 0

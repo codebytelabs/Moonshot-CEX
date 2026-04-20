@@ -29,10 +29,13 @@ from .base import BaseStrategy, StrategySignal
 
 # ── Regime → Strategy Weights ────────────────────────────────────────────────
 REGIME_WEIGHTS = {
+    # v7.8.1: ema_trend is OFF in choppy and bear based on live data (0/4 wins,
+    # -$323 over a 24h window dominated by those regimes). Bull allocation is
+    # unchanged; bear/choppy now route to mean-reversion and squeeze only.
     "bull":     {"ema_trend": 0.45, "vwap_momentum": 0.50, "bb_squeeze": 0.15, "bb_mean_rev": 0.00},
-    "bear":     {"ema_trend": 0.35, "vwap_momentum": 0.00, "bb_squeeze": 0.35, "bb_mean_rev": 0.30},
+    "bear":     {"ema_trend": 0.00, "vwap_momentum": 0.00, "bb_squeeze": 0.45, "bb_mean_rev": 0.55},
     "sideways": {"ema_trend": 0.00, "vwap_momentum": 0.25, "bb_squeeze": 0.30, "bb_mean_rev": 0.45},
-    "choppy":   {"ema_trend": 0.15, "vwap_momentum": 0.00, "bb_squeeze": 0.50, "bb_mean_rev": 0.35},
+    "choppy":   {"ema_trend": 0.00, "vwap_momentum": 0.00, "bb_squeeze": 0.55, "bb_mean_rev": 0.45},
 }
 
 # Minimum combined score to emit a signal
