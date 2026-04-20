@@ -33,7 +33,7 @@ class BBSqueezeStrategy(BaseStrategy):
     ATR_TP_MULT = 2.5           
     ATR_TRAIL_MULT = 1.0        # Trailing distance = 1.0x ATR
     MAX_SL_PCT = -5.0           
-    TRAIL_ACTIVATE_PCT = 2.0     
+    TRAIL_ACTIVATE_PCT = 1.25    
     TRAIL_DISTANCE_PCT = 1.5
     MAX_HOLD_MINUTES = 300      # 5h — squeeze breakouts can run
     SQUEEZE_MIN_BARS = 3        # Require at least 3 bars of squeeze
@@ -218,7 +218,7 @@ class BBSqueezeStrategy(BaseStrategy):
             # v7.8.1: in bear/choppy, activate trailing sooner (lock in gains
             # faster) and cap hold at 150min (2.5h) — squeeze breakouts that
             # haven't paid off in 2.5h in a hostile regime won't.
-            trail_activate_pct=1.5 if regime in ("bear", "choppy") else self.TRAIL_ACTIVATE_PCT,
+            trail_activate_pct=1.0 if regime in ("bear", "choppy") else self.TRAIL_ACTIVATE_PCT,
             trail_distance_pct=self.TRAIL_DISTANCE_PCT,
             trail_distance_price=atr_val * self.ATR_TRAIL_MULT,
             max_hold_minutes=150 if regime in ("bear", "choppy") else self.MAX_HOLD_MINUTES,
