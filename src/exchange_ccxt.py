@@ -257,6 +257,11 @@ class ExchangeConnector:
                 if "-2013" in str(e) or "order does not exist" in str(e).lower():
                     logger.debug(f"[{self.name}] Order already filled/gone on {endpoint}: {e}")
                     raise
+                # Binance -4411: symbol requires TradFi-Perps agreement — not retriable.
+                # Bail immediately so execution_core can apply symbol cooldown.
+                if "-4411" in str(e):
+                    logger.warning(f"[{self.name}] TradFi-Perps agreement required (not retriable): {e}")
+                    raise
                 err_str = str(e).lower()
                 # ── Dust / sub-minimum detection ─────────────────────────────
                 # Gate.io and other exchanges return ExchangeError (not retryable)
