@@ -36,17 +36,20 @@ REGIME_SCALE = {
     # Data: choppy SL×0.65 = -2.28% was too tight for 7x leverage (0.33% noise triggers it).
     # The stop-loss is a hard floor, not a knob to turn. Trail and time still scale.
     #
-    # v7.5 TIME EXIT TIGHTENING (2026-04-18 data-driven):
-    # 7/14 losses were time_exit bleeds — positions held 4h then ejected at -2~5%.
-    # Root cause: time limits were too generous for choppy/bear markets. Fix:
-    #   bull:    1.0× (4h) — dropped from 1.5× (6h was reckless, alts drift in bull too)
-    #   sideways:1.0× (4h) — no change
-    #   bear:    0.50× (2h) — dropped from 0.75×. If not moving in 2h in bear, it won't.
-    #   choppy:  0.35× (1.4h) — hard cutoff. Choppy positions don't recover, they bleed.
-    "bull": {"sl": 1.0, "trail": 1.2, "time": 1.0},
+    # v7.8.1 R:R ASYMMETRY FIX (2026-04-20 data-driven):
+    # 200-trade audit: avg_win=$33.88, avg_loss=-$47.55 → breakeven WR=58.4%, actual=45.5%.
+    # Root cause: trail_distance (0.60% in choppy) was too narrow — every zig-zag in a
+    # choppy market triggered the trailing stop before the position could run to a meaningful
+    # gain. We now separate trail_act (activation threshold) from trail_dist (room from peak):
+    #   trail_act scale — unchanged. Trailing activates at the same % gain as before.
+    #   trail_dist scale — widened in bear/choppy so winners can breathe through normal
+    #                      intraday pullbacks instead of getting stopped at the first retrace.
+    # time:  choppy 0.35→0.50 (53min→75min). v7.5 tightening over-corrected — 0.35× barely
+    #         gives a valid position time to develop any momentum at all.
+    "bull":     {"sl": 1.0, "trail": 1.2, "time": 1.0},
     "sideways": {"sl": 1.0, "trail": 1.0, "time": 1.0},
-    "bear": {"sl": 1.0, "trail": 0.9, "time": 0.50},
-    "choppy": {"sl": 1.0, "trail": 0.85, "time": 0.35},
+    "bear":     {"sl": 1.0, "trail": 0.9,  "trail_dist": 1.6, "time": 0.50},
+    "choppy":   {"sl": 1.0, "trail": 0.85, "trail_dist": 2.0, "time": 0.50},
 }
 
 # ── Per-regime capital deployment limits ───────────────────────────────────────
@@ -363,11 +366,16 @@ class BigBrotherAgent:
         }
 
     def _build_regime_params(self, regime: str) -> dict:
-        """Build exit parameter dict scaled for the current regime."""
+        """Build exit parameter dict scaled for the current regime.
+
+        v7.8.1: trail_act and trail_dist are now separately scalable.
+        trail_act uses scale["trail"]; trail_dist uses scale["trail_dist"]
+        if present, falling back to scale["trail"] for backward compat.
+        """
         scale = REGIME_SCALE.get(regime, REGIME_SCALE["sideways"])
         sl = round(self._base_stop_loss_pct * scale["sl"], 2)
         ta = round(self._base_trailing_activate_pct * scale["trail"], 2)
-        td = round(self._base_trailing_distance_pct * scale["trail"], 2)
+        td = round(self._base_trailing_distance_pct * scale.get("trail_dist", scale["trail"]), 2)
         te = round(self._base_time_exit_hours * scale["time"], 2)
         return {
             "stop_loss_pct": sl,

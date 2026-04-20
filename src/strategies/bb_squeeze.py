@@ -155,8 +155,12 @@ class BBSqueezeStrategy(BaseStrategy):
             sl_pct = -abs((sl - price) / price * 100)
 
         # ── Hard cap SL at MAX_SL_PCT ──────────────────────────────────────
-        if sl_pct < self.MAX_SL_PCT:
-            sl_pct = self.MAX_SL_PCT
+        # v7.8.1: tighter cap in bear/choppy. Squeeze breakouts in hostile
+        # regimes have a higher false-breakout rate — cut the max loss per
+        # signal before it becomes a portfolio-level drain.
+        _max_sl = -3.5 if regime in ("bear", "choppy") else self.MAX_SL_PCT
+        if sl_pct < _max_sl:
+            sl_pct = _max_sl
             if direction == "long":
                 sl = price * (1 + sl_pct / 100)
             else:
@@ -211,10 +215,13 @@ class BBSqueezeStrategy(BaseStrategy):
             setup_type="bb_squeeze_breakout",
             reason=f"BB squeeze {direction} bars={squeeze_bars} vol={vol_ratio:.1f}x slope={ema_slope:+.2f}% RSI={rsi_val:.0f}",
             timeframe="1h",
-            trail_activate_pct=self.TRAIL_ACTIVATE_PCT,
+            # v7.8.1: in bear/choppy, activate trailing sooner (lock in gains
+            # faster) and cap hold at 150min (2.5h) — squeeze breakouts that
+            # haven't paid off in 2.5h in a hostile regime won't.
+            trail_activate_pct=1.5 if regime in ("bear", "choppy") else self.TRAIL_ACTIVATE_PCT,
             trail_distance_pct=self.TRAIL_DISTANCE_PCT,
             trail_distance_price=atr_val * self.ATR_TRAIL_MULT,
-            max_hold_minutes=self.MAX_HOLD_MINUTES,
+            max_hold_minutes=150 if regime in ("bear", "choppy") else self.MAX_HOLD_MINUTES,
         )
 
     def _detect_squeeze(
