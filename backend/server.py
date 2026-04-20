@@ -3662,6 +3662,30 @@ async def emergency_stop():
     return {"status": "emergency_stop", "positions_closed": len(results)}
 
 
+@app.post("/api/positions/{position_id}/close")
+async def force_close_position(position_id: str):
+    """Force-close a single in-memory tracked position by ID.
+    Use when the tick loop fails to close a stuck/breached position.
+    """
+    if not _position_manager:
+        raise HTTPException(status_code=503, detail="Position manager not ready")
+    pos = _position_manager._positions.get(position_id)
+    if pos is None:
+        # also check by 8-char prefix
+        matches = [p for pid, p in _position_manager._positions.items() if pid.startswith(position_id)]
+        if not matches:
+            raise HTTPException(status_code=404, detail=f"Position {position_id} not found")
+        pos = matches[0]
+    if pos.status != "open":
+        return {"ok": False, "detail": f"Position {pos.symbol} is already {pos.status}"}
+    try:
+        current_price = await _position_manager.execution.get_current_price(pos.symbol)
+        result = await _position_manager._execute_exit(pos, current_price or pos.entry_price, "force_close_admin", pos.amount)
+        return {"ok": True, "symbol": pos.symbol, "result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/swarm/close-all-positions")
 async def close_all_positions():
     """Market-sell ALL exchange holdings (demo/live mode).

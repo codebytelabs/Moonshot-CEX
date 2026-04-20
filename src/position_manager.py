@@ -592,9 +592,14 @@ class PositionManager:
         for pos_id, pos in list(self._positions.items()):
             if pos.status != "open":
                 continue
-            result = await self._tick_position(pos, regime_params)
-            if result:
-                exits.append(result)
+            try:
+                result = await self._tick_position(pos, regime_params)
+                if result:
+                    exits.append(result)
+            except Exception as _tick_err:
+                logger.error(
+                    f"[PM] Tick error for {pos.symbol} ({pos.id[:8]}): {_tick_err} — skipping this position this cycle"
+                )
         return exits
 
     async def tighten_stops_for_regime(
