@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from loguru import logger
@@ -42,6 +42,7 @@ from src.performance_tracker import PerformanceTracker
 from src.strategy_manager import StrategyManager, compute_old_strategy_merge_cap
 from src.strategies.regime_engine import RegimeEngine
 from src.leverage_engine import LeverageEngine
+from src.chiron import ChironCoach
 
 # ── Global state ──────────────────────────────────────────────────────────────
 cfg = get_settings()
@@ -81,6 +82,9 @@ STATE: dict = {
     "start_time": 0.0,
     "equity_history": [],
     "confirmed_issues": [],
+    "chiron": {},
+    "chiron_active_overrides": {},
+    "chiron_promoted_overrides": {},
 }
 
 _ws_clients: list[WebSocket] = []
@@ -100,9 +104,11 @@ _risk_manager: Optional[RiskManager] = None
 _quant_mutator: Optional[QuantMutator] = None
 _bigbrother: Optional[BigBrotherAgent] = None
 _alerts: Optional[AlertManager] = None
+_chiron: Optional[ChironCoach] = None
 _min_score_live: float = cfg.analyzer_min_score
 _bayesian_threshold_live: float = cfg.bayesian_threshold_normal
 _swarm_task: Optional[asyncio.Task] = None
+_chiron_task: Optional[asyncio.Task] = None
 _consecutive_zero_setups: int = (
     0  # cycles with 0 setups; drought relief triggers at 200
 )
@@ -160,6 +166,116 @@ async def _refresh_symbol_blacklist():
         logger.warning(f"[Blacklist] Refresh error: {e}")
 
 
+def _apply_chiron_overrides(overrides: dict):
+    STATE["chiron_active_overrides"] = dict(overrides)
+    _sync_chiron_overrides()
+
+
+def _clear_chiron_overrides():
+    STATE["chiron_active_overrides"] = {}
+    _sync_chiron_overrides()
+
+
+def _extract_promoted_overrides(artifact: dict | None) -> dict:
+    promotions = (artifact or {}).get("promotions") or {}
+    return {
+        "source": "chiron_promotions",
+        "updated_at": (artifact or {}).get("updated_at"),
+        "setup_size_mult": dict(promotions.get("setup_size_mult") or {}),
+        "setup_pause_minutes": {},
+        "regime_weight_mult": dict(promotions.get("regime_weight_mult") or {}),
+        "proposal_keys": list(((artifact or {}).get("metadata") or {}).get("promoted_keys") or []),
+    }
+
+
+def _merge_regime_weights(base: dict | None, overlay: dict | None) -> dict:
+    merged: dict[str, dict[str, float]] = {
+        str(regime): {str(strategy): float(mult) for strategy, mult in weights.items()}
+        for regime, weights in (base or {}).items()
+        if isinstance(weights, dict)
+    }
+    for regime, weights in (overlay or {}).items():
+        if not isinstance(weights, dict):
+            continue
+        merged.setdefault(str(regime), {}).update(
+            {str(strategy): float(mult) for strategy, mult in weights.items()}
+        )
+    return merged
+
+
+def _sync_chiron_overrides():
+    promoted = STATE.get("chiron_promoted_overrides") or {}
+    active = STATE.get("chiron_active_overrides") or {}
+    merged_setup_size = dict(promoted.get("setup_size_mult") or {})
+    merged_setup_size.update(active.get("setup_size_mult") or {})
+    merged_regime_weights = _merge_regime_weights(
+        promoted.get("regime_weight_mult"),
+        active.get("regime_weight_mult"),
+    )
+    if _risk_manager:
+        _risk_manager.set_runtime_setup_overrides(
+            size_mult=merged_setup_size,
+            pause_minutes=active.get("setup_pause_minutes"),
+        )
+    if _regime_engine:
+        _regime_engine.set_runtime_weight_overrides(merged_regime_weights)
+
+
+def _set_chiron_promoted_overrides(artifact: dict | None):
+    STATE["chiron_promoted_overrides"] = _extract_promoted_overrides(artifact)
+    _sync_chiron_overrides()
+
+
+def _refresh_chiron_overrides():
+    active = STATE.get("chiron_active_overrides") or {}
+    expires_at = int(active.get("expires_at") or 0)
+    if active and expires_at and time.time() >= expires_at:
+        logger.info("[Chiron] Active runtime overrides expired")
+        _clear_chiron_overrides()
+
+
+async def _run_chiron_review(manual: bool = False) -> dict:
+    if not _chiron:
+        return {"ok": False, "status": "not_ready", "manual": manual}
+    result = await _chiron.review(
+        current_regime=STATE.get("regime", "sideways"),
+        current_equity=STATE.get("current_equity", 0.0),
+        current_min_score=_min_score_live,
+        current_bayesian_threshold=_bayesian_threshold_live,
+    )
+    if result.get("promotion"):
+        _set_chiron_promoted_overrides(result["promotion"].get("artifact"))
+    if result.get("applied_overrides"):
+        _apply_chiron_overrides(result["applied_overrides"])
+        if _alerts:
+            try:
+                await _alerts.send(
+                    f"🧠 CHIRON applied {len(result['applied_overrides'].get('proposal_keys', []))} low-risk override(s).",
+                    priority="low",
+                )
+            except Exception:
+                pass
+    _refresh_chiron_overrides()
+    result["active_overrides"] = dict(STATE.get("chiron_active_overrides") or {})
+    result["promoted_overrides"] = dict(STATE.get("chiron_promoted_overrides") or {})
+    STATE["chiron"] = result
+    return result
+
+
+async def _chiron_loop():
+    logger.info("[Chiron] Loop started.")
+    await asyncio.sleep(min(60, max(5, cfg.cycle_interval_seconds)))
+    while STATE["running"]:
+        try:
+            await _run_chiron_review()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"[Chiron] Cycle error: {e}")
+        await asyncio.sleep(max(300, cfg.chiron_interval_hours * 3600))
+    logger.info("[Chiron] Loop ended.")
+
+
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -171,7 +287,7 @@ async def lifespan(app: FastAPI):
 async def _startup():
     global _mongo_client, _db, _exchange, _redis, _watcher, _analyzer, _context
     global _bayesian, _execution, _position_manager, _risk_manager, _quant_mutator
-    global _bigbrother, _alerts, _swarm_task
+    global _bigbrother, _alerts, _swarm_task, _chiron, _chiron_task
     global _futures_exchange, _futures_execution, _leverage_engine
 
     logger.info("=" * 60)
@@ -371,6 +487,37 @@ async def _startup():
     logger.info(
         f"[Startup] RegimeEngine v7.0 initialized: {_regime_engine.strategy_names}"
     )
+    _chiron = ChironCoach(
+        db=_db,
+        risk_manager=_risk_manager,
+        regime_engine=_regime_engine,
+        openrouter_api_key=cfg.openrouter_api_key,
+        openrouter_base_url=cfg.openrouter_base_url,
+        openrouter_model=cfg.openrouter_primary_model,
+        openrouter_fallback_model=cfg.openrouter_fallback_model,
+        enabled=cfg.chiron_enabled,
+        llm_enabled=cfg.chiron_llm_enabled,
+        interval_hours=cfg.chiron_interval_hours,
+        lookback_hours=cfg.chiron_lookback_hours,
+        override_ttl_hours=cfg.chiron_override_ttl_hours,
+        min_trades_per_bucket=cfg.chiron_min_trades_per_bucket,
+        min_total_trades=cfg.chiron_min_total_trades,
+        param_cooldown_hours=cfg.chiron_param_cooldown_hours,
+        max_proposals_per_run=cfg.chiron_max_proposals_per_run,
+        auto_apply_low_risk=cfg.chiron_auto_apply_low_risk,
+        promotion_enabled=cfg.chiron_promotion_enabled,
+        promotion_file_path=cfg.chiron_promotion_file_path,
+        promotion_min_occurrences=cfg.chiron_promotion_min_occurrences,
+        promotion_lookback_runs=cfg.chiron_promotion_lookback_runs,
+        repo_path=str(Path(__file__).resolve().parent.parent),
+        git_auto_commit=cfg.chiron_git_auto_commit,
+        git_auto_push=cfg.chiron_git_auto_push,
+        git_remote=cfg.chiron_git_remote,
+        git_branch=cfg.chiron_git_branch,
+        git_committer_name=cfg.chiron_git_committer_name,
+        git_committer_email=cfg.chiron_git_committer_email,
+    )
+    _set_chiron_promoted_overrides(_chiron.load_promoted_overrides())
 
     # ── Futures Mode Setup ─────────────────────────────────────────────────
     _is_futures = cfg.trading_mode.lower() == "futures"
@@ -486,6 +633,9 @@ async def _startup():
     _swarm_task = asyncio.create_task(_swarm_loop())
     STATE["running"] = True
     logger.info("Swarm started automatically.")
+    if cfg.chiron_enabled:
+        _chiron_task = asyncio.create_task(_chiron_loop())
+        logger.info("Chiron started automatically.")
 
     await _alerts.send(
         f"Moonshot-CEX started | exchange={cfg.exchange_name} | mode={cfg.exchange_mode}",
@@ -494,12 +644,18 @@ async def _startup():
 
 
 async def _shutdown():
-    global _swarm_task
+    global _swarm_task, _chiron_task
     STATE["running"] = False
     if _swarm_task and not _swarm_task.done():
         _swarm_task.cancel()
         try:
             await _swarm_task
+        except asyncio.CancelledError:
+            pass
+    if _chiron_task and not _chiron_task.done():
+        _chiron_task.cancel()
+        try:
+            await _chiron_task
         except asyncio.CancelledError:
             pass
     if _exchange:
@@ -588,7 +744,9 @@ async def _run_cycle():
     global _min_score_live, _bayesian_threshold_live, _consecutive_zero_setups
     global _blacklist_refresh_cycle
 
+    _refresh_chiron_overrides()
     STATE["cycle_count"] += 1
+    STATE["last_cycle_at"] = int(time.time())
     cycle = STATE["cycle_count"]
     trace = {"cycle": cycle, "steps": []}
 
@@ -3508,6 +3666,63 @@ async def strategies_status():
     return result
 
 
+@app.get("/api/meta/chiron/state")
+async def chiron_state():
+    if not _chiron:
+        return {"ok": False, "status": "not_ready"}
+    return {
+        "ok": True,
+        **_chiron.get_state(),
+        "active_overrides": dict(STATE.get("chiron_active_overrides") or {}),
+        "promoted_overrides": dict(STATE.get("chiron_promoted_overrides") or {}),
+    }
+
+
+@app.post("/api/meta/chiron/run_now")
+async def chiron_run_now():
+    if not _chiron:
+        raise HTTPException(status_code=503, detail="Chiron not ready")
+    return await _run_chiron_review(manual=True)
+
+
+@app.get("/api/meta/chiron/history")
+async def chiron_history(limit: int = 20):
+    if _db is None:
+        return {"ok": False, "error": "db_not_ready"}
+    limit = max(1, min(int(limit), 100))
+    cursor = _db.chiron_runs.find({}, {"_id": 0}, sort=[("last_run_at", -1)], limit=limit)
+    return {"ok": True, "runs": await cursor.to_list(length=limit)}
+
+
+@app.get("/api/meta/chiron/promotions")
+async def chiron_promotions_state():
+    if not _chiron:
+        return {"ok": False, "status": "not_ready"}
+    state = _chiron.get_state()
+    return {
+        "ok": True,
+        "promotion": state.get("promotion", {}),
+        "promoted_overrides": dict(STATE.get("chiron_promoted_overrides") or {}),
+    }
+
+
+@app.post("/api/meta/chiron/promotions/run")
+async def chiron_promotions_run():
+    if not _chiron:
+        raise HTTPException(status_code=503, detail="Chiron not ready")
+    result = await _chiron.promote()
+    _set_chiron_promoted_overrides(result.get("artifact"))
+    return {"ok": True, **result, "promoted_overrides": dict(STATE.get("chiron_promoted_overrides") or {})}
+
+
+@app.post("/api/meta/chiron/promotions/commit")
+async def chiron_promotions_commit(push: bool = False):
+    if not _chiron:
+        raise HTTPException(status_code=503, detail="Chiron not ready")
+    result = _chiron.commit_promotions(push=push)
+    return {"ok": result.get("status") in {"clean", "committed", "pushed"}, **result}
+
+
 @app.get("/api/debug/pipeline")
 async def debug_pipeline():
     """Run a single pipeline trace and return results at each stage."""
@@ -4172,6 +4387,8 @@ async def get_metrics_daily():
 async def get_agents():
     cycle = STATE["cycle_count"]
     bb_mode = STATE.get("bigbrother_mode", "normal")
+    _chiron_state = _chiron.get_state() if _chiron else {}
+    _chiron_promotion = _chiron_state.get("promotion", {}) if _chiron else {}
     return {
         "watcher": {
             "status": "ok"
@@ -4225,6 +4442,16 @@ async def get_agents():
             "errors": 0,
             "current_min_score": _min_score_live,
             "current_threshold": _bayesian_threshold_live,
+        },
+        "chiron": {
+            "status": _chiron_state.get("status", "idle") if _chiron else "idle",
+            "runs": len(_chiron_state.get("history", [])) if _chiron else 0,
+            "errors": 1 if _chiron_state.get("status") == "error" else 0,
+            "last_run_at": _chiron_state.get("last_run_at") if _chiron else None,
+            "active_override_count": len((STATE.get("chiron_active_overrides") or {}).get("proposal_keys", [])),
+            "promoted_override_count": len((STATE.get("chiron_promoted_overrides") or {}).get("proposal_keys", [])),
+            "llm_enabled": _chiron_state.get("llm_enabled", False) if _chiron else False,
+            "promotion_status": _chiron_promotion.get("status", "idle") if _chiron else "idle",
         },
     }
 

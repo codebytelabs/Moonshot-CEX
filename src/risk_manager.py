@@ -159,6 +159,40 @@ class RiskManager:
         # after which the setup becomes allowed again. Not persisted across
         # restarts by design — startup recovery re-evaluates from history.
         self._setup_pause_until: dict[str, float] = {}
+        self._runtime_setup_size_mult: dict[str, float] = {}
+        self._runtime_setup_pause_until: dict[str, float] = {}
+
+    def set_runtime_setup_overrides(
+        self,
+        size_mult: Optional[dict[str, float]] = None,
+        pause_minutes: Optional[dict[str, int]] = None,
+    ):
+        self._runtime_setup_size_mult = {
+            str(k): max(0.25, min(1.25, float(v)))
+            for k, v in (size_mult or {}).items()
+        }
+        now = time.time()
+        self._runtime_setup_pause_until = {
+            str(k): now + max(1, int(v)) * 60 for k, v in (pause_minutes or {}).items()
+        }
+
+    def clear_runtime_setup_overrides(self):
+        self._runtime_setup_size_mult = {}
+        self._runtime_setup_pause_until = {}
+
+    def get_effective_setup_size_multiplier(self, setup_type: Optional[str]) -> float:
+        if not setup_type:
+            return 1.0
+        raw = self._runtime_setup_size_mult.get(
+            setup_type, SETUP_SIZE_MULT.get(setup_type, 1.0)
+        )
+        return max(0.25, min(1.25, float(raw)))
+
+    def get_runtime_setup_overrides(self) -> dict:
+        return {
+            "size_mult": dict(self._runtime_setup_size_mult),
+            "pause_until": dict(self._runtime_setup_pause_until),
+        }
 
     # ── Account-tier detection (call at startup and after equity updates) ──────
     def detect_account_tier(self, equity: float) -> str:
@@ -309,7 +343,10 @@ class RiskManager:
         # v7.8.1: per-setup circuit breaker. Pauses a single setup_type without
         # affecting others. State is computed in record_trade() on each close.
         if setup_type:
-            pause_until = self._setup_pause_until.get(setup_type)
+            pause_until = max(
+                self._setup_pause_until.get(setup_type, 0.0),
+                self._runtime_setup_pause_until.get(setup_type, 0.0),
+            )
             if pause_until and time.time() < pause_until:
                 remaining = int(pause_until - time.time())
                 return (
@@ -418,8 +455,7 @@ class RiskManager:
         # the table can't blow up sizing.
         setup_mult = 1.0
         if setup_type:
-            raw = SETUP_SIZE_MULT.get(setup_type, 1.0)
-            setup_mult = max(0.25, min(1.0, float(raw)))
+            setup_mult = self.get_effective_setup_size_multiplier(setup_type)
 
         # ── Final size ────────────────────────────────────────────────────────
         size = base_size * conviction_mult * liq_mult * ta_mult * reg_mult * setup_mult

@@ -64,6 +64,27 @@ class Settings(BaseSettings):
     openrouter_secondary_model: str = Field(default="deepseek/deepseek-v3.2-exp", alias="OPENROUTER_SECONDARY_MODEL")
     openrouter_fallback_model: str = Field(default="google/gemini-2.5-flash-lite-preview-09-2025", alias="OPENROUTER_FALLBACK_MODEL")
 
+    chiron_enabled: bool = Field(default=True, alias="CHIRON_ENABLED")
+    chiron_llm_enabled: bool = Field(default=True, alias="CHIRON_LLM_ENABLED")
+    chiron_interval_hours: int = Field(default=6, alias="CHIRON_INTERVAL_HOURS")
+    chiron_lookback_hours: int = Field(default=72, alias="CHIRON_LOOKBACK_HOURS")
+    chiron_override_ttl_hours: int = Field(default=12, alias="CHIRON_OVERRIDE_TTL_HOURS")
+    chiron_min_trades_per_bucket: int = Field(default=8, alias="CHIRON_MIN_TRADES_PER_BUCKET")
+    chiron_min_total_trades: int = Field(default=16, alias="CHIRON_MIN_TOTAL_TRADES")
+    chiron_param_cooldown_hours: int = Field(default=24, alias="CHIRON_PARAM_COOLDOWN_HOURS")
+    chiron_max_proposals_per_run: int = Field(default=6, alias="CHIRON_MAX_PROPOSALS_PER_RUN")
+    chiron_auto_apply_low_risk: bool = Field(default=True, alias="CHIRON_AUTO_APPLY_LOW_RISK")
+    chiron_promotion_enabled: bool = Field(default=True, alias="CHIRON_PROMOTION_ENABLED")
+    chiron_promotion_file_path: str = Field(default="config/chiron_promotions.json", alias="CHIRON_PROMOTION_FILE_PATH")
+    chiron_promotion_min_occurrences: int = Field(default=3, alias="CHIRON_PROMOTION_MIN_OCCURRENCES")
+    chiron_promotion_lookback_runs: int = Field(default=8, alias="CHIRON_PROMOTION_LOOKBACK_RUNS")
+    chiron_git_auto_commit: bool = Field(default=False, alias="CHIRON_GIT_AUTO_COMMIT")
+    chiron_git_auto_push: bool = Field(default=False, alias="CHIRON_GIT_AUTO_PUSH")
+    chiron_git_remote: str = Field(default="origin", alias="CHIRON_GIT_REMOTE")
+    chiron_git_branch: str = Field(default="main", alias="CHIRON_GIT_BRANCH")
+    chiron_git_committer_name: str = Field(default="Chiron Bot", alias="CHIRON_GIT_COMMITTER_NAME")
+    chiron_git_committer_email: str = Field(default="chiron@moonshot.local", alias="CHIRON_GIT_COMMITTER_EMAIL")
+
     # ── Watcher ─────────────────────────────────────────────────────────────
     watcher_min_volume_24h_usd: float = Field(default=2_000_000.0, alias="WATCHER_MIN_VOLUME_24H_USD")
     watcher_top_n: int = Field(default=30, alias="WATCHER_TOP_N")  # was 20 — wider universe for dual-side

@@ -56,6 +56,7 @@ class RegimeEngine:
         self.config = config or {}
         self._last_regime = "sideways"
         self._regime_switch_time = time.time()
+        self._runtime_weight_mult: dict[str, dict[str, float]] = {}
 
         # Import strategies here to avoid circular imports
         from .ema_trend import EMATrendStrategy
@@ -73,6 +74,33 @@ class RegimeEngine:
             f"[RegimeEngine] Initialized with {len(self._strategies)} strategies: "
             f"{list(self._strategies.keys())}"
         )
+
+    def set_runtime_weight_overrides(
+        self, weight_mult: dict[str, dict[str, float]] | None = None
+    ):
+        cleaned: dict[str, dict[str, float]] = {}
+        for regime, weights in (weight_mult or {}).items():
+            if not isinstance(weights, dict):
+                continue
+            cleaned[str(regime)] = {
+                str(strategy): max(0.0, min(1.25, float(mult)))
+                for strategy, mult in weights.items()
+            }
+        self._runtime_weight_mult = cleaned
+
+    def clear_runtime_weight_overrides(self):
+        self._runtime_weight_mult = {}
+
+    def get_runtime_weight_multiplier(self, regime: str, strategy: str) -> float:
+        return float(self._runtime_weight_mult.get(regime, {}).get(strategy, 1.0))
+
+    def get_effective_weights(self, regime: str = "sideways") -> dict[str, float]:
+        base = REGIME_WEIGHTS.get(regime, REGIME_WEIGHTS["sideways"])
+        mults = self._runtime_weight_mult.get(regime, {})
+        return {
+            name: max(0.0, min(1.0, float(weight) * max(0.0, float(mults.get(name, 1.0)))))
+            for name, weight in base.items()
+        }
 
     async def scan(
         self,
@@ -102,7 +130,7 @@ class RegimeEngine:
             self._last_regime = regime
             self._regime_switch_time = time.time()
 
-        weights = REGIME_WEIGHTS.get(regime, REGIME_WEIGHTS["sideways"])
+        weights = self.get_effective_weights(regime)
 
         # Only run strategies with weight > 0 for this regime
         active = {name: strat for name, strat in self._strategies.items()
@@ -212,10 +240,11 @@ class RegimeEngine:
         return list(self._strategies.keys())
 
     def get_status(self, regime: str = "sideways") -> dict:
-        weights = REGIME_WEIGHTS.get(regime, REGIME_WEIGHTS["sideways"])
+        weights = self.get_effective_weights(regime)
         return {
             "regime": regime,
             "weights": weights,
+            "runtime_weight_mult": self._runtime_weight_mult.get(regime, {}),
             "strategies": list(self._strategies.keys()),
             "active": [n for n, w in weights.items() if w > 0],
             "last_regime_switch": self._regime_switch_time,
