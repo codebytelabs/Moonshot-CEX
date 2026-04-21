@@ -720,6 +720,20 @@ async def _swarm_loop():
     logger.info("[Swarm] Loop started.")
     while STATE["running"]:
         if STATE["paused"] or STATE["emergency_stop"]:
+            # Auto-recover from risk-triggered pauses once the underlying pause expires.
+            # Manual pauses (from /api/swarm/stop) are marked with _manual_pause and
+            # are NOT auto-cleared — they require an explicit /api/swarm/resume call.
+            if STATE["paused"] and not STATE["emergency_stop"] and not STATE.get("_manual_pause"):
+                if _risk_manager:
+                    _eq = STATE.get("current_equity") or _risk_manager.peak_equity
+                    _h = _risk_manager.check_portfolio_health(_eq)
+                    if not _h.get("paused"):
+                        STATE["paused"] = False
+                        logger.info(
+                            "[Swarm] Risk pause expired — auto-resuming "
+                            f"(drawdown={_h['drawdown']:.1%} consec_losses={_h['consecutive_losses']})"
+                        )
+                        continue  # fall through to run cycle immediately
             await asyncio.sleep(5)
             continue
 
@@ -1757,7 +1771,15 @@ async def _run_cycle():
             logger.info(f"[Swarm] Regime changed: {old_regime} → {STATE['regime']}")
 
     if bb_result["mode"] == "paused":
+        if not STATE.get("paused"):
+            logger.info("[Swarm] Risk manager pause triggered — blocking new entries")
         STATE["paused"] = True
+        # Do NOT set _manual_pause — this is a risk-triggered pause that must auto-clear
+    elif STATE.get("paused") and not STATE.get("_manual_pause"):
+        # BigBrother recovered — proactively clear the flag here too (belt+suspenders
+        # alongside the _swarm_loop auto-recovery check).
+        STATE["paused"] = False
+        logger.info(f"[Swarm] Risk pause cleared in-cycle — BigBrother mode: {bb_result['mode']}")
 
     # ── Step 9: Update equity and push to WebSocket ────────────────────────
     await _update_equity()
@@ -3835,12 +3857,14 @@ async def swarm_start():
 @app.post("/api/swarm/stop")
 async def swarm_stop():
     STATE["paused"] = True
+    STATE["_manual_pause"] = True  # prevents auto-recovery; needs explicit /resume
     return {"status": "paused"}
 
 
 @app.post("/api/swarm/resume")
 async def swarm_resume():
     STATE["paused"] = False
+    STATE["_manual_pause"] = False
     return {"status": "resumed"}
 
 

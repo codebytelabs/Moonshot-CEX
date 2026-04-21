@@ -849,6 +849,14 @@ class RiskManager:
             self._day_start_equity = equity
             self._day_trade_count = 0
             self._day_start_time = today
+            # Reset session guards at day boundary so yesterday's loss streak
+            # doesn't block a fresh trading day.
+            self._consecutive_losses = 0
+            self._consecutive_wins = 0
+            self._pause_until = None
+            self._setup_pause_until = {}
+            self._session_start_idx = len(self._trade_history)
+            logger.info("[Risk] New day — session guards reset (consecutive losses, pauses, setup CBs)")
 
     def _update_metrics(self):
         recent = self._recent_trades(50)
