@@ -80,6 +80,9 @@ SETUP_SIZE_MULT: dict[str, float] = {
     # Validation period after the v7.8 restoration: 0/4 wins in live data.
     # Stay at half-size until at least SETUP_VALIDATION_GRAD_AFTER closes land.
     "ema_trend_follow": 0.5,
+    # Live data (last 40 trades): 0W/5L, -$167.11, 0% WR. Half-size until it
+    # recovers; CHIRON can promote a better multiplier once data supports it.
+    "ema_ribbon_pullback": 0.5,
 }
 
 # ── v7.8.1: Per-setup circuit breaker ─────────────────────────────────────────
@@ -88,6 +91,9 @@ SETUP_SIZE_MULT: dict[str, float] = {
 # setups running normally. Prevents one bad strategy from dominating drawdown.
 SETUP_CIRCUIT_BREAKERS: dict[str, dict] = {
     "ema_trend_follow": {"window": 5, "max_wr": 0.20, "pause_minutes": 120},
+    # Live data: 0W/5L streak destroyed $167. Treat symmetrically with
+    # ema_trend_follow so a losing streak pauses the setup for 2h.
+    "ema_ribbon_pullback": {"window": 5, "max_wr": 0.20, "pause_minutes": 120},
 }
 
 

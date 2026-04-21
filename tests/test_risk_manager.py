@@ -142,3 +142,57 @@ def test_compute_position_size_respects_single_exposure():
     )
     assert size <= 1000.0 * 0.25
     assert size > 0
+
+
+def test_setup_size_mult_halves_ema_ribbon_pullback():
+    """ema_ribbon_pullback went 0W/5L (-$167) → must ship at half sizing."""
+    from src.risk_manager import SETUP_SIZE_MULT
+
+    assert SETUP_SIZE_MULT.get("ema_ribbon_pullback") == 0.5
+    rm = make_rm()
+    assert rm.get_effective_setup_size_multiplier("ema_ribbon_pullback") == 0.5
+    # A setup without an entry should default to 1.0 (no sizing penalty).
+    assert rm.get_effective_setup_size_multiplier("vwap_momentum_breakout") == 1.0
+
+
+def test_setup_circuit_breaker_covers_ema_ribbon_pullback():
+    """Losing streak on ema_ribbon_pullback must trigger a per-setup pause."""
+    from src.risk_manager import SETUP_CIRCUIT_BREAKERS
+
+    cfg = SETUP_CIRCUIT_BREAKERS.get("ema_ribbon_pullback")
+    assert cfg is not None
+    assert cfg["window"] == 5
+    assert cfg["max_wr"] == 0.20
+    assert cfg["pause_minutes"] == 120
+
+    # Raise consecutive_loss_threshold + daily_loss_limit so only the per-setup
+    # circuit breaker can block; otherwise global guards trip first.
+    rm = make_rm(
+        consecutive_loss_threshold=99,
+        daily_loss_limit_pct=0.50,
+        initial_equity=10_000.0,
+    )
+    for _ in range(5):
+        rm.record_trade(
+            pnl_usd=-10.0,
+            pnl_pct=-0.001,
+            r_multiple=-0.5,
+            setup_type="ema_ribbon_pullback",
+        )
+    assert rm._setup_pause_until.get("ema_ribbon_pullback", 0) > time.time()
+    allowed, reason = rm.can_open_position(
+        current_equity=9_950.0,
+        open_count=0,
+        current_exposure_usd=0.0,
+        setup_type="ema_ribbon_pullback",
+    )
+    assert allowed is False
+    assert "setup_circuit_breaker:ema_ribbon_pullback" in reason
+    # Other setups should still be allowed to trade.
+    allowed_other, _ = rm.can_open_position(
+        current_equity=9_950.0,
+        open_count=0,
+        current_exposure_usd=0.0,
+        setup_type="vwap_momentum_breakout",
+    )
+    assert allowed_other is True
