@@ -901,16 +901,16 @@ async def _run_cycle():
                 regime=current_regime,
                 open_positions=list(open_syms_pre),
             )
-            # v7.8.2: Filter regime-incompatible signals from old pipeline.
-            # RegimeEngine already respects weights, but old pipeline
-            # (strategy_manager) fires all strategies regardless of regime.
-            # Mean-reversion signals in bull = fighting the trend → losses.
+            # v7.9: Old pipeline is DISABLED except vwap_momentum.
+            # Only the RegimeEngine vwap_momentum setup has positive expectancy
+            # in live data. Block everything else at the source.
             _filtered = []
             for sig in signals:
                 st = getattr(sig, "setup_type", "")
-                if current_regime == "bull" and "mean_reversion" in st:
-                    continue
-                _filtered.append(sig)
+                if "vwap_momentum" in st:
+                    _filtered.append(sig)
+                else:
+                    continue  # silently drop — not worth logging noise
             return [sig.to_setup_dict() for sig in _filtered]
         except Exception as exc:
             logger.error(f"[Cycle {cycle}] Strategy manager error: {exc}")
@@ -977,46 +977,24 @@ async def _run_cycle():
     # Regime engine gets unlimited slots. Old strategies get 2 slots. Legacy gets 2 max.
     seen_symbols = set()
     approved = []
-    # 1) Regime Engine signals (highest priority — proven regime-adaptive strategies)
+    # v7.9: Bulletproof — ONLY vwap_momentum_breakout from regime engine.
+    # Live data: vwap_momentum is the ONLY setup with positive expectancy
+    # (PF=2.95, WR=75%, +$57.20 over 4 trades). Everything else loses.
+    # Old pipeline and legacy fallback are permanently disabled until they
+    # independently prove positive expectancy in live data.
+    _vwap_added = 0
     for setup in regime_setups:
         sym = setup.get("symbol", "")
-        if sym not in seen_symbols:
+        st = setup.get("setup_type", "")
+        if sym not in seen_symbols and "vwap_momentum" in st:
             seen_symbols.add(sym)
             approved.append(setup)
-    # 2) Old strategy manager signals (2 slot cap)
-    _old_strat_added = 0
-    _old_strat_cap = compute_old_strategy_merge_cap(strategy_setups, cfg.max_positions)
-    # v7.8.2: suppress old pipeline bleed when regime_engine has coverage.
-    # Old pipeline setups (momentum, mean_reversion, breakout) ignore regime
-    # weights and have been the primary source of post-fix losses.
-    if regime_setups and _old_strat_cap > 0:
-        _old_strat_cap = max(0, _old_strat_cap - len(regime_setups))
-    for setup in strategy_setups:
-        if _old_strat_added >= _old_strat_cap:
-            break
-        sym = setup.get("symbol", "")
-        if sym not in seen_symbols:
-            seen_symbols.add(sym)
-            approved.append(setup)
-            _old_strat_added += 1
-    # 3) Legacy analyzer signals (2 slot cap — fallback only)
-    _legacy_slots = 2 if (regime_setups or strategy_setups) else 4
-    # v7.8.2: suppress legacy fallback when regime_engine is active.
-    if regime_setups and _legacy_slots > 0:
-        _legacy_slots = max(0, _legacy_slots - len(regime_setups))
-    _legacy_added = 0
-    for setup in legacy_approved:
-        if _legacy_added >= _legacy_slots:
-            break
-        sym = setup.get("symbol", "")
-        if sym not in seen_symbols:
-            seen_symbols.add(sym)
-            approved.append(setup)
-            _legacy_added += 1
+            _vwap_added += 1
+    # Old pipeline: fully disabled. Legacy: fully disabled.
     if regime_setups:
         logger.info(
-            f"[Cycle {cycle}] v7.0 merge: {len(regime_setups)} regime + "
-            f"{_old_strat_added} old_strat + {_legacy_added} legacy = {len(approved)} total"
+            f"[Cycle {cycle}] v7.9 merge: {_vwap_added} vwap_momentum / "
+            f"{len(regime_setups)} raw regime setups (only vwap accepted)"
         )
 
     # ── v7.5 Symbol Whitelist (profitability-data-driven) ─────────────────
