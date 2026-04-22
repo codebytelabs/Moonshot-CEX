@@ -152,7 +152,7 @@ def test_setup_size_mult_halves_ema_ribbon_pullback():
     rm = make_rm()
     assert rm.get_effective_setup_size_multiplier("ema_ribbon_pullback") == 0.5
     # A setup without an entry should default to 1.0 (no sizing penalty).
-    assert rm.get_effective_setup_size_multiplier("vwap_momentum_breakout") == 1.0
+    assert rm.get_effective_setup_size_multiplier("breakout_orb") == 1.0
 
 
 def test_setup_circuit_breaker_covers_ema_ribbon_pullback():
@@ -280,3 +280,59 @@ def test_setup_circuit_breaker_covers_bb_mean_reversion():
     )
     assert allowed is False
     assert "setup_circuit_breaker:bb_mean_reversion" in reason
+
+
+def test_setup_size_mult_halves_momentum():
+    """legacy 'momentum' setup went 2W/4L (PF=0.65) in 24h → half-size."""
+    from src.risk_manager import SETUP_SIZE_MULT
+
+    assert SETUP_SIZE_MULT.get("momentum") == 0.5
+    rm = make_rm()
+    assert rm.get_effective_setup_size_multiplier("momentum") == 0.5
+
+
+def test_setup_circuit_breaker_covers_momentum():
+    """Losing streak on legacy 'momentum' must trigger a per-setup pause."""
+    from src.risk_manager import SETUP_CIRCUIT_BREAKERS
+
+    cfg = SETUP_CIRCUIT_BREAKERS.get("momentum")
+    assert cfg is not None
+    assert cfg["window"] == 5
+    assert cfg["max_wr"] == 0.20
+    assert cfg["pause_minutes"] == 120
+
+    rm = make_rm(
+        consecutive_loss_threshold=99,
+        daily_loss_limit_pct=0.50,
+        initial_equity=10_000.0,
+    )
+    for _ in range(5):
+        rm.record_trade(
+            pnl_usd=-10.0,
+            pnl_pct=-0.001,
+            r_multiple=-0.5,
+            setup_type="momentum",
+        )
+    assert rm._setup_pause_until.get("momentum", 0) > time.time()
+    allowed, reason = rm.can_open_position(
+        current_equity=9_950.0,
+        open_count=0,
+        current_exposure_usd=0.0,
+        setup_type="momentum",
+    )
+    assert allowed is False
+    assert "setup_circuit_breaker:momentum" in reason
+
+
+def test_setup_size_mult_boosts_vwap_momentum_breakout():
+    """Only positive-expectancy setup gets a modest 1.15x boost.
+
+    Live 24h: 2W/1L, +$47.48, PF=2.62. Effective must respect the 1.25 clamp.
+    """
+    from src.risk_manager import SETUP_SIZE_MULT
+
+    assert SETUP_SIZE_MULT.get("vwap_momentum_breakout") == 1.15
+    rm = make_rm()
+    mult = rm.get_effective_setup_size_multiplier("vwap_momentum_breakout")
+    assert mult == 1.15
+    assert 1.0 < mult <= 1.25

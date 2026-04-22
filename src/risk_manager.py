@@ -89,6 +89,13 @@ SETUP_SIZE_MULT: dict[str, float] = {
     # Live data (last 24h in bull regime): 0W/1L, -$8.99, 0% WR.
     # Mean reversion fights the trend in bull — should be zero-weight there.
     "bb_mean_reversion": 0.5,
+    # v7.8.2c: Legacy analyzer 'momentum' setup. Live 24h: 2W/4L, -$36.30,
+    # PF=0.65, 33% WR. Half-size until it earns its way back to full.
+    "momentum": 0.5,
+    # v7.8.2c: Only setup with positive expectancy in 24h data.
+    # 2W/1L, +$47.48, PF=2.62, 66.7% WR. Modest boost (1.15x) given small
+    # sample; CHIRON can promote higher once sample grows. Clamp is 1.25x.
+    "vwap_momentum_breakout": 1.15,
 }
 
 # ── v7.8.1: Per-setup circuit breaker ─────────────────────────────────────────
@@ -106,6 +113,9 @@ SETUP_CIRCUIT_BREAKERS: dict[str, dict] = {
     # Live data (last 24h in bull regime): 0W/1L, -$8.99, 0% WR.
     # Mean reversion fighting the bull trend; pause until regime shifts.
     "bb_mean_reversion": {"window": 5, "max_wr": 0.20, "pause_minutes": 120},
+    # v7.8.2c: Legacy 'momentum' setup. Live 24h: 2W/4L, PF=0.65.
+    # Not as bad as 0% WR setups; use 20% floor so only bad streaks pause it.
+    "momentum": {"window": 5, "max_wr": 0.20, "pause_minutes": 120},
 }
 
 
