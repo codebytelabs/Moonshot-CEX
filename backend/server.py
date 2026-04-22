@@ -986,6 +986,11 @@ async def _run_cycle():
     # 2) Old strategy manager signals (2 slot cap)
     _old_strat_added = 0
     _old_strat_cap = compute_old_strategy_merge_cap(strategy_setups, cfg.max_positions)
+    # v7.8.2: suppress old pipeline bleed when regime_engine has coverage.
+    # Old pipeline setups (momentum, mean_reversion, breakout) ignore regime
+    # weights and have been the primary source of post-fix losses.
+    if regime_setups and _old_strat_cap > 0:
+        _old_strat_cap = max(0, _old_strat_cap - len(regime_setups))
     for setup in strategy_setups:
         if _old_strat_added >= _old_strat_cap:
             break
@@ -996,6 +1001,9 @@ async def _run_cycle():
             _old_strat_added += 1
     # 3) Legacy analyzer signals (2 slot cap — fallback only)
     _legacy_slots = 2 if (regime_setups or strategy_setups) else 4
+    # v7.8.2: suppress legacy fallback when regime_engine is active.
+    if regime_setups and _legacy_slots > 0:
+        _legacy_slots = max(0, _legacy_slots - len(regime_setups))
     _legacy_added = 0
     for setup in legacy_approved:
         if _legacy_added >= _legacy_slots:
