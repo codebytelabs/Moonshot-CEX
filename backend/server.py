@@ -901,7 +901,17 @@ async def _run_cycle():
                 regime=current_regime,
                 open_positions=list(open_syms_pre),
             )
-            return [sig.to_setup_dict() for sig in signals]
+            # v7.8.2: Filter regime-incompatible signals from old pipeline.
+            # RegimeEngine already respects weights, but old pipeline
+            # (strategy_manager) fires all strategies regardless of regime.
+            # Mean-reversion signals in bull = fighting the trend → losses.
+            _filtered = []
+            for sig in signals:
+                st = getattr(sig, "setup_type", "")
+                if current_regime == "bull" and "mean_reversion" in st:
+                    continue
+                _filtered.append(sig)
+            return [sig.to_setup_dict() for sig in _filtered]
         except Exception as exc:
             logger.error(f"[Cycle {cycle}] Strategy manager error: {exc}")
             return []

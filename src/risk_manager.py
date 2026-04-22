@@ -83,6 +83,12 @@ SETUP_SIZE_MULT: dict[str, float] = {
     # Live data (last 40 trades): 0W/5L, -$167.11, 0% WR. Half-size until it
     # recovers; CHIRON can promote a better multiplier once data supports it.
     "ema_ribbon_pullback": 0.5,
+    # Live data (last 24h in bull regime): 0W/3L, -$33.71, 0% WR.
+    # Squeeze breakouts are regime-specific; in bull they trigger false breaks.
+    "bb_squeeze_breakout": 0.5,
+    # Live data (last 24h in bull regime): 0W/1L, -$8.99, 0% WR.
+    # Mean reversion fights the trend in bull — should be zero-weight there.
+    "bb_mean_reversion": 0.5,
 }
 
 # ── v7.8.1: Per-setup circuit breaker ─────────────────────────────────────────
@@ -94,6 +100,12 @@ SETUP_CIRCUIT_BREAKERS: dict[str, dict] = {
     # Live data: 0W/5L streak destroyed $167. Treat symmetrically with
     # ema_trend_follow so a losing streak pauses the setup for 2h.
     "ema_ribbon_pullback": {"window": 5, "max_wr": 0.20, "pause_minutes": 120},
+    # Live data (last 24h in bull regime): 0W/3L, -$33.71, 0% WR.
+    # False breakouts from squeeze signals in bull; pause to stop the bleed.
+    "bb_squeeze_breakout": {"window": 5, "max_wr": 0.20, "pause_minutes": 120},
+    # Live data (last 24h in bull regime): 0W/1L, -$8.99, 0% WR.
+    # Mean reversion fighting the bull trend; pause until regime shifts.
+    "bb_mean_reversion": {"window": 5, "max_wr": 0.20, "pause_minutes": 120},
 }
 
 

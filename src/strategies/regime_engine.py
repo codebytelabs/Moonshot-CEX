@@ -32,7 +32,9 @@ REGIME_WEIGHTS = {
     # v7.8.1: ema_trend is OFF in choppy and bear based on live data (0/4 wins,
     # -$323 over a 24h window dominated by those regimes). Bull allocation is
     # unchanged; bear/choppy now route to mean-reversion and squeeze only.
-    "bull":     {"ema_trend": 0.45, "vwap_momentum": 0.50, "bb_squeeze": 0.15, "bb_mean_rev": 0.00},
+    # v7.8.2: bb_squeeze weight 0.15→0.00 in bull. Live data: 0W/3L, -$33.71 in
+    # 24h. Squeeze breakouts false-break in strong trends; vwap+ema cover bull.
+    "bull":     {"ema_trend": 0.45, "vwap_momentum": 0.55, "bb_squeeze": 0.00, "bb_mean_rev": 0.00},
     "bear":     {"ema_trend": 0.00, "vwap_momentum": 0.00, "bb_squeeze": 0.45, "bb_mean_rev": 0.55},
     "sideways": {"ema_trend": 0.00, "vwap_momentum": 0.25, "bb_squeeze": 0.30, "bb_mean_rev": 0.45},
     "choppy":   {"ema_trend": 0.00, "vwap_momentum": 0.00, "bb_squeeze": 0.55, "bb_mean_rev": 0.45},
