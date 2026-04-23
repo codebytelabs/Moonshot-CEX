@@ -57,15 +57,32 @@ fi
 sleep 1
 
 # ── 5. Start FastAPI backend ─────────────────────────────────────────────────
+# Rotate raw stdout/stderr capture if it has grown beyond 100 MB. Loguru's
+# internal sink already rotates `backend/backend.log`, but the uvicorn stdout
+# capture here appends unbounded, so we archive+truncate before each start.
+_BACKEND_LOG="$LOG_DIR/backend.log"
+_MAX_LOG_BYTES=$((100 * 1024 * 1024))  # 100 MB
+if [[ -s "$_BACKEND_LOG" ]]; then
+  # Prefer stat -c (Linux/GNU) with fallback to stat -f (BSD/macOS)
+  _LOG_SIZE=$(stat -c%s "$_BACKEND_LOG" 2>/dev/null || stat -f%z "$_BACKEND_LOG" 2>/dev/null || echo 0)
+  if [[ "${_LOG_SIZE:-0}" -gt "$_MAX_LOG_BYTES" ]]; then
+    mkdir -p "$LOG_DIR/archive"
+    _TS=$(date +%Y%m%d_%H%M%S)
+    gzip -c "$_BACKEND_LOG" > "$LOG_DIR/archive/backend.${_TS}.log.gz" \
+      && : > "$_BACKEND_LOG" \
+      && echo "[OK] Rotated backend.log (${_LOG_SIZE} bytes → archive/backend.${_TS}.log.gz)"
+  fi
+fi
+
 echo "[INFO] Starting backend (FastAPI)..."
 nohup "$PYTHON" -m uvicorn backend.server:app \
   --host 0.0.0.0 \
   --port "${BACKEND_PORT:-8000}" \
   --log-level info \
-  </dev/null >> "$LOG_DIR/backend.log" 2>&1 &
+  </dev/null >> "$_BACKEND_LOG" 2>&1 &
 BACKEND_PID=$!
 echo $BACKEND_PID > "$PID_DIR/backend.pid"
-echo "[OK] Backend PID=$BACKEND_PID — logs: $LOG_DIR/backend.log"
+echo "[OK] Backend PID=$BACKEND_PID — logs: $_BACKEND_LOG"
 
 # Wait for backend to be ready (up to 15s)
 for i in $(seq 1 15); do

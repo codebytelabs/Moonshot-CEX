@@ -2,6 +2,7 @@
 Tests for ExecutionCore: verifies paper mode simulates fills while
 demo/live mode calls real exchange methods.
 """
+
 import pytest
 import time
 from unittest.mock import AsyncMock, MagicMock
@@ -17,7 +18,9 @@ def _make_mock_exchange(fill_price: float = 1.0, fill_amount: float = 100.0):
     ex = MagicMock()
     ex.name = "gateio"
     ex.cost_to_amount = MagicMock(return_value=fill_amount)
-    ex.amount_to_precision = MagicMock(side_effect=lambda _symbol, amount: float(amount))
+    ex.amount_to_precision = MagicMock(
+        side_effect=lambda _symbol, amount: float(amount)
+    )
     ex.price_to_precision = MagicMock(side_effect=lambda _symbol, price: float(price))
     order_response = {"id": "test-order-123", "status": "closed"}
     fill_response = {
@@ -30,18 +33,24 @@ def _make_mock_exchange(fill_price: float = 1.0, fill_amount: float = 100.0):
     ex.create_market_sell = AsyncMock(return_value=order_response)
     ex.create_limit_sell = AsyncMock(return_value=order_response)
     ex.fetch_order = AsyncMock(return_value=fill_response)
-    ex.fetch_balance = AsyncMock(return_value={
-        "SOL": {"free": fill_amount},
-        "BTC": {"free": fill_amount},
-        "ETH": {"free": fill_amount},
-        "BNB": {"free": fill_amount},
-        "XRP": {"free": fill_amount},
-    })
-    ex.fetch_order_book = AsyncMock(return_value={
-        "bids": [[fill_price * 0.999, fill_amount]],
-        "asks": [[fill_price * 1.001, fill_amount]],
-    })
-    ex.cancel_order = AsyncMock(return_value={"id": "test-order-123", "status": "canceled"})
+    ex.fetch_balance = AsyncMock(
+        return_value={
+            "SOL": {"free": fill_amount},
+            "BTC": {"free": fill_amount},
+            "ETH": {"free": fill_amount},
+            "BNB": {"free": fill_amount},
+            "XRP": {"free": fill_amount},
+        }
+    )
+    ex.fetch_order_book = AsyncMock(
+        return_value={
+            "bids": [[fill_price * 0.999, fill_amount]],
+            "asks": [[fill_price * 1.001, fill_amount]],
+        }
+    )
+    ex.cancel_order = AsyncMock(
+        return_value={"id": "test-order-123", "status": "canceled"}
+    )
     return ex
 
 
@@ -91,6 +100,9 @@ async def test_demo_mode_calls_exchange_on_entry():
 
 @pytest.mark.asyncio
 async def test_demo_mode_calls_exchange_on_exit():
+    """Stop-loss / trailing exits use `create_market_sell` for guaranteed fill
+    (introduced in commit 55d2f4d after IOC-limit exits bled -$900 on failed
+    fills that let losers widen past the SL)."""
     mock_ex = _make_mock_exchange(fill_price=1.0, fill_amount=10.0)
     core = ExecutionCore(exchange=mock_ex, exchange_mode="demo")
 
@@ -98,8 +110,8 @@ async def test_demo_mode_calls_exchange_on_exit():
         symbol="SOL/USDT", amount=10.0, price=1.0, reason="trailing_stop"
     )
 
-    mock_ex.create_limit_sell.assert_called_once()
-    mock_ex.create_market_sell.assert_not_called()
+    mock_ex.create_market_sell.assert_called_once()
+    mock_ex.create_limit_sell.assert_not_called()
     assert result["mode"] == "demo"
     assert result["order_id"] == "test-order-123"
 
@@ -144,22 +156,33 @@ async def test_paper_mode_exit_returns_sell_side():
 
 
 @pytest.mark.asyncio
-async def test_demo_mode_exit_reprices_limit_sell_until_fill():
+async def test_demo_mode_exit_falls_back_to_ioc_when_market_sell_fails():
+    """All stop-loss-family exits (stop_loss, trailing_stop, momentum_*,
+    time_exit, etc.) use `create_market_sell` first. If the market sell raises
+    (e.g. exchange rate-limit), exit_position falls back to the IOC-limit
+    loop. This test ensures the fallback path still executes.
+    """
     mock_ex = _make_mock_exchange(fill_price=1.0, fill_amount=10.0)
-    mock_ex.fetch_order = AsyncMock(side_effect=[
-        {"status": "open", "filled": 0.0, "fee": {"cost": 0.0, "currency": "USDT"}},
-        {"status": "open", "filled": 0.0, "fee": {"cost": 0.0, "currency": "USDT"}},
-        {"status": "open", "filled": 0.0, "fee": {"cost": 0.0, "currency": "USDT"}},
-        {"status": "closed", "average": 1.0, "filled": 10.0, "fee": {"cost": 0.1, "currency": "USDT"}},
-    ])
-    core = ExecutionCore(exchange=mock_ex, exchange_mode="demo", max_retries=3, exit_limit_poll_seconds=1)
-
-    result = await core.exit_position(
-        symbol="SOL/USDT", amount=10.0, price=1.0, reason="momentum_died_15m"
+    mock_ex.create_market_sell = AsyncMock(side_effect=Exception("rate limited"))
+    mock_ex.fetch_order = AsyncMock(
+        return_value={
+            "status": "closed",
+            "average": 1.0,
+            "filled": 10.0,
+            "fee": {"cost": 0.1, "currency": "USDT"},
+        }
+    )
+    core = ExecutionCore(
+        exchange=mock_ex, exchange_mode="demo", max_retries=3, exit_limit_poll_seconds=1
     )
 
-    assert mock_ex.create_limit_sell.call_count == 2
-    mock_ex.cancel_order.assert_called_once()
+    result = await core.exit_position(
+        symbol="SOL/USDT", amount=10.0, price=1.0, reason="momentum_faded"
+    )
+
+    # Market sell attempted and failed → IOC limit path engaged
+    mock_ex.create_market_sell.assert_called_once()
+    assert mock_ex.create_limit_sell.call_count >= 1
     assert result["filled_amount"] == 10.0
 
 
@@ -167,14 +190,19 @@ async def test_demo_mode_exit_reprices_limit_sell_until_fill():
 async def test_demo_mode_entry_retries_on_exchange_failure():
     mock_ex = _make_mock_exchange(fill_price=1.0, fill_amount=100.0)
     mock_ex.create_market_buy = AsyncMock(
-        side_effect=[Exception("network error"), {"id": "retry-order", "status": "closed"}]
+        side_effect=[
+            Exception("network error"),
+            {"id": "retry-order", "status": "closed"},
+        ]
     )
-    mock_ex.fetch_order = AsyncMock(return_value={
-        "status": "closed",
-        "average": 1.0,
-        "filled": 100.0,
-        "fee": {"cost": 0.05, "currency": "USDT"},
-    })
+    mock_ex.fetch_order = AsyncMock(
+        return_value={
+            "status": "closed",
+            "average": 1.0,
+            "filled": 100.0,
+            "fee": {"cost": 0.05, "currency": "USDT"},
+        }
+    )
     core = ExecutionCore(exchange=mock_ex, exchange_mode="demo", max_retries=3)
 
     result = await core.enter_position(

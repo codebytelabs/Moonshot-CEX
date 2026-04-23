@@ -901,13 +901,16 @@ async def _run_cycle():
                 regime=current_regime,
                 open_positions=list(open_syms_pre),
             )
-            # v7.9: Old pipeline is DISABLED except vwap_momentum.
-            # Only the RegimeEngine vwap_momentum setup has positive expectancy
-            # in live data. Block everything else at the source.
+            # v8.0: Old pipeline — allow only setups with positive expectancy
+            # per 7-day data (153 trades). Block known losers at the source.
+            # ALLOWED: vwap_momentum, consolidation_breakout, breakout_orb
+            # BLOCKED: momentum, ema_trend_follow, ema_ribbon_pullback,
+            #           bb_squeeze_breakout, bb_mean_reversion
+            _allowed_old = {"vwap_momentum", "consolidation_breakout", "breakout_orb"}
             _filtered = []
             for sig in signals:
                 st = getattr(sig, "setup_type", "")
-                if "vwap_momentum" in st:
+                if any(a in st for a in _allowed_old):
                     _filtered.append(sig)
                 else:
                     continue  # silently drop — not worth logging noise
@@ -977,24 +980,51 @@ async def _run_cycle():
     # Regime engine gets unlimited slots. Old strategies get 2 slots. Legacy gets 2 max.
     seen_symbols = set()
     approved = []
-    # v7.9: Bulletproof — ONLY vwap_momentum_breakout from regime engine.
-    # Live data: vwap_momentum is the ONLY setup with positive expectancy
-    # (PF=2.95, WR=75%, +$57.20 over 4 trades). Everything else loses.
-    # Old pipeline and legacy fallback are permanently disabled until they
-    # independently prove positive expectancy in live data.
-    _vwap_added = 0
+    # v8.0: Data-driven merge — accept regime engine + filtered old pipeline.
+    # Regime engine already weights only vwap_momentum (bear=0 pause).
+    # Old pipeline allows consolidation_breakout, breakout_orb, vwap_momentum.
+    _regime_added = 0
     for setup in regime_setups:
         sym = setup.get("symbol", "")
-        st = setup.get("setup_type", "")
-        if sym not in seen_symbols and "vwap_momentum" in st:
+        if sym not in seen_symbols:
             seen_symbols.add(sym)
             approved.append(setup)
-            _vwap_added += 1
-    # Old pipeline: fully disabled. Legacy: fully disabled.
-    if regime_setups:
+            _regime_added += 1
+
+    # v8.0: Bear regime = pause. No new entries. Let existing positions resolve.
+    if current_regime == "bear":
         logger.info(
-            f"[Cycle {cycle}] v7.9 merge: {_vwap_added} vwap_momentum / "
-            f"{len(regime_setups)} raw regime setups (only vwap accepted)"
+            f"[Cycle {cycle}] v8.0 BEAR PAUSE: {_regime_added} regime signals "
+            f"dropped — 7-day data: 27% WR, -$273 in bear regime."
+        )
+        approved = []  # clear all approved signals in bear
+        _regime_added = 0
+
+    # Old pipeline slots (only for non-bear)
+    _old_added = 0
+    if current_regime != "bear":
+        for setup in strategy_setups:
+            sym = setup.get("symbol", "")
+            if sym not in seen_symbols:
+                seen_symbols.add(sym)
+                approved.append(setup)
+                _old_added += 1
+
+    # Legacy fallback (2 max slots)
+    _legacy_slots = 0
+    _legacy_max = 0 if current_regime == "bear" else 2
+    for setup in legacy_approved:
+        sym = setup.get("symbol", "")
+        if sym not in seen_symbols and _legacy_slots < _legacy_max:
+            seen_symbols.add(sym)
+            approved.append(setup)
+            _legacy_slots += 1
+
+    if regime_setups or strategy_setups:
+        logger.info(
+            f"[Cycle {cycle}] v8.0 merge: {_regime_added} regime / "
+            f"{_old_added} old-pipeline / {_legacy_slots} legacy "
+            f"regime={current_regime}"
         )
 
     # ── v7.5 Symbol Whitelist (profitability-data-driven) ─────────────────

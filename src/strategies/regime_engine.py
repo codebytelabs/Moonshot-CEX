@@ -28,15 +28,22 @@ from .base import BaseStrategy, StrategySignal
 
 
 # ── Regime → Strategy Weights ────────────────────────────────────────────────
-# v7.9: Bulletproof — only vwap_momentum gets weight in ALL regimes.
-# Live data (last 24h): vwap_momentum_breakout is the ONLY setup with positive
-# expectancy (3W/1L, +$57.20, PF=2.95, 75% WR). Everything else is negative.
-# No more multi-strategy hope — single proven edge, full allocation.
+# v8.0: Data-driven regime weights.
+# 7-day lifetime analysis of 153 closed trades (biggest sample available):
+#   vwap_momentum_breakout: +$139 bull (39% WR), +$78 sideways (100% WR n=3),
+#                          -$100 choppy (43% WR). Best in trending regimes.
+#   consolidation_breakout: +$42 bull (57% WR n=7). Small positive sample.
+#   breakout_orb: +$13 choppy (67% WR n=3). Tiny positive sample.
+#   bb_squeeze: loses in every regime (-$34 choppy, -$144 bear, -$18 bull).
+#   bb_mean_rev: +$19 choppy (2 trades) but -$156 bull (2 trades).
+#   ema_trend: loses in ALL regimes including bull (-$648). Dead strategy.
+#   ema_ribbon: 0% WR across all regimes. Dead strategy.
+# Bear regime: 27% WR, -$273 total → ZERO WEIGHT (pause all entries).
 REGIME_WEIGHTS = {
     "bull":     {"ema_trend": 0.00, "vwap_momentum": 1.00, "bb_squeeze": 0.00, "bb_mean_rev": 0.00},
-    "bear":     {"ema_trend": 0.00, "vwap_momentum": 1.00, "bb_squeeze": 0.00, "bb_mean_rev": 0.00},
+    "bear":     {"ema_trend": 0.00, "vwap_momentum": 0.00, "bb_squeeze": 0.00, "bb_mean_rev": 0.00},
     "sideways": {"ema_trend": 0.00, "vwap_momentum": 1.00, "bb_squeeze": 0.00, "bb_mean_rev": 0.00},
-    "choppy":   {"ema_trend": 0.00, "vwap_momentum": 1.00, "bb_squeeze": 0.00, "bb_mean_rev": 0.00},
+    "choppy":   {"ema_trend": 0.00, "vwap_momentum": 0.50, "bb_squeeze": 0.00, "bb_mean_rev": 0.00},
 }
 
 # Minimum combined score to emit a signal

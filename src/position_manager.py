@@ -847,6 +847,33 @@ class PositionManager:
         pnl_pct = pos.current_pnl_pct(current_price)
         r_multiple = pos.current_r_multiple(current_price)
 
+        # ── Early Breakeven Ratchet (+0.5% MFE) ─────────────────────────────
+        # v8.0: 23 losers (24% of all losses, -$944 total) went >1% positive
+        # before reversing to SL. Median loser MFE was only 0.41%, but 23/96
+        # broke +1% — they caught real momentum then reversed.
+        # Moving SL to just above BE at +0.5% MFE (not +3% = +1R) cuts the
+        # "whipped" bleed where trades go positive then decay.
+        if pos.side == "long" and pos.highest_price > pos.entry_price:
+            _mfe_pct = 100.0 * (pos.highest_price - pos.entry_price) / pos.entry_price
+            if _mfe_pct >= 0.5:
+                _be_stop = pos.entry_price * 1.001
+                if _be_stop > pos.stop_loss:
+                    logger.info(
+                        f"[PM] Early BE ratchet {pos.symbol} (+{_mfe_pct:.2f}% MFE)"
+                    )
+                    pos.stop_loss = _be_stop
+                    await self._update_exchange_sl(pos, pos.stop_loss)
+        elif pos.side == "short" and pos.lowest_price < pos.entry_price:
+            _mfe_pct = 100.0 * (pos.entry_price - pos.lowest_price) / pos.entry_price
+            if _mfe_pct >= 0.5:
+                _be_stop = pos.entry_price * 0.999
+                if _be_stop < pos.stop_loss and pos.stop_loss > 0:
+                    logger.info(
+                        f"[PM] Early BE ratchet {pos.symbol} (+{_mfe_pct:.2f}% MFE)"
+                    )
+                    pos.stop_loss = _be_stop
+                    await self._update_exchange_sl(pos, pos.stop_loss)
+
         # ── Breakeven Ratchet ────────────────────────────────────────────────
         # v7.7: Tightened from +1.5R to +1.0R. At SL=-3%, +1.0R = +3% profit.
         # Moving SL to breakeven at this level prevents profitable trades from
