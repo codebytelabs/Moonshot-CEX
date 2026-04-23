@@ -851,13 +851,17 @@ class PositionManager:
         # v8.0: 23 losers (24% of all losses, -$944 total) went >1% positive
         # before reversing to SL. Median loser MFE was only 0.41%, but 23/96
         # broke +1% — they caught real momentum then reversed.
-        # Moving SL to just above BE at +0.5% MFE (not +3% = +1R) cuts the
+        # Moving SL to just inside BE at +0.5% MFE (not +3% = +1R) cuts the
         # "whipped" bleed where trades go positive then decay.
+        # v8.0a fix: SL is placed at 0.998×entry (long) / 1.002×entry (short)
+        # — just below BE so it doesn't sit on the entry line, with a
+        # current_price buffer to avoid "Order would immediately trigger".
         if pos.side == "long" and pos.highest_price > pos.entry_price:
             _mfe_pct = 100.0 * (pos.highest_price - pos.entry_price) / pos.entry_price
             if _mfe_pct >= 0.5:
-                _be_stop = pos.entry_price * 1.001
-                if _be_stop > pos.stop_loss:
+                _be_stop = pos.entry_price * 0.998
+                _safe_gap = 1.002  # new SL must be >0.2% below current price
+                if _be_stop > pos.stop_loss and current_price > _be_stop * _safe_gap:
                     logger.info(
                         f"[PM] Early BE ratchet {pos.symbol} (+{_mfe_pct:.2f}% MFE)"
                     )
@@ -866,8 +870,9 @@ class PositionManager:
         elif pos.side == "short" and pos.lowest_price < pos.entry_price:
             _mfe_pct = 100.0 * (pos.entry_price - pos.lowest_price) / pos.entry_price
             if _mfe_pct >= 0.5:
-                _be_stop = pos.entry_price * 0.999
-                if _be_stop < pos.stop_loss and pos.stop_loss > 0:
+                _be_stop = pos.entry_price * 1.002
+                _safe_gap = 0.998  # new SL must be >0.2% above current price
+                if _be_stop < pos.stop_loss and pos.stop_loss > 0 and current_price < _be_stop * _safe_gap:
                     logger.info(
                         f"[PM] Early BE ratchet {pos.symbol} (+{_mfe_pct:.2f}% MFE)"
                     )
